@@ -14,22 +14,27 @@ pypdf>=4.0
 # =====================================================================
 # Live Capture (Beta) — phone/tablet camera tracking
 # =====================================================================
-# REQUIRED for the Live Capture ball-tracking flow (works on Python 3.10
-# through 3.14, no special version needed):
-streamlit-webrtc>=0.47.0
-opencv-python-headless>=4.10.0
-av>=12.0
-numpy>=1.26
+# These are DISABLED for Streamlit Cloud because `av` (PyAV) needs
+# system-level FFmpeg libraries that the default Cloud container doesn't
+# ship. The rest of the app (Pitching Lab, Hitting Lab, Tunneling,
+# Reports, PDFs) deploys cleanly without them. The Live Capture tab in
+# the cloud version will show a "package missing" message — that's
+# expected.
+#
+# For LOCAL use (your Mac), uncomment these four lines, run
+#   pip3 install -r requirements.txt --upgrade
+# and Live Capture works the same as before.
+#
+# To re-enable Live Capture on a hosted version of the app, deploy to a
+# host that supports custom Dockerfiles (Render, Railway, fly.io —
+# each has a free tier).
+#
+# streamlit-webrtc>=0.47.0
+# opencv-python-headless>=4.10.0
+# av>=12.0
+# numpy>=1.26
 
 # OPTIONAL — pose extraction via MediaPipe.
-# MediaPipe currently only ships wheels for Python 3.9-3.12. If you're
-# on Python 3.13 or 3.14, you'll see "No matching distribution" when
-# installing this — that's expected. The Live Capture tab will run
-# WITHOUT pose extraction (ball-tracking + spin + break still work).
-#
-# To enable pose: install Python 3.12 alongside your current version
-# (Homebrew: `brew install python@3.12`), or create a venv with
-# Python 3.12 and run the app from that env.
-#
-# Uncomment the line below if you're on Python 3.9-3.12:
+# MediaPipe ships wheels for Python 3.9-3.12. If you enable Live Capture
+# above and you're on Python 3.9-3.12, you can also uncomment this line:
 # mediapipe>=0.10.14
