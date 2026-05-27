@@ -1,0 +1,21 @@
+# Diamond Sports Lab — Streamlit theme
+[theme]
+primaryColor = "#1a2150"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f7fb"
+textColor = "#1f2937"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# Local: open browser automatically. Streamlit Cloud overrides this anyway.
+headless = false
+runOnSave = true
+# Allow larger video uploads for Live Capture beta testing.
+maxUploadSize = 200

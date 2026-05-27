@@ -1,0 +1,7 @@
+"Pitch_ID: P_88294","Pitcher: Marcus Vance","Hand: RHP","Frame_Rate: 240","Captured_At: 2026-05-15 14:04:26"
+"Frame","Phase","Time_sec","Pelvis_Rotation_deg","Trunk_Rotation_deg","Hip_Shoulder_Separation_deg","Elbow_Flexion_deg","Shoulder_Abduction_deg","Shoulder_External_Rot_deg","Lead_Knee_Extension_deg","Pelvis_Angular_Vel_deg_sec","Trunk_Angular_Vel_deg_sec"
+42,"Early_Stride",0.175,12.8,3.0,9.8,112.2,78.3,45.4,120.7,242.0,111.0
+112,"Foot_Plant",0.466,85.8,31.5,54.3,88.2,92.2,165.8,136.4,748.0,418.0
+117,"Max_External_Rot",0.488,98.8,79.1,19.7,51.8,94.0,178.7,149.4,422.0,990.0
+121,"Ball_Release",0.504,102.8,99.8,3.0,35.0,94.4,21.8,155.5,109.0,1170.0
+139,"Follow_Through",0.579,108.9,129.4,-20.5,28.2,82.2,-45.5,158.8,39.0,418.0

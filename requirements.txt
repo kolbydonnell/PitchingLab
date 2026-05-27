@@ -1,0 +1,35 @@
+# Version specs use >= (not ==) so pip can find prebuilt wheels for
+# whichever Python version you're on (3.10, 3.12, 3.13, 3.14, etc.).
+# Pinning with == forces pip to build from source when a wheel doesn't
+# exist for your Python — that's what causes "failed wheel build" errors.
+
+streamlit>=1.36.0
+pandas>=2.2.0
+plotly>=5.22.0
+pillow>=11.0      # imaging — Python 3.14 wheels start here
+reportlab>=4.0
+matplotlib>=3.9
+pypdf>=4.0
+
+# =====================================================================
+# Live Capture (Beta) — phone/tablet camera tracking
+# =====================================================================
+# REQUIRED for the Live Capture ball-tracking flow (works on Python 3.10
+# through 3.14, no special version needed):
+streamlit-webrtc>=0.47.0
+opencv-python-headless>=4.10.0
+av>=12.0
+numpy>=1.26
+
+# OPTIONAL — pose extraction via MediaPipe.
+# MediaPipe currently only ships wheels for Python 3.9-3.12. If you're
+# on Python 3.13 or 3.14, you'll see "No matching distribution" when
+# installing this — that's expected. The Live Capture tab will run
+# WITHOUT pose extraction (ball-tracking + spin + break still work).
+#
+# To enable pose: install Python 3.12 alongside your current version
+# (Homebrew: `brew install python@3.12`), or create a venv with
+# Python 3.12 and run the app from that env.
+#
+# Uncomment the line below if you're on Python 3.9-3.12:
+# mediapipe>=0.10.14

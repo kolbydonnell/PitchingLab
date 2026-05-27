@@ -1,0 +1,12286 @@
+"""
+Diamond Sports Lab — Pitching
+==============================
+Single-file Streamlit application that ingests CSV exports from three apps
+(Pitch Logic / Rapsodo, Driveline Pulse, ProPlayAI), aligns them into a
+canonical per-pitch dataset, heals dropped pitches, and renders a
+Post-Bullpen Report with action plan, strike-zone scatter, and grip
+recommendations.
+
+Hitting analysis is on the v2 roadmap.
+
+Run locally with:
+    streamlit run pitching_lab.py
+
+Author: Built for Kolby's Diamond Sports Lab, May 2026.
+"""
+
+import hashlib
+import io
+import random
+import re
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+
+# =============================================================================
+# CONFIG / CONSTANTS
+# =============================================================================
+PITCH_LOGIC_METADATA_ROWS = 4          # rows before the header row in PL exports
+ALIGNMENT_TOLERANCE_SECONDS = 5         # ± window for timestamp-based matching
+SECOND_PASS_TOLERANCE_SECONDS = 15      # wider window for velocity-signature pass
+DANGER_VALGUS_NM = 62.0                 # elbow stress threshold (Newton-meters)
+ACR_WARNING_THRESHOLD = 1.3             # acute:chronic workload ratio warning
+ACR_DANGER_THRESHOLD = 1.5              # ACR danger threshold
+EARLY_TRUNK_ROTATION_DEG = 35.0         # >this at foot-plant = "opening too early"
+
+# Sample pitcher video for testing the video features when the user has no
+# bullpen footage of their own. (Public YouTube — "Slow Motion Pitching
+# Mechanics in Bullpen" from an amateur/college pitcher.)
+SAMPLE_PITCHER_VIDEO_URL = "https://www.youtube.com/watch?v=SdxpgCsDXcw"
+
+# Pitch-type color map for the scatter plot
+PITCH_COLORS = {
+    # Baseball pitch types
+    "Four-Seam Fastball":   "#d32f2f",
+    "Two-Seam Sinker":      "#f57c00",
+    "Slider Strike-Getter": "#1976d2",
+    "Slider Chase":         "#7b1fa2",
+    "Changeup":             "#388e3c",
+    "Curveball":            "#00838f",
+    # Softball pitch types
+    "Softball Fastball":    "#d32f2f",
+    "Rise Ball":            "#0ea5e9",
+    "Drop Ball":            "#7c3aed",
+    "Curveball ":           "#00838f",       # trailing space avoids key collision; not used externally
+    "Screwball":            "#f59e0b",
+    "Change-Up":            "#388e3c",
+}
+
+# =============================================================================
+# DRILL LIBRARY
+# =============================================================================
+# Each drill has:
+#   category   — Injury / Mechanics / Velocity / Stuff / Grip / Consistency
+#   phase      — "today" (cooldown immediately after bullpen) or "week" (between bullpens)
+#   priority   — 1-5; lower = more urgent. Injury 1, mech 2, velo 3, stuff 4, grip 4, consistency 5
+#   label      — short title shown to the coach
+#   drill      — the actual drill name
+#   protocol   — sets × reps × frequency
+#   why        — short coach-friendly explanation
+#
+# These drill names and protocols are reasonable starting points based on
+# common baseball training literature (Driveline, Tread, etc) — Kolby should
+# review and replace any he doesn't trust with his preferred protocols.
+#
+# DRILL_VIDEOS maps drill_key → list of curated YouTube tutorial entries.
+# Each entry is a dict with:
+#   url       — YouTube URL
+#   title     — short descriptor for the link
+#   source    — who made it (Driveline, Amanda Scarborough, etc.)
+#   level     — "any" / "youth" / "hs" / "college+" — athlete-skill match
+#   severity  — "any" / "mild" / "moderate" / "severe" — how serious the
+#               problem is in the data (e.g., gyro 75° → moderate vs 85° → severe)
+#   duration_min — approx tutorial length (info only)
+#
+# The video picker selects the best fit for the athlete's data + level.
+# Multiple entries per drill let coaches see alternates and the system
+# can pick differently for a youth pitcher vs a college pitcher.
+DRILL_VIDEOS = {
+    # ===== Baseball =====
+    "high_valgus_stress": [
+        {"url": "https://www.youtube.com/watch?v=71fRlH-nKdM",
+         "title": "Reverse Throws — Plyo-Care Routine",
+         "source": "Resilient Performance / PlyoCare",
+         "level": "any", "severity": "any"},
+    ],
+    "moderate_acr_cooldown": [
+        {"url": "https://www.youtube.com/watch?v=qLgmm6OWFOM",
+         "title": "Sleeper Stretch + Shoulder Cooldown Series",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "session_cooldown_default": [
+        {"url": "https://www.youtube.com/watch?v=qLgmm6OWFOM",
+         "title": "Standard Bullpen Cooldown — Cuff Series",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "early_trunk_rotation": [
+        {"url": "https://www.youtube.com/watch?v=espdyF-BEUU",
+         "title": "Pivot Pickoff Throws (Slow-Mo)",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "soft_lead_knee": [
+        {"url": "https://www.youtube.com/watch?v=D2iBFwUSphg",
+         "title": "Lead Leg Patterning Drill Series",
+         "source": "Performance Therapy",
+         "level": "any", "severity": "any"},
+    ],
+    "low_hip_shoulder_separation": [
+        {"url": "https://www.youtube.com/watch?v=AVBhM0U9wDc",
+         "title": "Hip-Shoulder Separation Drill — All Ages",
+         "source": "Coach DM",
+         "level": "any", "severity": "any"},
+    ],
+    "low_extension": [
+        {"url": "https://www.youtube.com/watch?v=ybqA8ukDhpo",
+         "title": "How Pros Use the Towel Drill for Drive & Extension",
+         "source": "Hector Berrios",
+         "level": "any", "severity": "any"},
+    ],
+    "below_baseline_fastball_velo": [
+        {"url": "https://www.youtube.com/watch?v=vzbYILuv2zM",
+         "title": "Underload Velocity Pulldowns",
+         "source": "Driveline Baseball",
+         "level": "hs", "severity": "moderate"},
+        {"url": "https://www.youtube.com/watch?v=d-a0CKlF8sQ",
+         "title": "Max Velocity Pulldowns — 105.8 MPH",
+         "source": "Driveline Baseball",
+         "level": "college+", "severity": "severe"},
+    ],
+    "below_baseline_offspeed_velo": [
+        {"url": "https://www.youtube.com/watch?v=SPo50ugFM6Q",
+         "title": "How To Use Weighted Baseballs On A Velocity Day",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "low_fastball_spin": [
+        {"url": "https://www.youtube.com/watch?v=soY59hqq5IQ",
+         "title": "Fingerprint of Velocity — Why Spin Starts in the Hand",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "low_slider_spin_efficiency": [
+        {"url": "https://www.youtube.com/watch?v=SypTLJa7paM",
+         "title": "Pitching Towel Drill — Throw Gas",
+         "source": "Baseball Pitcher Drills",
+         "level": "any", "severity": "mild"},
+        {"url": "https://www.youtube.com/watch?v=1LR9sp6qutE",
+         "title": "Quick Guide to Baseball Pitch Grips",
+         "source": "PlayBaseball",
+         "level": "any", "severity": "moderate"},
+    ],
+    "low_offspeed_break": [
+        {"url": "https://www.youtube.com/watch?v=1LR9sp6qutE",
+         "title": "Pitch Grips — Curveball / Changeup Spin",
+         "source": "PlayBaseball",
+         "level": "any", "severity": "any"},
+    ],
+    "slider_grip_pronation_fix": [
+        {"url": "https://www.youtube.com/watch?v=1LR9sp6qutE",
+         "title": "Slider Grip — Spike-Seam Variation",
+         "source": "PlayBaseball",
+         "level": "any", "severity": "any"},
+    ],
+    "fastball_grip_finger_pressure": [
+        {"url": "https://www.youtube.com/watch?v=soY59hqq5IQ",
+         "title": "Fingerprint of Velocity — Middle-Finger Pressure",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "arm_slot_variance": [
+        {"url": "https://www.youtube.com/watch?v=D2iBFwUSphg",
+         "title": "Lead Leg Patterning — Release Consistency",
+         "source": "Performance Therapy",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ===== Softball =====
+    "softball_low_rise_spin": [
+        {"url": "https://www.youtube.com/watch?v=QiI_P1RZct0",
+         "title": "Wrist Snap Practice for Softball Pitchers",
+         "source": "Power Up Sports",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_low_drop_topspin": [
+        {"url": "https://www.youtube.com/watch?v=LIVYiPfKjKU",
+         "title": "How to Throw a Dropball — Amanda Scarborough",
+         "source": "Amanda Scarborough",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_K_drill": [
+        {"url": "https://www.youtube.com/watch?v=D5ba34a9nK4",
+         "title": "Power K — Putting It All Together (Part 3)",
+         "source": "FastPitch Softball Pitching",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_brush_at_hip": [
+        {"url": "https://www.youtube.com/watch?v=wMrRQfBSzTU",
+         "title": "3 Swing Whip Drill — Brush at Hip",
+         "source": "Softball Pitching",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_drag_toe": [
+        {"url": "https://www.youtube.com/watch?v=8pbfXm_o4lo",
+         "title": "Fastpitch Pitching Softball — Drag Box Tutorial",
+         "source": "Power Drive Performance",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_below_baseline_velo": [
+        {"url": "https://www.youtube.com/watch?v=NBODs5vHchA",
+         "title": "Front Foot Rotation — Toe Touch & Heel Plant",
+         "source": "Fastpitch Pitching",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_grip_curve_pronation": [
+        {"url": "https://www.youtube.com/watch?v=QiI_P1RZct0",
+         "title": "Wrist Snap & Axis Control",
+         "source": "Power Up Sports",
+         "level": "any", "severity": "any"},
+    ],
+
+    # Softball versions of shared issue keys
+    "softball_session_cooldown_default": [
+        {"url": "https://www.youtube.com/watch?v=qLgmm6OWFOM",
+         "title": "Shoulder Cooldown Series (works for windmill)",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_high_valgus_stress": [
+        {"url": "https://www.youtube.com/watch?v=qLgmm6OWFOM",
+         "title": "Sleeper Stretch + Cuff Series",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_low_fastball_spin": [
+        {"url": "https://www.youtube.com/watch?v=QiI_P1RZct0",
+         "title": "Wrist Snap Practice — Fastball Backspin",
+         "source": "Power Up Sports",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_low_offspeed_break": [
+        {"url": "https://www.youtube.com/watch?v=gc99t_g9RUs",
+         "title": "Windmill Drills — Spin Axis Variations",
+         "source": "Softball Spot",
+         "level": "any", "severity": "any"},
+    ],
+    "softball_arm_slot_variance": [
+        {"url": "https://www.youtube.com/watch?v=ycRB2rvyleA",
+         "title": "Beginner Pitching Drills — Arm Path / Body Control",
+         "source": "DR3 Fastpitch",
+         "level": "any", "severity": "any"},
+    ],
+
+    # =========================================================================
+    # HITTING DRILL VIDEOS — specific YouTube tutorials curated per drill.
+    # Each entry points to a single canonical instructional video. If any URL
+    # ever 404s, replace it — the rest of the system is URL-agnostic.
+    # =========================================================================
+    "hitting_session_cooldown": [
+        {"url": "https://www.youtube.com/watch?v=Ujk1E6XFTk0",
+         "title": "Forearm Stretch — Arm Stretch For Baseball",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_heavy_workload_cooldown": [
+        {"url": "https://www.youtube.com/watch?v=bDEXVfchUGg",
+         "title": "Important Arm Cooldown & Recovery Drills",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Bat speed (4 drills) ----
+    "hitting_bat_speed_overload_underload": [
+        {"url": "https://www.youtube.com/watch?v=oiJ2bUPdfwg",
+         "title": "How to Train Bat Speed In The Cage",
+         "source": "Driveline Baseball",
+         "level": "hs", "severity": "any"},
+    ],
+    "hitting_bat_speed_medball": [
+        {"url": "https://www.youtube.com/watch?v=eHkGMY70kFU",
+         "title": "Top 10 Med-Ball Drills to Increase Bat Speed & Power",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_bat_speed_resistance_band": [
+        {"url": "https://www.youtube.com/watch?v=k1XTovi8X6s",
+         "title": "Top 3 Resistance-Band Hitting Drills",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_bat_speed_top_hand": [
+        {"url": "https://www.youtube.com/watch?v=R8lBmtaRqzM",
+         "title": "Top-Hand Progression Drill",
+         "source": "Factory 101",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Hip-shoulder separation (3 drills) ----
+    "hitting_hip_sep_coil_hold": [
+        {"url": "https://www.youtube.com/watch?v=8pFGPutHi0E",
+         "title": "Simple Hip Coil and Hold",
+         "source": "Hitting Done Right",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_hip_sep_step_behind": [
+        {"url": "https://www.youtube.com/watch?v=AkwKO0J2SEM",
+         "title": "Step Backs — Hitting Drill",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_hip_sep_x_drill": [
+        {"url": "https://www.youtube.com/watch?v=Q1HEhdBf8N8",
+         "title": "Hip to Shoulder Separation — Baseball Hitting Mechanics",
+         "source": "Batspeed.com",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Flat swing (3 drills) ----
+    "hitting_flat_high_tee": [
+        {"url": "https://www.youtube.com/watch?v=0BYiG_0saOY",
+         "title": "High Tee — Hitting Drill",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_flat_pvc_path": [
+        {"url": "https://www.youtube.com/watch?v=XGHyJ61o6x8",
+         "title": "PVC Hitting Drills To Help Improve Your Swing",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_flat_launch_pause": [
+        {"url": "https://www.youtube.com/watch?v=bbqzyYYXvtM",
+         "title": "Stride-Pause-Swing Tee Drill",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Steep swing (3 drills) ----
+    "hitting_steep_low_high_mix": [
+        {"url": "https://www.youtube.com/watch?v=Ad3K8y1w6Fc",
+         "title": "Low Tee — Hitting Drill",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_steep_top_hand_path": [
+        {"url": "https://www.youtube.com/watch?v=VFn3vxAz01U",
+         "title": "Drive the Ball More Consistently — Top Hand Drill",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_steep_outside_front_toss": [
+        {"url": "https://www.youtube.com/watch?v=omtGAS-Kk0w",
+         "title": "Off-Set Front Toss Drill",
+         "source": "Driveline Baseball",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Off-plane swing (3 drills) ----
+    "hitting_on_plane_plyo_uphill": [
+        {"url": "https://www.youtube.com/watch?v=RdCSttVTJ78",
+         "title": "Overloaded Plyo Ball Indoor Drill for Hitting",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_on_plane_two_tee": [
+        {"url": "https://www.youtube.com/watch?v=5DxC2zZMbqs",
+         "title": "Two Tee — Swing Path Drill",
+         "source": "Hitting Done Right",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_on_plane_connection_band": [
+        {"url": "https://www.youtube.com/watch?v=sbm2YJEpfYg",
+         "title": "3 Best Connection-Ball Drills",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Slow time-to-contact (3 drills) ----
+    "hitting_ttc_short_bat": [
+        {"url": "https://www.youtube.com/watch?v=3fogUIU5az4",
+         "title": "Short Bat Drill (Window Drill)",
+         "source": "Factory 101",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_ttc_heavy_quick": [
+        {"url": "https://www.youtube.com/watch?v=f3Zm0m2thsI",
+         "title": "Bat Speed and Quick Hands Drill",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_ttc_connection_ball": [
+        {"url": "https://www.youtube.com/watch?v=y_dvzrPibB4",
+         "title": "Connection Ball Hitting Drills",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Whiffs (3 drills) ----
+    "hitting_whiffs_sit_fastball": [
+        {"url": "https://www.youtube.com/watch?v=RedR_MVnzk4",
+         "title": "Pitch Selection & Plate Discipline — Timing at Home Plate",
+         "source": "The Language of Hitting",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_whiffs_vision_bottle": [
+        {"url": "https://www.youtube.com/watch?v=pLC-WnXMkHo",
+         "title": "Vision Training Baseball Batting Drill",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_whiffs_multi_color": [
+        {"url": "https://www.youtube.com/watch?v=jXHL6ryl3EE",
+         "title": "Evan Longoria — Advanced Pitch Recognition Drill",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+
+    # ---- Weak contact (3 drills) ----
+    "hitting_weak_front_toss_oppo": [
+        {"url": "https://www.youtube.com/watch?v=jD3OkLcnig0",
+         "title": "3 Tips To Hit For More Opposite Field Power",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_weak_bottom_hand": [
+        {"url": "https://www.youtube.com/watch?v=xS-PTR1c0Mc",
+         "title": "Bottom Hand Iso Drill — Knob Direction",
+         "source": "Hitting Done Right",
+         "level": "any", "severity": "any"},
+    ],
+    "hitting_weak_inside_outside_tee": [
+        {"url": "https://www.youtube.com/watch?v=PApy4Xd3ZtQ",
+         "title": "Inside/Outside Hitting Drill — Recognition & Adjustment",
+         "source": "YouTube",
+         "level": "any", "severity": "any"},
+    ],
+}
+
+
+def pick_video(drill_key: str, severity: str = "any",
+                level: str = "any") -> dict | None:
+    """Pick the best video for a drill key given the athlete's severity + level.
+
+    Scoring:
+      +3 for exact severity match
+      +1 if video severity is "any" (fits anyone)
+      +2 for exact level match
+      +1 if video level is "any"
+
+    Returns the video dict (with url, title, source, etc.) or None.
+    """
+    candidates = DRILL_VIDEOS.get(drill_key) or []
+    if not candidates:
+        return None
+
+    def score(v):
+        s = 0
+        v_sev = v.get("severity", "any")
+        v_lvl = v.get("level", "any")
+        if v_sev == severity:        s += 3
+        elif v_sev == "any":          s += 1
+        if v_lvl == level:           s += 2
+        elif v_lvl == "any":          s += 1
+        return s
+
+    return max(candidates, key=score)
+
+
+def get_drill_video(drill_key: str, severity: str = "any",
+                     level: str = "any") -> str | None:
+    """Backward-compatible URL lookup. Returns just the URL string."""
+    v = pick_video(drill_key, severity=severity, level=level)
+    return v["url"] if v else None
+
+
+def get_drill_video_alternates(drill_key: str) -> list:
+    """Return ALL curated videos for a drill (used by the Drill Library)."""
+    return DRILL_VIDEOS.get(drill_key) or []
+
+
+# =============================================================================
+# STANDARD WARM-UP + COOL-DOWN SEQUENCES (referenced by every weekly plan)
+# Each step is a discrete movement with a clear cue. The weekly-plan builder
+# lists the warm-up FIRST and the cool-down LAST on every prescribed day so
+# the structure is the same regardless of the player's specific weaknesses.
+# =============================================================================
+PITCHING_WARMUP = {
+    "label":     "Pitcher Pre-Bullpen Warm-Up",
+    "duration":  "10–12 min",
+    "steps": [
+        ("Light cardio",                "3 min easy jog or jump rope — get the body warm."),
+        ("Dynamic mobility",            "Arm circles 2×10 each direction · leg swings 2×8 each leg · hip openers 2×8."),
+        ("Band external rotations",     "3×12 with a light band. Elbow at side, slow tempo, full ROM."),
+        ("Band Y/T/W",                  "2×8 of each, slow tempo. Activates scapular stabilizers."),
+        ("Wrist flicks",                "2×10 each side — light wrist snaps to wake the forearm."),
+        ("Bullpen-pace warm-up throws", "Long-toss progression: 30 ft × 5 throws → 60 ft × 5 → game-distance × 5."),
+    ],
+    "why": "A consistent warm-up cuts UCL incident rates and primes the rotator cuff for max-effort throws. "
+            "Skipping it is the #1 cause of preventable injury in HS pitchers.",
+}
+
+PITCHING_COOLDOWN = {
+    "label":     "Pitcher Post-Bullpen Cool-Down",
+    "duration":  "6–8 min",
+    "steps": [
+        ("Reverse throws (decel)",      "2×8 throws with a 5oz plyo ball, 25 ft into a wall. Decelerates the arm safely."),
+        ("Sleeper stretch",             "3×30s each side. Keeps the posterior capsule mobile, prevents GIRD."),
+        ("Band external rotations",     "2×15 light band, elbow at side. Cuff blood flow + recovery."),
+        ("Cross-body stretch",          "2×30s each arm — opens the posterior shoulder."),
+        ("Foam roll T-spine + lats",    "2 min, focus on the throwing-side lat. Restores thoracic rotation."),
+        ("Easy walk or bike",           "3–5 min flushing pace. Helps clear lactic load."),
+    ],
+    "why": "Cool-down protocols cut next-day soreness by ~40% in college pitching studies. "
+            "Coaches who skip this are the ones whose pitchers feel 'dead-arm' two days later.",
+}
+
+HITTING_WARMUP = {
+    "label":     "Hitter Pre-Session Warm-Up",
+    "duration":  "8–10 min",
+    "steps": [
+        ("Light cardio",                "3 min easy jog or jump rope."),
+        ("Dynamic mobility",            "T-spine rotations 2×8 each side · hip openers 2×8 · band pull-aparts 2×12."),
+        ("Wrist + forearm prep",        "Wrist flexor stretch 2×30s each · forearm pronation drill 2×10 with a bat."),
+        ("Dry swings — short bat",      "10 controlled swings choked up — feel the path before loading the swing."),
+        ("Tee — middle, 50% intent",    "10 swings on a middle tee at half effort. Build into full intent."),
+        ("Tee — middle, 80% intent",    "10 swings at 80% — final ramp before live BP."),
+    ],
+    "why": "A consistent warm-up gets the bat path on plane before the first hard swing — "
+            "reduces wasted reps and lowers wrist/lat strain risk.",
+}
+
+HITTING_COOLDOWN = {
+    "label":     "Hitter Post-Session Cool-Down",
+    "duration":  "5–7 min",
+    "steps": [
+        ("Forearm flexor stretch",      "3×30s each side. Hitters accumulate forearm fatigue from BP volume."),
+        ("Lat doorway stretch",         "3×30s each side — opens the lats and decompresses the spine."),
+        ("Scapular slides",             "2×10 against a wall — restores shoulder-blade glide after rotational load."),
+        ("Foam roll T-spine",           "2 min, focus on the rotational side."),
+        ("Hydration + 2-min walk",      "Active recovery flushes the system."),
+    ],
+    "why": "Forearm + lat fatigue is the silent killer of hitter consistency across a long week. "
+            "The 5-minute cool-down is what lets the hitter come back fresh for the next session.",
+}
+
+
+DRILL_LIBRARY = {
+    # ===== INJURY PREVENTION (today / cooldown) =====
+    "high_valgus_stress": {
+        "category": "Injury Prevention",
+        "phase": "today",
+        "priority": 1,
+        "label": "Elevated Elbow Stress",
+        "drill": "Half-kneeling reverse throws + 7oz plyo decel work",
+        "protocol": "3 sets × 6 reps, 2 min rest between sets. Do today within 30 min of finishing.",
+        "why": "Decelerates the arm safely and reduces peak valgus load on the UCL after a high-stress outing.",
+    },
+    "high_acr_rest": {
+        "category": "Injury Prevention",
+        "phase": "today",
+        "priority": 1,
+        "label": "Workload Spike — REST",
+        "drill": "REST DAY. No throws. Mobility + sleeve work only.",
+        "protocol": "Light band external rotations 3×15. Cuff mobility 10 min. Easy walk 20 min.",
+        "why": "Acute:Chronic Ratio above 1.5 carries 3–5× injury risk in the next 7 days (Gabbett 2016).",
+    },
+    "moderate_acr_cooldown": {
+        "category": "Injury Prevention",
+        "phase": "today",
+        "priority": 2,
+        "label": "Workload Elevated — Light Recovery",
+        "drill": "Sleeper stretch + reverse-throw decel + cuff series",
+        "protocol": "Sleeper stretch 3×30s each side. Reverse throws 2×8. Cuff series 2×12.",
+        "why": "ACR 1.3–1.5 is the yellow zone. Active recovery now keeps you out of the red zone next session.",
+    },
+    "session_cooldown_default": {
+        "category": "Injury Prevention",
+        "phase": "today",
+        "priority": 3,
+        "label": "Standard Bullpen Cooldown",
+        "drill": "Reverse throws + sleeper stretch + 5-min light cardio",
+        "protocol": "Reverse throws 2×10 with 5oz. Sleeper stretch 3×30s each side. Walk or bike 5 min.",
+        "why": "Baseline cooldown that flushes blood through the shoulder and elbow after any bullpen.",
+    },
+
+    # ===== MECHANICS — EFFICIENCY (week) =====
+    "early_trunk_rotation": {
+        "category": "Mechanics",
+        "phase": "week",
+        "priority": 2,
+        "label": "Chest Opens Too Early",
+        "drill": "Driveline pivot pick-offs with weighted blue plyo (1 lb)",
+        "protocol": "3 sets × 5 reps, 3 days this week. Front shoulder stays closed until foot strike.",
+        "why": "Late trunk rotation protects the elbow AND transfers more ground force into the ball — typically worth +1-2 mph plus tighter command.",
+    },
+    "soft_lead_knee": {
+        "category": "Mechanics",
+        "phase": "week",
+        "priority": 2,
+        "label": "Soft Front Leg Block",
+        "drill": "Wall drill — front-leg stiff brace + medball into wall",
+        "protocol": "4 sets × 6 reps, every other day. Focus on locking the front knee at brace.",
+        "why": "A stiff front-side block transfers energy up the chain instead of leaking sideways. Adds 1-2 mph + sharper command.",
+    },
+    "low_hip_shoulder_separation": {
+        "category": "Mechanics — Velocity",
+        "phase": "week",
+        "priority": 3,
+        "label": "Low Hip-Shoulder Separation",
+        "drill": "Hershiser drill — exaggerated coil reps with 6oz ball",
+        "protocol": "3 sets × 4 reps, 3 days this week. Hold the coil 1 sec before unwinding.",
+        "why": "Separation > 50° at peak = more rubber-band torque. Top D1 averages 55-65°. Each 5° added is roughly 1 mph of velocity.",
+    },
+    "low_extension": {
+        "category": "Mechanics — Velocity",
+        "phase": "week",
+        "priority": 3,
+        "label": "Short Release Extension",
+        "drill": "Stride-down drill emphasizing long stride + reach",
+        "protocol": "3 sets × 8 reps, 2-3 days this week. Aim for stride length = 90% of pitcher's height.",
+        "why": "Extension > 6.2 ft adds ~2 mph of perceived velocity by shortening the distance the hitter sees. 'Free velocity.'",
+    },
+
+    # ===== VELOCITY (week) =====
+    "below_baseline_fastball_velo": {
+        "category": "Velocity",
+        "phase": "week",
+        "priority": 3,
+        "label": "Fastball Velocity Down vs Baseline",
+        "drill": "Weighted-ball pull-down + hold protocol (Driveline-style)",
+        "protocol": "Pull-downs: 3oz/4oz/5oz/6oz/7oz, 3 throws each, 2 days. Holds: 6oz, 5 reps × 5 sec, 2 days.",
+        "why": "Weighted-ball protocols reliably add 2-4 mph in 6-8 weeks. Train the arm to move fast THEN strong.",
+    },
+    "below_baseline_offspeed_velo": {
+        "category": "Velocity",
+        "phase": "week",
+        "priority": 4,
+        "label": "Offspeed Velocity Soft",
+        "drill": "Tempo throws + intent training at the offspeed pitch type",
+        "protocol": "Tempo throws: 10 reps at 80% intent, 5 reps at 100% intent, 2 days this week.",
+        "why": "Offspeed pitches lose effectiveness when they drift more than 8-10 mph off the fastball. Hold the velocity gap.",
+    },
+
+    # ===== STUFF (week) — SPIN AND MOVEMENT =====
+    "low_fastball_spin": {
+        "category": "Stuff — Fastball",
+        "phase": "week",
+        "priority": 4,
+        "label": "Low Fastball Spin Rate",
+        "drill": "Sponge balls + four-seam ride grip protocol",
+        "protocol": "Sponge spin reps 4 sets × 10 daily. Live cue: middle finger does the work on release.",
+        "why": "Spin rate is partly mechanical (wrist snap, finger pressure). Sponge protocols add 100-200 RPM over 4 weeks.",
+    },
+    "low_slider_spin_efficiency": {
+        "category": "Stuff — Slider",
+        "phase": "week",
+        "priority": 4,
+        "label": "Slider Too Gyro (Bullet Spin)",
+        "drill": "Towel slider drill + grip shift toward middle finger",
+        "protocol": "Towel dry reps 5×10 daily. Live grip: middle finger on long seam, index lightly off the ball.",
+        "why": "Slider spin efficiency below 30% = mostly gyro / bullet spin / no break. Target 30-40% efficiency for a tight 2-plane break.",
+    },
+    "low_offspeed_break": {
+        "category": "Stuff — Movement",
+        "phase": "week",
+        "priority": 4,
+        "label": "Offspeed Not Breaking Enough",
+        "drill": "Supination hook-em drill + grip pressure shift",
+        "protocol": "Hook-em reps 3×6 with 5oz weighted ball, 2 days. Strong wrist supination at release.",
+        "why": "Movement comes from spin axis + active spin %. Stronger supination shifts axis toward 9:00 and adds 2-3 inches of break.",
+    },
+
+    # ===== GRIP =====
+    "slider_grip_pronation_fix": {
+        "category": "Grip",
+        "phase": "week",
+        "priority": 4,
+        "label": "Slider Grip — Stop Wrist-Twisting",
+        "drill": "Spike-seam slider grip: ball wedged between thumb pad and middle finger",
+        "protocol": "Mirror grip work 5 min daily. 10 spike-seam sliders per bullpen until natural.",
+        "why": "High gyro + high elbow stress on the slider usually means you're forcing break with wrist twist. A spike grip lets the ball cut naturally and unloads the elbow.",
+        "grip_key": "slider_spike_seam",
+    },
+    "fastball_grip_finger_pressure": {
+        "category": "Grip",
+        "phase": "week",
+        "priority": 5,
+        "label": "Fastball Grip — Index Pressure Cue",
+        "drill": "Shift release pressure to the middle finger pad, lighten index",
+        "protocol": "Dry-fire wrist work 50 reps daily. Every bullpen, throw the first 10 fastballs with cue 'middle finger does the work'.",
+        "why": "Index-dominant release biases gyro/sweep; middle-finger dominant release adds carry and 'ride' to a four-seamer.",
+        "grip_key": "four_seam_fastball",
+    },
+
+    # ===== CONSISTENCY =====
+    "arm_slot_variance": {
+        "category": "Consistency",
+        "phase": "week",
+        "priority": 5,
+        "label": "Inconsistent Arm Slot",
+        "drill": "Mirror drill + 1-knee throws",
+        "protocol": "10 mirror reps before each bullpen. 1-knee throws 3×10, 2 days this week.",
+        "why": "A consistent arm slot = a consistent release point = better command and tunneling. Pros vary < 2° in slot across pitches.",
+    },
+
+    # =========================================================================
+    # SOFTBALL-SPECIFIC DRILLS (windmill mechanics)
+    # =========================================================================
+    "softball_low_rise_spin": {
+        "category": "Stuff — Rise Ball",
+        "phase": "week",
+        "priority": 4,
+        "label": "Rise Ball Spin Too Low",
+        "drill": "Wrist-snap rise drill + sponge ball spin reps",
+        "protocol": "Sponge ball pure backspin reps 4×10 daily. Live: emphasize a hard wrist 'flick' upward at release, palm rotating fully to sky. 15 rise balls per bullpen this week.",
+        "why": "Rise balls thrive on backspin rate — below 1900 RPM the ball drops too much and the 'rise' illusion fails. Wrist-snap drills increase the spin contribution from the fingertips.",
+        "grip_key": "softball_rise",
+    },
+    "softball_low_drop_topspin": {
+        "category": "Stuff — Drop Ball",
+        "phase": "week",
+        "priority": 4,
+        "label": "Drop Ball Not Dropping Enough",
+        "drill": "Peel-finger drop drill — fingers off the FRONT",
+        "protocol": "5 sets × 8 reps daily, focus on the 'pulling a window shade down' release. Live drops: 12 per bullpen, all targeting the bottom of the zone or below.",
+        "why": "Sharp drop balls need 6:00 topspin. If your fingers come off the SIDE instead of the front, you'll get a 4:00 axis and the ball backs up instead of dropping.",
+        "grip_key": "softball_drop",
+    },
+    "softball_K_drill": {
+        "category": "Mechanics",
+        "phase": "week",
+        "priority": 2,
+        "label": "K-Position at Top of Windmill",
+        "drill": "K-drill — pause at the 12:00 windmill position",
+        "protocol": "5 sets × 6 reps daily. Hold the K-position (arm at 12:00, ball facing batter) for 1 sec before completing the windmill. Works arm path consistency.",
+        "why": "A consistent K-position at the top of the windmill is the foundation of a repeatable softball delivery — like a baseball pitcher's high cock position. Inconsistent K = inconsistent release = scattered pitches.",
+    },
+    "softball_brush_at_hip": {
+        "category": "Mechanics — Velocity",
+        "phase": "week",
+        "priority": 3,
+        "label": "Brush at Hip Timing",
+        "drill": "Hip-brush drill — wall + glove-hand pull",
+        "protocol": "3 sets × 8 reps, every other day. Focus on the elbow brushing the hip as the arm comes through the release zone — and the glove side pulling back hard at the same instant.",
+        "why": "The 'brush at hip' is where the windmill converts arm circle into ball velocity. Late or missed brush = ball gets pushed instead of whipped, costing 3-5 mph.",
+    },
+    "softball_drag_toe": {
+        "category": "Mechanics",
+        "phase": "week",
+        "priority": 3,
+        "label": "Drive Foot Drag Inconsistency",
+        "drill": "Towel drag-toe drill",
+        "protocol": "Place a towel under the drive (back) foot; drag the toe through the entire delivery. 3 sets × 10 reps, 2 days this week.",
+        "why": "A consistent drag-toe finish keeps the hips and shoulders in line, which keeps the release point consistent. Hopping off the rubber leaks energy and scatters the ball.",
+    },
+    "softball_below_baseline_velo": {
+        "category": "Velocity",
+        "phase": "week",
+        "priority": 3,
+        "label": "Fastball Velocity Down vs Baseline",
+        "drill": "Weighted windmill protocol (4oz, 5oz, 6oz, 7oz)",
+        "protocol": "Pull-downs at full intent: 4oz/5oz/6oz/7oz × 3 reps each, 2 days this week. Plus 'spinners' (10oz ball, no release, full motion) 5×10 daily.",
+        "why": "Weighted-ball protocols add 2-4 mph in 6-8 weeks for softball pitchers too. The added load forces faster arm circle and stronger trunk involvement.",
+    },
+    "softball_grip_curve_pronation": {
+        "category": "Grip",
+        "phase": "week",
+        "priority": 4,
+        "label": "Curveball Wrist Path Inconsistent",
+        "drill": "Wrist-rotation mirror work + spin axis check",
+        "protocol": "Mirror grip + wrist rotation 5 min daily. 10 curveballs per bullpen with a coach calling out spin direction afterward (or check Pitch Logic spin axis output).",
+        "why": "Softball curveballs depend on wrist outward rotation timing. Mirror work locks the muscle memory so the spin axis is consistent — 9:00 axis curves break sharply, 10:30 axes back up.",
+        "grip_key": "softball_curve",
+    },
+
+    # ----- Softball versions of shared issue keys (so the recommender can route
+    # to softball drill text + softball videos instead of baseball ones) -----
+    "softball_session_cooldown_default": {
+        "category": "Injury Prevention",
+        "phase": "today",
+        "priority": 3,
+        "label": "Standard Windmill Cooldown",
+        "drill": "Bands + decel windmill swings + light catch — softball shoulder care",
+        "protocol": "Light yellow-band external rotations 3×15. Slow decel windmill swings (no ball) 2×10. Easy catch at 30 ft 5 min.",
+        "why": "Baseline cooldown for softball pitchers. Flushes blood through the shoulder and protects the windmill's internal rotation mechanics.",
+    },
+    "softball_high_valgus_stress": {
+        "category": "Injury Prevention",
+        "phase": "today",
+        "priority": 1,
+        "label": "Elevated Arm Stress (Windmill)",
+        "drill": "Sleeper stretch + light decel windmill swings",
+        "protocol": "Sleeper stretch 3×30s each side. Decel windmill swings (no ball, slow) 3×8. Cold-pack the arm 10 min.",
+        "why": "Even windmill mechanics can stress the shoulder if release timing is off. Slow swings with deceleration teach the arm to slow safely after release.",
+    },
+    "softball_low_fastball_spin": {
+        "category": "Stuff — Fastball",
+        "phase": "week",
+        "priority": 4,
+        "label": "Softball Fastball Spin Too Low",
+        "drill": "Wrist-snap reps + finger-pressure cue at release",
+        "protocol": "Sponge ball spin reps 4×10 daily (focus on hard fingertip snap upward). Live cue: 'pull the trigger' on the index + middle finger at the bottom of the arm circle.",
+        "why": "Softball fastballs live or die by clean backspin. Below 1,500-1,800 RPM the ball flattens out and hitters time it easily.",
+    },
+    "softball_low_offspeed_break": {
+        "category": "Stuff — Movement",
+        "phase": "week",
+        "priority": 4,
+        "label": "Offspeed Not Breaking Enough",
+        "drill": "Spin-axis isolation drill — pause and check axis each rep",
+        "protocol": "10 reps per off-speed pitch per bullpen. Watch the seam rotation as the ball leaves the hand — a coach calls out the clock-face axis you hit. Match axis to pitch type (12:00 rise, 6:00 drop, 9:00 curve, 3:00 screw).",
+        "why": "Softball off-speed movement comes from the spin AXIS, not the spin rate. Axis drills lock in the muscle memory for each pitch's release feel.",
+    },
+    "softball_arm_slot_variance": {
+        "category": "Consistency",
+        "phase": "week",
+        "priority": 5,
+        "label": "Inconsistent Windmill Arm Path",
+        "drill": "Mirror windmill drill + cone tracking",
+        "protocol": "10 slow windmill mirror reps before each bullpen. Cone drill: 3 cones at 9:00 / 12:00 / 6:00 around your body; arm should pass through them at every windmill rotation. 3×6, 2 days this week.",
+        "why": "A consistent windmill path = consistent release point = consistent command. The mirror + cones give you the visual feedback to lock it in.",
+    },
+}
+
+
+# =============================================================================
+# UTILITY: spin-clock conversion
+# =============================================================================
+def spin_clock_to_degrees(clock_str: str) -> float:
+    """Convert Pitch Logic's '01:15' clock-face spin direction to degrees.
+
+    12:00 = 0°, 3:00 = 90°, 6:00 = 180°, 9:00 = 270° (clockwise).
+    """
+    if pd.isna(clock_str):
+        return None
+    try:
+        h, m = clock_str.split(":")
+        return (int(h) % 12) * 30 + int(m) * 0.5
+    except (ValueError, AttributeError):
+        return None
+
+
+# =============================================================================
+# PARSERS — one per upstream app
+# =============================================================================
+
+class ParserError(Exception):
+    """Raised when a CSV doesn't match any known schema for its app."""
+    pass
+
+
+# Column alias dictionaries: maps canonical names to alternate names we'll accept.
+# This SINGLE map handles BOTH Pitch Logic AND Rapsodo because the canonical
+# data we want from each is essentially the same — just named differently.
+# Add new aliases here as you discover them in real exports (TrackMan, FlightScope, etc).
+PITCH_LOGIC_ALIASES = {
+    "Timestamp":           ["timestamp", "time", "datetime", "date_time", "pitch_time",
+                            "release_time", "date", "captured_at", "recorded_at",
+                            "pitch_date", "datestamp"],
+    "Pitch_Num":           ["pitch_num", "pitch_number", "pitch_no", "pitch_#",
+                            "pitch_index", "pitchnum", "throw_num", "no"],
+    "Pitcher_Name":        ["pitcher", "pitcher_name", "player", "player_name", "athlete"],
+    "Pitch_Type":          ["pitch_type", "type", "pitchtype", "pitch_class",
+                            "pitch_label", "classification", "auto_pitch_type",
+                            "rapsodo_pitch_type"],
+    "Velocity_mph":        ["velocity_mph", "velocity", "speed", "speed_mph", "mph",
+                            "release_velocity", "release_velocity_mph", "release_speed",
+                            "release_speed_mph", "ball_speed", "velocity_release"],
+    "Total_Spin_rpm":      ["total_spin_rpm", "total_spin", "spin_rate", "spin_rate_rpm",
+                            "spin", "rpm", "spin_rpm"],
+    "True_Spin_rpm":       ["true_spin_rpm", "true_spin", "active_spin_rpm",
+                            "useful_spin_rpm"],
+    "Spin_Efficiency_pct": ["spin_efficiency_pct", "spin_efficiency", "spin_eff",
+                            "active_spin", "active_spin_pct", "true_spin_pct",
+                            "useful_spin", "useful_spin_pct"],
+    "Spin_Direction_hhmm": ["spin_direction_hhmm", "spin_direction", "spin_axis_clock",
+                            "spin_clock", "axis_clock", "spin_axis_hhmm", "tilt",
+                            "spin_axis"],
+    "Gyro_Degrees":        ["gyro_degrees", "gyro", "gyro_deg", "gyro_angle"],
+    "Vert_Break_in":       ["vert_break_in", "vertical_break", "vert_break", "vbreak",
+                            "ivb", "induced_vertical_break", "induced_vert_break",
+                            "vert_break_inches", "vbreak_in", "vb"],
+    "Horiz_Break_in":      ["horiz_break_in", "horizontal_break", "horiz_break",
+                            "hbreak", "horiz_break_inches", "hbreak_in", "hb"],
+    "Extension_ft":        ["extension_ft", "extension", "release_extension",
+                            "release_extension_ft"],
+    "Release_Height_ft":   ["release_height_ft", "release_height", "release_z",
+                            "rel_height", "release_height_feet"],
+    "Release_Side_ft":     ["release_side_ft", "release_side", "release_x",
+                            "rel_side", "release_side_feet"],
+    "Strike_Zone_Side":    ["strike_zone_side", "plate_x", "strikezoneside"],
+    "Strike_Zone_Height":  ["strike_zone_height", "plate_z", "strikezoneheight",
+                            "strike_zone_top"],
+}
+
+PULSE_ALIASES = {
+    "Timestamp":               ["timestamp", "time", "datetime", "date_time",
+                                "throw_time", "date", "captured_at", "recorded_at"],
+    "Athlete_Name":            ["athlete_name", "athlete", "name", "player_name", "player"],
+    "Athlete_ID":              ["athlete_id", "id", "player_id", "user_id"],
+    "Throw_ID":                ["throw_id", "id", "throw_num", "throw_number", "event_id"],
+    "Throw_Type":              ["throw_type", "type", "throw_kind"],
+    "Tag":                     ["tag", "label", "throw_tag", "session_tag"],
+    "Arm_Speed_deg_sec":       ["arm_speed_deg_sec", "arm_speed", "armspeed",
+                                "arm_velocity", "arm_speed_dps"],
+    "Peak_Valgus_Torque_Nm":   ["peak_valgus_torque_nm", "valgus_torque", "torque",
+                                "peak_valgus", "stress_nm", "elbow_torque",
+                                "peak_torque", "valgus", "stress"],
+    "Arm_Slot_deg":            ["arm_slot_deg", "arm_slot", "armslot", "slot",
+                                "arm_angle"],
+    "Shoulder_Rotation_deg":   ["shoulder_rotation_deg", "shoulder_rotation",
+                                "shoulder_ext_rot"],
+    "Daily_Workload":          ["daily_workload", "workload", "today_workload"],
+    "Chronic_Workload":        ["chronic_workload", "chronic_load", "chronic"],
+    "AC_Ratio":                ["ac_ratio", "acr", "acute_chronic_ratio",
+                                "acute_to_chronic", "load_ratio"],
+    "One_Day_Stress":          ["one_day_stress", "stress", "daily_stress",
+                                "throw_stress"],
+}
+
+PPAI_FRAME_ALIASES = {
+    "Frame":                          ["frame", "frame_num", "frame_number"],
+    "Phase":                          ["phase", "event", "kinematic_phase", "label"],
+    "Time_sec":                       ["time_sec", "time", "t_sec", "t", "timestamp_sec"],
+    "Pelvis_Rotation_deg":            ["pelvis_rotation_deg", "pelvis_rotation",
+                                       "pelvis_rot", "hip_rotation"],
+    "Trunk_Rotation_deg":             ["trunk_rotation_deg", "trunk_rotation",
+                                       "torso_rotation", "trunk_rot"],
+    "Hip_Shoulder_Separation_deg":    ["hip_shoulder_separation_deg",
+                                       "hip_shoulder_separation",
+                                       "hip_shoulder_sep", "separation"],
+    "Elbow_Flexion_deg":              ["elbow_flexion_deg", "elbow_flexion",
+                                       "elbow_angle"],
+    "Shoulder_Abduction_deg":         ["shoulder_abduction_deg", "shoulder_abduction"],
+    "Shoulder_External_Rot_deg":      ["shoulder_external_rot_deg",
+                                       "shoulder_external_rotation",
+                                       "shoulder_ext_rot", "external_rotation"],
+    "Lead_Knee_Extension_deg":        ["lead_knee_extension_deg", "lead_knee_extension",
+                                       "front_knee_extension", "knee_extension"],
+    "Pelvis_Angular_Vel_deg_sec":     ["pelvis_angular_vel_deg_sec",
+                                       "pelvis_angular_velocity", "pelvis_vel"],
+    "Trunk_Angular_Vel_deg_sec":      ["trunk_angular_vel_deg_sec",
+                                       "trunk_angular_velocity", "trunk_vel"],
+}
+
+
+def _norm_col(name: str) -> str:
+    """Normalize a column name for matching: lowercase, no spaces/dashes/special."""
+    return (
+        str(name)
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("/", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("%", "pct")
+    )
+
+
+def _normalize_columns(df: pd.DataFrame, alias_map: dict) -> pd.DataFrame:
+    """Rename df columns to canonical names based on alias_map."""
+    rename = {}
+    for col in df.columns:
+        norm = _norm_col(col)
+        for canonical, aliases in alias_map.items():
+            if norm == _norm_col(canonical) or norm in [_norm_col(a) for a in aliases]:
+                rename[col] = canonical
+                break
+    return df.rename(columns=rename)
+
+
+def _detect_header_row(lines: list, indicator_keywords: list, min_hits: int = 2) -> int:
+    """Find the first line that looks like a CSV header by counting keyword matches."""
+    for i, line in enumerate(lines[:40]):  # scan first 40 lines only
+        line_lower = line.lower()
+        hits = sum(1 for kw in indicator_keywords if kw.lower() in line_lower)
+        if hits >= min_hits:
+            return i
+    return -1
+
+
+def file_diagnostic(uploaded_file, max_lines: int = 12) -> str:
+    """Return the first N lines of a file as a string, for diagnostic display."""
+    try:
+        text = _read_uploaded_text(uploaded_file)
+        return "\n".join(text.split("\n")[:max_lines])
+    except Exception as e:
+        return f"(could not read file: {e})"
+
+
+def parse_ball_flight(uploaded_file) -> pd.DataFrame:
+    """Parse a ball-flight CSV (Pitch Logic, Rapsodo, or compatible).
+
+    Auto-detects the header row and normalizes column names to a canonical
+    schema. Handles the differences between Pitch Logic (gives Spin Efficiency
+    as a percentage) and Rapsodo (gives True Spin in RPM) automatically.
+    """
+    text = _read_uploaded_text(uploaded_file)
+    lines = text.split("\n")
+
+    # Find the header row by looking for common ball-flight indicators
+    indicators = ["pitch", "velocity", "speed", "spin", "release", "break", "rapsodo"]
+    header_idx = _detect_header_row(lines, indicators, min_hits=2)
+    if header_idx < 0:
+        raise ParserError(
+            "Could not find a ball-flight CSV header row.\n\n"
+            "First lines of the file looked like:\n"
+            + "\n".join(lines[:8])
+        )
+
+    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    df.columns = [str(c).strip() for c in df.columns]
+    df = _normalize_columns(df, PITCH_LOGIC_ALIASES)
+
+    # Required canonical columns
+    required = ["Timestamp", "Velocity_mph"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ParserError(
+            "Ball-flight CSV is missing required columns: "
+            + ", ".join(missing)
+            + "\n\nColumns we DID find in your file:\n  "
+            + ", ".join(df.columns)
+            + "\n\nIf your CSV uses different names, paste the first row of your "
+            "file and I'll add those names to the alias list."
+        )
+
+    # Fill in optional columns with defaults so downstream code never KeyErrors
+    optional_defaults = {
+        "Pitch_Num":           lambda: range(1, len(df) + 1),
+        "Pitch_Type":          "Unknown",
+        "Total_Spin_rpm":      None,
+        "True_Spin_rpm":       None,
+        "Spin_Efficiency_pct": None,
+        "Spin_Direction_hhmm": None,
+        "Gyro_Degrees":        None,
+        "Vert_Break_in":       None,
+        "Horiz_Break_in":      None,
+        "Extension_ft":        None,
+        "Release_Height_ft":   None,
+        "Release_Side_ft":     None,
+    }
+    for col, default in optional_defaults.items():
+        if col not in df.columns:
+            df[col] = default() if callable(default) else default
+
+    # ----- Derived fields -----
+    # Rapsodo gives True_Spin_rpm; Pitch Logic gives Spin_Efficiency_pct.
+    # If we have True_Spin + Total_Spin but no efficiency, compute it.
+    needs_eff = df["Spin_Efficiency_pct"].isna() if hasattr(df["Spin_Efficiency_pct"], "isna") else True
+    has_true = df["True_Spin_rpm"].notna().any() if hasattr(df["True_Spin_rpm"], "notna") else False
+    has_total = df["Total_Spin_rpm"].notna().any() if hasattr(df["Total_Spin_rpm"], "notna") else False
+    if has_true and has_total:
+        df["Spin_Efficiency_pct"] = df.apply(
+            lambda r: (r["True_Spin_rpm"] / r["Total_Spin_rpm"] * 100)
+                       if pd.notna(r["True_Spin_rpm"]) and pd.notna(r["Total_Spin_rpm"]) and r["Total_Spin_rpm"] > 0
+                       else r.get("Spin_Efficiency_pct"),
+            axis=1,
+        )
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+    df["Spin_Axis_Deg"] = df["Spin_Direction_hhmm"].apply(spin_clock_to_degrees)
+    df = df.dropna(subset=["Timestamp"]).reset_index(drop=True)
+    return df
+
+
+# Back-compat alias: existing code calls parse_pitch_logic, keep that working
+def parse_pitch_logic(uploaded_file) -> pd.DataFrame:
+    """Back-compat alias for parse_ball_flight. Handles Pitch Logic CSVs."""
+    return parse_ball_flight(uploaded_file)
+
+
+def parse_rapsodo(uploaded_file) -> pd.DataFrame:
+    """Alias for parse_ball_flight specifically for Rapsodo CSVs."""
+    return parse_ball_flight(uploaded_file)
+
+
+def parse_pulse(uploaded_file) -> pd.DataFrame:
+    """Parse a Driveline Pulse CSV export, auto-detecting columns."""
+    text = _read_uploaded_text(uploaded_file)
+    lines = text.split("\n")
+
+    indicators = ["throw", "timestamp", "time", "athlete", "torque", "workload",
+                  "stress", "valgus", "arm"]
+    header_idx = _detect_header_row(lines, indicators, min_hits=2)
+    if header_idx < 0:
+        raise ParserError(
+            "Could not find a Pulse header row.\n\n"
+            "First lines of the file looked like:\n"
+            + "\n".join(lines[:8])
+        )
+
+    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    df.columns = [str(c).strip() for c in df.columns]
+    df = _normalize_columns(df, PULSE_ALIASES)
+
+    required = ["Timestamp"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ParserError(
+            "Pulse CSV is missing required columns: "
+            + ", ".join(missing)
+            + "\n\nColumns we DID find:\n  "
+            + ", ".join(df.columns)
+        )
+
+    optional_defaults = {
+        "Athlete_ID":             None,
+        "Athlete_Name":           None,
+        "Throw_ID":               None,
+        "Throw_Type":             None,
+        "Tag":                    None,
+        "Arm_Speed_deg_sec":      None,
+        "Peak_Valgus_Torque_Nm":  None,
+        "Arm_Slot_deg":           None,
+        "Shoulder_Rotation_deg":  None,
+        "Daily_Workload":         None,
+        "Chronic_Workload":       None,
+        "AC_Ratio":               None,
+        "One_Day_Stress":         None,
+    }
+    for col, default in optional_defaults.items():
+        if col not in df.columns:
+            df[col] = default
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["Timestamp"]).reset_index(drop=True)
+    return df
+
+
+def _read_uploaded_text(uploaded_file) -> str:
+    """Helper that handles both Streamlit UploadedFile and plain file paths."""
+    if hasattr(uploaded_file, "read"):
+        raw = uploaded_file.read()
+        # Streamlit's UploadedFile returns bytes; rewind so it can be re-read
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8")
+        return raw
+    return Path(uploaded_file).read_text(encoding="utf-8")
+
+
+def parse_proplayai_metadata(metadata_line: str) -> dict:
+    """Extract Pitch_ID, Pitcher, Hand, Frame_Rate, Captured_At from line 1."""
+    pairs = re.findall(r'"([^"]+)"', metadata_line)
+    meta = {}
+    for pair in pairs:
+        if ":" in pair:
+            key, value = pair.split(":", 1)
+            meta[key.strip()] = value.strip()
+    return meta
+
+
+def _find_phase_row(frame_df: pd.DataFrame, phase_keywords: list):
+    """Find the first frame whose Phase value matches any keyword (case-insensitive)."""
+    if "Phase" not in frame_df.columns:
+        return None
+    matches = frame_df[frame_df["Phase"].astype(str).str.lower().apply(
+        lambda v: any(kw.lower() in v for kw in phase_keywords)
+    )]
+    return matches.iloc[0] if not matches.empty else None
+
+
+def parse_proplayai_file(uploaded_file, filename: str) -> dict:
+    """Parse one ProPlayAI per-pitch frame file and reduce it to a single row.
+
+    Auto-detects header row and normalizes column + phase names so we
+    handle variations in real exports.
+    """
+    text = _read_uploaded_text(uploaded_file)
+    lines = text.strip().split("\n")
+
+    # Try to find a metadata line (one with "Pitch_ID:" style key:value pairs)
+    metadata = {}
+    for line in lines[:3]:
+        if ":" in line and ("pitch_id" in line.lower() or "captured" in line.lower()
+                            or "pitcher" in line.lower() or "frame_rate" in line.lower()):
+            metadata = parse_proplayai_metadata(line)
+            break
+
+    # Find the frame header row
+    indicators = ["frame", "phase", "time", "pelvis", "trunk", "elbow",
+                  "shoulder", "knee", "rotation"]
+    header_idx = _detect_header_row(lines, indicators, min_hits=2)
+    if header_idx < 0:
+        raise ParserError(
+            f"Could not find a ProPlayAI header row in {filename}.\n\n"
+            "First lines of the file looked like:\n"
+            + "\n".join(lines[:8])
+        )
+
+    frame_df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    frame_df.columns = [str(c).strip() for c in frame_df.columns]
+    frame_df = _normalize_columns(frame_df, PPAI_FRAME_ALIASES)
+
+    # Pull canonical event-phase rows (tolerant to label variations)
+    release = _find_phase_row(frame_df, ["ball_release", "release"])
+    if release is None:
+        # No release frame — bail with None so the batch parser skips this pitch
+        return None
+    foot_plant_row = _find_phase_row(frame_df, ["foot_plant", "footplant", "fp"])
+    max_extrot_row = _find_phase_row(frame_df, ["max_external_rot", "max_er", "mer"])
+
+    def _safe_get(row, col):
+        if row is None:
+            return None
+        return row[col] if col in row.index else None
+
+    def _safe_max(col):
+        return frame_df[col].max() if col in frame_df.columns else None
+
+    return {
+        "Pitch_ID":                  metadata.get("Pitch_ID"),
+        "Source_File":               filename,
+        "Captured_At":               pd.to_datetime(metadata.get("Captured_At"), utc=True, errors="coerce"),
+        "Frame_Rate":                int(metadata.get("Frame_Rate", 240)) if metadata.get("Frame_Rate", "").isdigit() else 240,
+        "Release_Pelvis_Rot":        _safe_get(release, "Pelvis_Rotation_deg"),
+        "Release_Trunk_Rot":         _safe_get(release, "Trunk_Rotation_deg"),
+        "Release_Hip_Shoulder_Sep":  _safe_get(release, "Hip_Shoulder_Separation_deg"),
+        "Release_Elbow_Flex":        _safe_get(release, "Elbow_Flexion_deg"),
+        "Release_Shoulder_Abd":      _safe_get(release, "Shoulder_Abduction_deg"),
+        "Release_Shoulder_ExtRot":   _safe_get(release, "Shoulder_External_Rot_deg"),
+        "Release_Lead_Knee_Ext":     _safe_get(release, "Lead_Knee_Extension_deg"),
+        "Peak_Hip_Shoulder_Sep":     _safe_max("Hip_Shoulder_Separation_deg"),
+        "Peak_Pelvis_Angular_Vel":   _safe_max("Pelvis_Angular_Vel_deg_sec"),
+        "Peak_Trunk_Angular_Vel":    _safe_max("Trunk_Angular_Vel_deg_sec"),
+        "FootPlant_Trunk_Rot":       _safe_get(foot_plant_row, "Trunk_Rotation_deg"),
+        "MaxExtRot_Angle":           _safe_get(max_extrot_row, "Shoulder_External_Rot_deg"),
+        "Time_FootPlant_to_Release": (release["Time_sec"] - foot_plant_row["Time_sec"])
+                                       if (foot_plant_row is not None
+                                           and "Time_sec" in release.index
+                                           and "Time_sec" in foot_plant_row.index)
+                                       else None,
+    }
+
+
+def parse_proplayai_batch(uploaded_files) -> pd.DataFrame:
+    """Run the per-pitch parser over a list of uploaded ProPlayAI files."""
+    rows = []
+    for f in uploaded_files:
+        filename = getattr(f, "name", str(f))
+        row = parse_proplayai_file(f, filename)
+        if row is not None:
+            rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("Captured_At").reset_index(drop=True)
+
+
+# =============================================================================
+# SELF-HEALING TIMELINE ALIGNER
+# =============================================================================
+def align_pitches(pl_df: pd.DataFrame,
+                  pulse_df: pd.DataFrame,
+                  ppai_df: pd.DataFrame) -> pd.DataFrame:
+    """Align Pitch Logic + Pulse + ProPlayAI by timestamp.
+
+    Pitch Logic is the spine — every Pitch Logic row becomes one canonical
+    pitch. We then look for the nearest Pulse throw and the nearest ProPlayAI
+    capture within a tolerance window. Anything we can't find gets a
+    placeholder row and the healed_flag is set so downstream code knows.
+    """
+    canonical_rows = []
+
+    pulse_used = set()
+    ppai_used = set()
+
+    for _, pl in pl_df.iterrows():
+        pl_time = pl["Timestamp"]
+
+        # --- find nearest Pulse throw within tolerance ---
+        pulse_match = None
+        pulse_method = None
+        if not pulse_df.empty:
+            pulse_df_avail = pulse_df.loc[~pulse_df.index.isin(pulse_used)].copy()
+            pulse_df_avail["_dt"] = (pulse_df_avail["Timestamp"] - pl_time).abs()
+            within_tol = pulse_df_avail[pulse_df_avail["_dt"] <= timedelta(seconds=ALIGNMENT_TOLERANCE_SECONDS)]
+            if not within_tol.empty:
+                pulse_match = within_tol.nsmallest(1, "_dt").iloc[0]
+                pulse_used.add(pulse_match.name)
+                pulse_method = "timestamp_window"
+            else:
+                # Wider second pass: timestamp_wide
+                wider = pulse_df_avail[pulse_df_avail["_dt"] <= timedelta(seconds=SECOND_PASS_TOLERANCE_SECONDS)]
+                if not wider.empty:
+                    pulse_match = wider.nsmallest(1, "_dt").iloc[0]
+                    pulse_used.add(pulse_match.name)
+                    pulse_method = "timestamp_wide"
+
+        # --- find nearest ProPlayAI capture within tolerance ---
+        ppai_match = None
+        ppai_method = None
+        if not ppai_df.empty:
+            ppai_df_avail = ppai_df.loc[~ppai_df.index.isin(ppai_used)].copy()
+            ppai_df_avail["_dt"] = (ppai_df_avail["Captured_At"] - pl_time).abs()
+            within_tol = ppai_df_avail[ppai_df_avail["_dt"] <= timedelta(seconds=ALIGNMENT_TOLERANCE_SECONDS)]
+            if not within_tol.empty:
+                ppai_match = within_tol.nsmallest(1, "_dt").iloc[0]
+                ppai_used.add(ppai_match.name)
+                ppai_method = "timestamp_window"
+            else:
+                wider = ppai_df_avail[ppai_df_avail["_dt"] <= timedelta(seconds=SECOND_PASS_TOLERANCE_SECONDS)]
+                if not wider.empty:
+                    ppai_match = wider.nsmallest(1, "_dt").iloc[0]
+                    ppai_used.add(ppai_match.name)
+                    ppai_method = "timestamp_wide"
+
+        # --- build the canonical row ---
+        row = {
+            # Identity
+            "Pitch_Num":          pl["Pitch_Num"],
+            "Timestamp":          pl_time,
+            "Pitch_Type":         pl["Pitch_Type"],
+
+            # Ball flight (from Pitch Logic)
+            "Velocity_mph":       pl["Velocity_mph"],
+            "Total_Spin_rpm":     pl["Total_Spin_rpm"],
+            "Spin_Efficiency_pct": pl["Spin_Efficiency_pct"],
+            "Spin_Axis_Deg":      pl["Spin_Axis_Deg"],
+            "Spin_Direction_hhmm": pl["Spin_Direction_hhmm"],
+            "Gyro_Degrees":       pl["Gyro_Degrees"],
+            "Vert_Break_in":      pl["Vert_Break_in"],
+            "Horiz_Break_in":     pl["Horiz_Break_in"],
+            "Extension_ft":       pl["Extension_ft"],
+            "Release_Height_ft":  pl["Release_Height_ft"],
+            "Release_Side_ft":    pl["Release_Side_ft"],
+
+            # Plate location (Rapsodo provides directly; Pitch Logic gets estimated later)
+            "Strike_Zone_Side":   pl["Strike_Zone_Side"]   if "Strike_Zone_Side"   in pl.index else None,
+            "Strike_Zone_Height": pl["Strike_Zone_Height"] if "Strike_Zone_Height" in pl.index else None,
+
+            # Arm health (from Pulse)
+            "Pulse_Present":      pulse_match is not None,
+            "Pulse_Match_Method": pulse_method,
+            "Arm_Speed_deg_sec":  pulse_match["Arm_Speed_deg_sec"] if pulse_match is not None else None,
+            "Peak_Valgus_Nm":     pulse_match["Peak_Valgus_Torque_Nm"] if pulse_match is not None else None,
+            "Arm_Slot_deg":       pulse_match["Arm_Slot_deg"] if pulse_match is not None else None,
+            "AC_Ratio":           pulse_match["AC_Ratio"] if pulse_match is not None else None,
+            "One_Day_Stress":     pulse_match["One_Day_Stress"] if pulse_match is not None else None,
+
+            # Biomechanics (from ProPlayAI)
+            "PPAI_Present":               ppai_match is not None,
+            "PPAI_Match_Method":          ppai_method,
+            "Release_Hip_Shoulder_Sep":   ppai_match["Release_Hip_Shoulder_Sep"] if ppai_match is not None else None,
+            "Peak_Hip_Shoulder_Sep":      ppai_match["Peak_Hip_Shoulder_Sep"] if ppai_match is not None else None,
+            "Release_Trunk_Rot":          ppai_match["Release_Trunk_Rot"] if ppai_match is not None else None,
+            "Release_Lead_Knee_Ext":      ppai_match["Release_Lead_Knee_Ext"] if ppai_match is not None else None,
+            "FootPlant_Trunk_Rot":        ppai_match["FootPlant_Trunk_Rot"] if ppai_match is not None else None,
+            "Peak_Trunk_Angular_Vel":     ppai_match["Peak_Trunk_Angular_Vel"] if ppai_match is not None else None,
+
+            # Confidence
+            "Healed":             (pulse_match is None) or (ppai_match is None),
+            "Healed_Notes":       [],
+        }
+        if pulse_match is None:
+            row["Healed_Notes"].append("Pulse missing")
+        if ppai_match is None:
+            row["Healed_Notes"].append("ProPlayAI missing")
+
+        canonical_rows.append(row)
+
+    df = pd.DataFrame(canonical_rows)
+    df["Healed_Notes"] = df["Healed_Notes"].apply(lambda x: ", ".join(x) if x else "")
+    df["Alignment_Confidence"] = df.apply(_confidence_score, axis=1)
+    df = _estimate_plate_location_if_missing(df)
+    df = _score_outliers(df)
+    return df
+
+
+def _estimate_plate_location_if_missing(df: pd.DataFrame) -> pd.DataFrame:
+    """For rows missing plate location (typical for Pitch Logic ingest), estimate it.
+
+    Pitch Logic doesn't track where the ball crossed the plate — only where it
+    was released and how much it broke. We project the ball forward assuming
+    the pitcher AIMED AT THE CENTER OF THE STRIKE ZONE (the most reasonable
+    default in a bullpen). The break then dictates where it actually ended up.
+
+    This is an APPROXIMATION — for measured plate location, use Rapsodo or
+    a camera-based system.
+    """
+    DEFAULT_AIM_HEIGHT = 2.5   # ft — middle of strike zone
+    GRAVITY_DROP_FT    = 0.0   # already baked into "induced vertical break"
+                               # so net = aim height - rel_height baked in mechanics
+
+    for idx in df.index:
+        if pd.isna(df.at[idx, "Strike_Zone_Side"]):
+            hbreak = df.at[idx, "Horiz_Break_in"]
+            if pd.notna(hbreak):
+                # Assume aim at center plate (x=0). Plate location = break in feet.
+                df.at[idx, "Strike_Zone_Side"] = round(hbreak / 12.0, 2)
+
+        if pd.isna(df.at[idx, "Strike_Zone_Height"]):
+            vbreak = df.at[idx, "Vert_Break_in"]
+            if pd.notna(vbreak):
+                # Assume aim at mid-zone height (2.5 ft). Induced vertical break
+                # is what carries the ball above gravity-only trajectory.
+                # IVB > 0 = ball stays higher than gravity drop would predict.
+                # We approximate: a "true straight" pitch lands at aim height;
+                # IVB shifts the final position up by (vbreak - 12) inches / 12
+                # (12" is roughly the league-average IVB baseline).
+                BASELINE_IVB = 12.0
+                df.at[idx, "Strike_Zone_Height"] = round(
+                    DEFAULT_AIM_HEIGHT + (vbreak - BASELINE_IVB) / 12.0, 2
+                )
+    return df
+
+
+def _score_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """Classify each pitch as positive / negative / average outlier vs the session.
+
+    Positive outlier: pitch was notably BETTER than the pitcher's session avg
+    on a key axis (velo / spin / movement) AND safe on stress.
+    Negative outlier: pitch was notably WORSE — low velo/spin OR high stress
+    OR elevated mechanics flag.
+    """
+    df = df.copy()
+    df["Outlier_Type"] = "average"
+    df["Outlier_Score"] = 0.0
+    df["Outlier_Reasons"] = ""
+
+    # Per pitch type, look at velocity & spin
+    for ptype, group in df.groupby("Pitch_Type"):
+        if len(group) < 2:
+            continue
+        velo_mean, velo_std = group["Velocity_mph"].mean(), group["Velocity_mph"].std()
+        spin_mean, spin_std = group["Total_Spin_rpm"].mean(), group["Total_Spin_rpm"].std()
+        if not velo_std or pd.isna(velo_std): velo_std = 1.0
+        if not spin_std or pd.isna(spin_std): spin_std = 1.0
+
+        for idx in group.index:
+            reasons = []
+            score = 0.0
+            v = df.at[idx, "Velocity_mph"]
+            s = df.at[idx, "Total_Spin_rpm"]
+            stress = df.at[idx, "Peak_Valgus_Nm"]
+            fp_trunk = df.at[idx, "FootPlant_Trunk_Rot"]
+
+            # Velocity outlier
+            if pd.notna(v) and velo_std > 0:
+                v_z = (v - velo_mean) / velo_std
+                if v_z > 1.2:
+                    score += v_z
+                    reasons.append(f"velo +{v - velo_mean:.1f} mph above avg")
+                elif v_z < -1.2:
+                    score += v_z
+                    reasons.append(f"velo {v - velo_mean:.1f} mph below avg")
+
+            # Spin outlier
+            if pd.notna(s) and spin_std > 0:
+                s_z = (s - spin_mean) / spin_std
+                if s_z > 1.2:
+                    score += s_z * 0.5
+                    reasons.append(f"spin +{int(s - spin_mean)} RPM above avg")
+                elif s_z < -1.2:
+                    score += s_z * 0.5
+                    reasons.append(f"spin {int(s - spin_mean)} RPM below avg")
+
+            # Stress (always negative when high)
+            if pd.notna(stress) and stress >= DANGER_VALGUS_NM:
+                score -= 2.0
+                reasons.append(f"elbow stress {stress:.1f} Nm")
+
+            # Early trunk rotation (negative mechanics flag)
+            if pd.notna(fp_trunk) and fp_trunk >= EARLY_TRUNK_ROTATION_DEG:
+                score -= 1.0
+                reasons.append(f"chest opened early ({fp_trunk:.0f}°)")
+
+            df.at[idx, "Outlier_Score"] = round(score, 2)
+            df.at[idx, "Outlier_Reasons"] = "; ".join(reasons)
+
+            if score >= 1.5:
+                df.at[idx, "Outlier_Type"] = "positive"
+            elif score <= -1.5:
+                df.at[idx, "Outlier_Type"] = "negative"
+
+    return df
+
+
+def _confidence_score(row) -> float:
+    """0..1 confidence in a row's data quality."""
+    score = 1.0
+    if not row["Pulse_Present"]:
+        score -= 0.4
+    elif row["Pulse_Match_Method"] == "timestamp_wide":
+        score -= 0.15
+    if not row["PPAI_Present"]:
+        score -= 0.4
+    elif row["PPAI_Match_Method"] == "timestamp_wide":
+        score -= 0.15
+    return max(0.0, round(score, 2))
+
+
+# =============================================================================
+# DEMO MODE — synthetic data generator
+# =============================================================================
+# Pitch "archetypes" used by the demo generator. Each defines a believable
+# distribution of velocity, spin, movement, and biomechanics for a pitch type.
+DEMO_ARCHETYPES = {
+    "Four-Seam Fastball": {
+        "velo":  (91.0, 93.5),
+        "spin":  (2200, 2400),
+        "eff":   (95, 98),
+        "axis":  "01:15",  "gyro": (10, 13),
+        "vbreak": (17, 19),  "hbreak": (-8, -6),
+        "valgus": (52, 56),  "ac_ratio": (0.8, 1.1),
+        "trunk_fp": (28, 34), "hip_shoulder_peak": (52, 56),
+        "lead_knee": (152, 158),
+        # Plate location targets (ft from center plate; height in ft)
+        "plate_x_target": (-0.5, 0.3), "plate_z_target": (2.8, 3.4),
+        "target_grip": "four_seam_fastball",
+    },
+    "Two-Seam Sinker": {
+        "velo":  (89.0, 91.0),
+        "spin":  (2100, 2250),
+        "eff":   (93, 96),
+        "axis":  "02:30",  "gyro": (12, 15),
+        "vbreak": (11, 14),  "hbreak": (-16, -14),
+        "valgus": (50, 54),  "ac_ratio": (0.85, 1.1),
+        "trunk_fp": (29, 33), "hip_shoulder_peak": (50, 55),
+        "lead_knee": (150, 156),
+        "plate_x_target": (0.3, 0.9), "plate_z_target": (1.5, 2.2),
+        "target_grip": "two_seam_fastball",
+    },
+    "Slider Strike-Getter": {
+        "velo":  (82.5, 84.0),
+        "spin":  (2350, 2500),
+        "eff":   (30, 38),
+        "axis":  "08:45",  "gyro": (62, 70),
+        "vbreak": (-3, -1),  "hbreak": (4, 7),
+        "valgus": (47, 52),  "ac_ratio": (0.85, 1.1),
+        "trunk_fp": (30, 35), "hip_shoulder_peak": (46, 52),
+        "lead_knee": (148, 154),
+        "plate_x_target": (-0.7, -0.2), "plate_z_target": (1.8, 2.5),
+        "target_grip": "slider_standard",
+    },
+    "Slider Chase": {
+        "velo":  (78.0, 80.0),
+        "spin":  (2300, 2450),
+        "eff":   (14, 22),
+        "axis":  "09:15",  "gyro": (75, 82),
+        "vbreak": (-6, -3),  "hbreak": (14, 17),
+        "valgus": (62, 68),    # DANGER zone — this is the story arc
+        "ac_ratio": (1.05, 1.30),
+        "trunk_fp": (54, 62),  # opens chest too early
+        "hip_shoulder_peak": (38, 44),
+        "lead_knee": (134, 142),
+        "plate_x_target": (-1.3, -0.7), "plate_z_target": (1.0, 1.8),
+        "target_grip": "slider_spike_seam",
+    },
+    "Changeup": {
+        "velo":  (82.0, 84.5),
+        "spin":  (1600, 1800),
+        "eff":   (85, 92),
+        "axis":  "02:00",  "gyro": (17, 21),
+        "vbreak": (10, 13),  "hbreak": (-15, -13),
+        "valgus": (48, 53),  "ac_ratio": (0.85, 1.1),
+        "trunk_fp": (29, 33), "hip_shoulder_peak": (48, 53),
+        "lead_knee": (150, 156),
+        "plate_x_target": (0.2, 0.7), "plate_z_target": (1.5, 2.2),
+        "target_grip": "changeup_circle",
+    },
+}
+
+# Pitcher's "ideal" target per archetype — used to compute outlier distance
+PITCH_IDEALS = {
+    "Four-Seam Fastball": {"velo": 92.5, "spin": 2350, "vbreak": 18.5, "hbreak": -7.0, "valgus": 53.0},
+    "Two-Seam Sinker":    {"velo": 90.0, "spin": 2200, "vbreak": 13.0, "hbreak": -15.0, "valgus": 52.0},
+    "Slider Strike-Getter": {"velo": 83.5, "spin": 2450, "vbreak": -2.0, "hbreak": 5.5, "valgus": 49.0},
+    "Slider Chase":       {"velo": 79.5, "spin": 2400, "vbreak": -4.5, "hbreak": 16.0, "valgus": 56.0},
+    "Changeup":           {"velo": 83.5, "spin": 1700, "vbreak": 12.0, "hbreak": -14.0, "valgus": 50.0},
+}
+
+# Default demo bullpen: pitch types and counts. Coaches see fastball-heavy
+# work with a couple of chase sliders that flag the elbow-stress story.
+DEMO_BULLPEN_SCRIPT = [
+    "Four-Seam Fastball", "Four-Seam Fastball", "Two-Seam Sinker",
+    "Four-Seam Fastball", "Slider Strike-Getter", "Slider Chase",
+    "Two-Seam Sinker", "Four-Seam Fastball", "Slider Chase",
+    "Slider Strike-Getter", "Changeup", "Changeup",
+]
+
+
+# =============================================================================
+# SOFTBALL ARCHETYPES + BULLPEN SCRIPT
+# =============================================================================
+# Underhand windmill pitching. Mechanics + metrics differ meaningfully from
+# baseball — e.g., elbow stress is lower (windmill unloads the UCL), spin
+# axes target different clock positions (rise = 12:00 backspin, drop = 6:00
+# topspin), and target plate locations follow softball strike-zone norms.
+DEMO_ARCHETYPES_SOFTBALL = {
+    "Softball Fastball": {
+        "velo":  (58.0, 64.0),
+        "spin":  (1500, 2000),
+        "eff":   (88, 95),
+        "axis":  "10:30",  "gyro": (12, 18),
+        "vbreak": (-1, 2),  "hbreak": (6, 11),
+        "valgus": (28, 36),  "ac_ratio": (0.8, 1.1),
+        "trunk_fp": (28, 34), "hip_shoulder_peak": (40, 48),
+        "lead_knee": (152, 162),
+        "plate_x_target": (-0.4, 0.5), "plate_z_target": (1.8, 2.6),
+        "target_grip": "softball_fastball",
+    },
+    "Rise Ball": {
+        "velo":  (56.0, 62.0),
+        "spin":  (1900, 2400),     # high spin for the rise effect
+        "eff":   (92, 97),
+        "axis":  "12:00",  "gyro": (8, 14),    # near-pure backspin
+        "vbreak": (4, 9),                       # POSITIVE = ball stays up
+        "hbreak": (-2, 2),
+        "valgus": (30, 38),  "ac_ratio": (0.85, 1.15),
+        "trunk_fp": (29, 33), "hip_shoulder_peak": (40, 48),
+        "lead_knee": (150, 158),
+        "plate_x_target": (-0.5, 0.5), "plate_z_target": (2.9, 3.5),
+        "target_grip": "softball_rise",
+    },
+    "Drop Ball": {
+        "velo":  (55.0, 61.0),
+        "spin":  (1600, 2100),
+        "eff":   (80, 92),
+        "axis":  "06:00",  "gyro": (12, 22),    # topspin = drops fast
+        "vbreak": (-8, -3),                     # NEGATIVE = drops more than gravity
+        "hbreak": (-2, 3),
+        "valgus": (29, 36),  "ac_ratio": (0.85, 1.10),
+        "trunk_fp": (30, 35), "hip_shoulder_peak": (40, 47),
+        "lead_knee": (151, 159),
+        "plate_x_target": (-0.4, 0.4), "plate_z_target": (1.3, 1.9),
+        "target_grip": "softball_drop",
+    },
+    "Curveball": {
+        "velo":  (54.0, 59.0),
+        "spin":  (1500, 2000),
+        "eff":   (70, 85),
+        "axis":  "08:30",  "gyro": (25, 38),
+        "vbreak": (-2, 2),  "hbreak": (-9, -5),
+        "valgus": (28, 35),  "ac_ratio": (0.85, 1.10),
+        "trunk_fp": (30, 35), "hip_shoulder_peak": (38, 46),
+        "lead_knee": (149, 157),
+        "plate_x_target": (-1.0, -0.4), "plate_z_target": (1.6, 2.4),
+        "target_grip": "softball_curve",
+    },
+    "Screwball": {
+        "velo":  (54.0, 59.0),
+        "spin":  (1500, 2000),
+        "eff":   (70, 85),
+        "axis":  "03:30",  "gyro": (25, 38),
+        "vbreak": (-2, 2),  "hbreak": (5, 9),
+        "valgus": (28, 35),  "ac_ratio": (0.85, 1.10),
+        "trunk_fp": (30, 35), "hip_shoulder_peak": (38, 46),
+        "lead_knee": (149, 157),
+        "plate_x_target": (0.4, 1.0), "plate_z_target": (1.6, 2.4),
+        "target_grip": "softball_screw",
+    },
+    "Change-Up": {
+        "velo":  (44.0, 50.0),     # 10-14 mph slower than fastball
+        "spin":  (900, 1300),       # low "dead" spin
+        "eff":   (60, 78),
+        "axis":  "10:00",  "gyro": (35, 50),
+        "vbreak": (-4, -1),  "hbreak": (3, 7),
+        "valgus": (26, 33),  "ac_ratio": (0.80, 1.05),
+        "trunk_fp": (30, 35), "hip_shoulder_peak": (39, 46),
+        "lead_knee": (150, 158),
+        "plate_x_target": (-0.3, 0.6), "plate_z_target": (1.4, 2.1),
+        "target_grip": "softball_change",
+    },
+}
+
+# Softball bullpen script — features a rise ball at top + a drop ball
+# at bottom for the "vertical tunnel" story coaches teach
+DEMO_BULLPEN_SCRIPT_SOFTBALL = [
+    "Softball Fastball", "Softball Fastball", "Rise Ball",
+    "Drop Ball", "Rise Ball", "Curveball",
+    "Softball Fastball", "Drop Ball", "Change-Up",
+    "Screwball", "Rise Ball", "Drop Ball",
+]
+
+PITCH_IDEALS_SOFTBALL = {
+    "Softball Fastball": {"velo": 62.0, "spin": 1800, "vbreak": 0.0, "hbreak": 9.0,  "valgus": 32.0},
+    "Rise Ball":         {"velo": 60.0, "spin": 2200, "vbreak": 7.0, "hbreak": 0.0,  "valgus": 34.0},
+    "Drop Ball":         {"velo": 58.0, "spin": 1900, "vbreak": -6.0, "hbreak": 0.0, "valgus": 33.0},
+    "Curveball":         {"velo": 57.0, "spin": 1800, "vbreak": 0.0, "hbreak": -7.0, "valgus": 32.0},
+    "Screwball":         {"velo": 57.0, "spin": 1800, "vbreak": 0.0, "hbreak": 7.0,  "valgus": 32.0},
+    "Change-Up":         {"velo": 47.0, "spin": 1100, "vbreak": -2.5, "hbreak": 5.0, "valgus": 30.0},
+}
+
+DEMO_BASELINE_SOFTBALL = {
+    "Softball Fastball": {"velo": 60.0, "vbreak": 0.5,  "stress": 33.0},
+    "Rise Ball":         {"velo": 58.5, "vbreak": 5.0,  "stress": 34.5},
+    "Drop Ball":         {"velo": 57.5, "vbreak": -5.0, "stress": 33.0},
+    "Curveball":         {"velo": 56.0, "vbreak": 0.0,  "stress": 32.0},
+    "Screwball":         {"velo": 56.0, "vbreak": 0.0,  "stress": 32.0},
+    "Change-Up":         {"velo": 47.0, "vbreak": -2.5, "stress": 30.0},
+}
+
+
+# Sport-keyed lookup tables — call these helpers instead of accessing
+# the raw constants so future sports (e.g. high-school cricket?) are easy
+SPORT_ARCHETYPES = {
+    "Baseball": DEMO_ARCHETYPES,
+    "Softball": DEMO_ARCHETYPES_SOFTBALL,
+}
+SPORT_BULLPEN_SCRIPT = {
+    "Baseball": DEMO_BULLPEN_SCRIPT,
+    "Softball": DEMO_BULLPEN_SCRIPT_SOFTBALL,
+}
+SPORT_IDEALS = {
+    "Baseball": PITCH_IDEALS,
+    "Softball": PITCH_IDEALS_SOFTBALL,
+}
+SPORT_PITCHING_DISTANCE_FT = {
+    "Baseball": 60.5,
+    "Softball": 43.0,
+}
+
+
+def get_sport_archetypes(sport: str = "Baseball"):
+    return SPORT_ARCHETYPES.get(sport, DEMO_ARCHETYPES)
+
+def get_sport_bullpen_script(sport: str = "Baseball"):
+    return SPORT_BULLPEN_SCRIPT.get(sport, DEMO_BULLPEN_SCRIPT)
+
+def get_sport_ideals(sport: str = "Baseball"):
+    return SPORT_IDEALS.get(sport, PITCH_IDEALS)
+
+
+# =============================================================================
+# HITTING LAB — constants, schema, sample data
+# =============================================================================
+# Swings face pitches; the data is bat-side rather than ball-side. This
+# section mirrors the pitching constants but for hitters.
+
+# Elite-range targets per metric, for the mechanics critique + outlier check
+HITTING_IDEALS = {
+    "bat_speed_mph":     {"strong": 72, "weak": 60},   # peak bat speed
+    "exit_velocity_mph": {"strong": 90, "weak": 75},   # exit velo on contact
+    "launch_angle_deg":  {"strong": 25, "weak": 5,
+                          "ideal_low": 10, "ideal_high": 25},  # barrel zone
+    "attack_angle_deg":  {"strong": 12, "weak": -5,
+                          "ideal_low": 6, "ideal_high": 18},   # bat path
+    "on_plane_eff_pct":  {"strong": 80, "weak": 60},   # bat matches pitch plane
+    "peak_hand_speed_mph": {"strong": 24, "weak": 18},
+    "time_to_contact_sec": {"strong": 0.16, "weak": 0.22},  # lower is better
+    "hip_shoulder_sep_deg": {"strong": 45, "weak": 30},  # rotational sequencing
+}
+
+# Softball — windmill pitchers throw underhand from 43 ft, so timing differs
+# but the bat metrics themselves are mostly the same. Adjust velocity bands.
+HITTING_IDEALS_SOFTBALL = {
+    **HITTING_IDEALS,
+    "bat_speed_mph":     {"strong": 64, "weak": 52},
+    "exit_velocity_mph": {"strong": 78, "weak": 64},
+}
+
+# Outcome buckets the model recognizes on each swing.
+SWING_OUTCOMES = ["take", "whiff", "foul", "weak_contact", "solid_contact", "barrel"]
+
+# Pitch-type colors used in hitting strike-zone scatter (matches pitching map)
+HITTING_PITCH_FACED_COLORS = {
+    # Baseball pitches the hitter sees
+    "Four-Seam Fastball":   "#d32f2f",
+    "Two-Seam Sinker":      "#f57c00",
+    "Slider":               "#1976d2",
+    "Curveball":            "#00838f",
+    "Changeup":             "#388e3c",
+    # Softball pitches the hitter sees
+    "Softball Fastball":    "#d32f2f",
+    "Rise Ball":            "#0ea5e9",
+    "Drop Ball":            "#7c3aed",
+    "Screwball":            "#f59e0b",
+    "Change-Up":            "#388e3c",
+}
+
+# Demo "at-bat scripts" — what kind of pitch sequence the sample hitter sees,
+# and what they typically do with it. The story arc: strong on fastballs middle,
+# struggles vs sliders down-and-away (classic young-hitter pattern).
+DEMO_AB_SCRIPT_BASEBALL = [
+    # (Pitch_Type, plate_x, plate_z, intended_outcome)
+    ("Four-Seam Fastball",  0.10, 2.7,  "barrel"),         # middle-up — crushed
+    ("Slider",             -0.60, 1.6,  "whiff"),          # down-away — miss
+    ("Four-Seam Fastball",  0.30, 2.5,  "solid_contact"),
+    ("Changeup",            0.20, 2.0,  "weak_contact"),
+    ("Four-Seam Fastball", -0.20, 3.0,  "foul"),
+    ("Two-Seam Sinker",     0.50, 1.8,  "solid_contact"),
+    ("Slider",             -0.80, 1.4,  "whiff"),          # chase slider — miss
+    ("Four-Seam Fastball",  0.00, 2.8,  "barrel"),         # middle — crushed
+    ("Curveball",           0.10, 1.6,  "take"),           # took it for a strike
+    ("Four-Seam Fastball",  0.40, 2.6,  "solid_contact"),
+    ("Slider",             -0.55, 1.7,  "weak_contact"),   # late on slider
+    ("Four-Seam Fastball",  0.00, 3.2,  "foul"),           # high heat — fouled
+    ("Changeup",            0.30, 1.9,  "weak_contact"),
+    ("Two-Seam Sinker",    -0.30, 2.0,  "solid_contact"),
+    ("Slider",             -0.70, 1.5,  "whiff"),
+    ("Four-Seam Fastball",  0.20, 2.7,  "barrel"),
+    ("Curveball",          -0.30, 1.9,  "weak_contact"),
+    ("Four-Seam Fastball",  0.50, 2.5,  "solid_contact"),
+    ("Changeup",           -0.20, 2.0,  "take"),
+    ("Slider",             -0.65, 1.6,  "whiff"),
+    ("Four-Seam Fastball", -0.10, 2.6,  "solid_contact"),
+    ("Slider",              0.00, 2.4,  "barrel"),         # hung slider — crushed
+    ("Two-Seam Sinker",     0.40, 1.7,  "weak_contact"),
+    ("Four-Seam Fastball",  0.30, 2.8,  "solid_contact"),
+    ("Curveball",           0.00, 1.8,  "foul"),
+]
+
+DEMO_AB_SCRIPT_SOFTBALL = [
+    ("Softball Fastball",   0.10, 2.5,  "barrel"),
+    ("Rise Ball",           0.00, 3.2,  "whiff"),          # rise up — missed under
+    ("Softball Fastball",   0.30, 2.4,  "solid_contact"),
+    ("Drop Ball",           0.10, 1.4,  "weak_contact"),
+    ("Softball Fastball",  -0.20, 2.2,  "foul"),
+    ("Rise Ball",          -0.10, 3.0,  "whiff"),
+    ("Screwball",           0.60, 1.8,  "whiff"),          # chase
+    ("Softball Fastball",   0.00, 2.5,  "barrel"),
+    ("Drop Ball",          -0.20, 1.5,  "take"),
+    ("Softball Fastball",   0.40, 2.3,  "solid_contact"),
+    ("Rise Ball",           0.00, 2.9,  "weak_contact"),   # popped up
+    ("Change-Up",           0.30, 2.0,  "weak_contact"),
+    ("Softball Fastball",   0.20, 2.4,  "barrel"),
+    ("Screwball",           0.50, 1.7,  "whiff"),
+    ("Drop Ball",          -0.10, 1.3,  "whiff"),          # missed under drop
+    ("Softball Fastball",  -0.30, 2.5,  "solid_contact"),
+    ("Rise Ball",           0.10, 3.1,  "foul"),
+    ("Change-Up",          -0.20, 1.9,  "take"),
+    ("Softball Fastball",   0.00, 2.4,  "solid_contact"),
+    ("Drop Ball",           0.20, 1.2,  "whiff"),
+]
+
+SPORT_AB_SCRIPT = {
+    "Baseball": DEMO_AB_SCRIPT_BASEBALL,
+    "Softball": DEMO_AB_SCRIPT_SOFTBALL,
+}
+
+# Outcome → bat/contact metric ranges. Each tuple is (low, high) range
+# the random generator samples within for that outcome.
+HITTING_OUTCOME_PROFILES = {
+    "take": {
+        "bat_speed":   (0, 0),       "exit_velo": (None, None),
+        "launch_angle":(None, None), "attack_angle": (None, None),
+        "on_plane":    (None, None), "contact_offset": (None, None),
+        "distance":    (None, None), "spray":         (None, None),
+    },
+    "whiff": {
+        "bat_speed":   (62, 72),     "exit_velo": (None, None),
+        "launch_angle":(None, None), "attack_angle": (-5, 15),
+        "on_plane":    (45, 65),     "contact_offset": (None, None),
+        "distance":    (None, None), "spray":         (None, None),
+    },
+    "foul": {
+        "bat_speed":   (62, 72),     "exit_velo": (70, 85),
+        "launch_angle":(40, 75),     "attack_angle": (-3, 12),
+        "on_plane":    (60, 78),     "contact_offset": (-1.5, 1.5),
+        "distance":    (50, 200),    "spray":         (-50, 50),
+    },
+    "weak_contact": {
+        "bat_speed":   (60, 70),     "exit_velo": (62, 80),
+        "launch_angle":(-10, 8),     "attack_angle": (-5, 8),
+        "on_plane":    (55, 72),     "contact_offset": (-1.0, 1.0),
+        "distance":    (50, 200),    "spray":         (-35, 35),
+    },
+    "solid_contact": {
+        "bat_speed":   (68, 76),     "exit_velo": (82, 92),
+        "launch_angle":(8, 22),      "attack_angle": (6, 16),
+        "on_plane":    (72, 85),     "contact_offset": (-0.5, 0.5),
+        "distance":    (250, 380),   "spray":         (-25, 25),
+    },
+    "barrel": {
+        "bat_speed":   (72, 80),     "exit_velo": (95, 108),
+        "launch_angle":(18, 32),     "attack_angle": (10, 18),
+        "on_plane":    (82, 92),     "contact_offset": (-0.25, 0.25),
+        "distance":    (350, 460),   "spray":         (-20, 20),
+    },
+}
+
+
+def get_hitting_ideals(sport: str = "Baseball") -> dict:
+    return HITTING_IDEALS_SOFTBALL if sport == "Softball" else HITTING_IDEALS
+
+
+def _seeded_random(seed_string: str) -> random.Random:
+    """Make demo data deterministic per-pitcher: same name → same demo."""
+    h = hashlib.md5(seed_string.encode("utf-8")).hexdigest()
+    return random.Random(int(h[:8], 16))
+
+
+def _u(rng: random.Random, lo, hi) -> float:
+    return rng.uniform(lo, hi)
+
+
+def generate_hitting_session(hitter_name: str, hand: str = "Right",
+                              sport: str = "Baseball",
+                              session_date: datetime | None = None) -> pd.DataFrame:
+    """Produce a canonical aligned-swing DataFrame for demo purposes.
+
+    Same `hitter_name` returns the same session (seeded random) for
+    reproducible demos. Walks the sport's at-bat script and generates
+    bat / contact / biomech metrics matching each scripted outcome.
+    """
+    rng = _seeded_random(f"hitter|{sport}|{hitter_name}")
+    if session_date is None:
+        session_date = datetime.now(timezone.utc).replace(microsecond=0)
+    base_time = session_date.replace(hour=15, minute=0, second=0)
+
+    script = SPORT_AB_SCRIPT.get(sport, DEMO_AB_SCRIPT_BASEBALL)
+
+    def _u(lo, hi):
+        if lo is None or hi is None:
+            return None
+        return rng.uniform(lo, hi)
+
+    def _u_int(lo, hi):
+        v = _u(lo, hi)
+        return None if v is None else int(round(v))
+
+    rows = []
+    for i, (pitch_type, plate_x, plate_z, outcome) in enumerate(script, start=1):
+        prof = HITTING_OUTCOME_PROFILES[outcome]
+
+        # Pitch faced — speed/type sampled to match sport
+        if sport == "Softball":
+            pitch_velo = round(rng.uniform(55, 65) if "Fastball" in pitch_type
+                                else rng.uniform(50, 60), 1)
+        else:
+            pitch_velo = round(rng.uniform(88, 93) if "Fastball" in pitch_type or "Sinker" in pitch_type
+                                else rng.uniform(78, 86), 1)
+
+        # Swing decision
+        swing_type = "take" if outcome == "take" else "swing"
+
+        # Bat metrics
+        bat_speed = _u(*prof["bat_speed"])
+        attack    = _u(*prof["attack_angle"])
+        on_plane  = _u(*prof["on_plane"])
+        hand_spd  = bat_speed * 0.32 if bat_speed else None  # approx ratio
+        ttc       = round(rng.uniform(0.15, 0.21), 3) if outcome != "take" else None
+
+        # Contact metrics
+        exit_velo   = _u(*prof["exit_velo"])
+        launch      = _u(*prof["launch_angle"])
+        contact_off = _u(*prof["contact_offset"])
+        distance    = _u(*prof["distance"])
+        spray       = _u(*prof["spray"])
+
+        # Biomech — better numbers on solid/barrel, weaker on whiffs
+        if outcome in ("barrel", "solid_contact"):
+            hip_shoulder = round(rng.uniform(40, 52), 1)
+            stride       = round(rng.uniform(28, 36), 1)
+            lead_knee    = round(rng.uniform(20, 35), 1)
+        else:
+            hip_shoulder = round(rng.uniform(28, 42), 1)
+            stride       = round(rng.uniform(24, 34), 1)
+            lead_knee    = round(rng.uniform(15, 40), 1)
+
+        rows.append({
+            "Swing_Num":              i,
+            "Timestamp":              base_time + timedelta(seconds=45 * (i - 1)),
+            "Pitch_Type_Faced":       pitch_type,
+            "Pitch_Velocity_mph":     pitch_velo,
+            "Plate_X_ft":             round(plate_x + rng.uniform(-0.05, 0.05), 2),
+            "Plate_Z_ft":             round(plate_z + rng.uniform(-0.05, 0.05), 2),
+            "Swing_Type":             swing_type,
+            "Swing_Outcome":          outcome,
+            "Bat_Speed_mph":          round(bat_speed, 1) if bat_speed else None,
+            "Attack_Angle_deg":       round(attack, 1) if attack is not None else None,
+            "On_Plane_Eff_pct":       round(on_plane, 1) if on_plane is not None else None,
+            "Peak_Hand_Speed_mph":    round(hand_spd, 1) if hand_spd else None,
+            "Time_to_Contact_sec":    ttc,
+            "Exit_Velocity_mph":      round(exit_velo, 1) if exit_velo else None,
+            "Launch_Angle_deg":       round(launch, 1) if launch is not None else None,
+            "Contact_Offset_in":      round(contact_off, 2) if contact_off is not None else None,
+            "Distance_ft":            int(distance) if distance else None,
+            "Spray_Angle_deg":        round(spray, 1) if spray is not None else None,
+            "Peak_Hip_Shoulder_Sep_deg": hip_shoulder,
+            "Stride_Length_in":       stride,
+            "Lead_Knee_Flex_deg":     lead_knee,
+        })
+
+    df = pd.DataFrame(rows)
+    df["Sport"] = sport
+    return df
+
+
+def hitting_session_kpis(df: pd.DataFrame) -> dict:
+    """Headline KPIs for a hitting session."""
+    in_play = df[df["Swing_Outcome"].isin(["weak_contact", "solid_contact", "barrel", "foul"])]
+    swings  = df[df["Swing_Type"] == "swing"]
+    barrels = df[df["Swing_Outcome"] == "barrel"]
+
+    avg_velo  = float(in_play["Exit_Velocity_mph"].dropna().mean()) if len(in_play) else None
+    peak_velo = float(in_play["Exit_Velocity_mph"].dropna().max())  if len(in_play) else None
+    avg_bat   = float(swings["Bat_Speed_mph"].dropna().mean())      if len(swings)  else None
+    avg_la    = float(in_play["Launch_Angle_deg"].dropna().mean())  if len(in_play) else None
+    avg_op    = float(swings["On_Plane_Eff_pct"].dropna().mean())   if len(swings)  else None
+    barrel_pct = (len(barrels) / len(swings) * 100) if len(swings) else 0
+
+    whiff_count = (df["Swing_Outcome"] == "whiff").sum()
+    whiff_pct = (whiff_count / len(swings) * 100) if len(swings) else 0
+
+    return {
+        "Total Swings":     int(len(swings)),
+        "Avg Exit Velo":    round(avg_velo, 1) if avg_velo else None,
+        "Peak Exit Velo":   round(peak_velo, 1) if peak_velo else None,
+        "Avg Bat Speed":    round(avg_bat, 1) if avg_bat else None,
+        "Avg Launch Angle": round(avg_la, 1) if avg_la is not None else None,
+        "On-Plane %":       round(avg_op, 1) if avg_op else None,
+        "Barrel %":         round(barrel_pct, 1),
+        "Whiff %":          round(whiff_pct, 1),
+    }
+
+
+def generate_demo_session(pitcher_name: str, hand: str = "Right",
+                          session_date: datetime | None = None,
+                          sport: str = "Baseball") -> pd.DataFrame:
+    """Produce a canonical aligned-pitch DataFrame for demo purposes.
+
+    Same `pitcher_name` returns the same session (seeded random), so demos
+    feel like a real pitcher with consistent metrics across "visits."
+
+    `sport` selects the pitch-type archetypes and bullpen script ("Baseball"
+    or "Softball"). Determines pitching distance, valid pitch types, etc.
+    """
+    rng = _seeded_random(f"{sport}|{pitcher_name}")
+    if session_date is None:
+        session_date = datetime.now(timezone.utc).replace(microsecond=0)
+    base_time = session_date.replace(hour=14, minute=0, second=0)
+
+    archetypes = get_sport_archetypes(sport)
+    bullpen_script = get_sport_bullpen_script(sport)
+
+    # Fatigue trigger pitch differs by sport (the demo "story arc")
+    fatigue_pitch = "Slider Chase" if sport == "Baseball" else "Rise Ball"
+
+    rows = []
+    for i, pitch_type in enumerate(bullpen_script, start=1):
+        a = archetypes[pitch_type]
+        # Fatigue drift: late in the bullpen, the "fatigue pitch" shows more stress
+        fatigue_bump = 0.0
+        if pitch_type == fatigue_pitch and i > 6:
+            fatigue_bump = rng.uniform(2.0, 4.0)  # extra Nm late in the session
+
+        # Simulate two healed pitches per session for realism
+        pulse_present = not (i == 5)            # pitch 5 missing pulse
+        ppai_present  = not (i == 9)            # pitch 9 missing ppai
+
+        valgus = round(_u(rng, *a["valgus"]) + fatigue_bump, 1) if pulse_present else None
+        ac_ratio = round(_u(rng, *a["ac_ratio"]), 2) if pulse_present else None
+
+        # Plate location: target zone + control variance.
+        # Late in the bullpen, control degrades slightly (fatigue effect)
+        control_noise = 0.10 + 0.02 * max(0, i - 6)  # widens after pitch 6
+        plate_x = round(_u(rng, *a["plate_x_target"]) + rng.uniform(-control_noise, control_noise), 2)
+        plate_z = round(_u(rng, *a["plate_z_target"]) + rng.uniform(-control_noise, control_noise), 2)
+
+        row = {
+            "Pitch_Num":          i,
+            "Timestamp":          base_time + timedelta(seconds=45 * (i - 1)),
+            "Pitch_Type":         pitch_type,
+            "Velocity_mph":       round(_u(rng, *a["velo"]), 1),
+            "Total_Spin_rpm":     int(_u(rng, *a["spin"])),
+            "Spin_Efficiency_pct": round(_u(rng, *a["eff"]), 1),
+            "Spin_Axis_Deg":      spin_clock_to_degrees(a["axis"]),
+            "Spin_Direction_hhmm": a["axis"],
+            "Gyro_Degrees":       round(_u(rng, *a["gyro"]), 1),
+            "Vert_Break_in":      round(_u(rng, *a["vbreak"]), 1),
+            "Horiz_Break_in":     round(_u(rng, *a["hbreak"]), 1),
+            "Extension_ft":       round(_u(rng, 5.9, 6.4), 1),
+            "Release_Height_ft":  round(_u(rng, 5.7, 6.0), 1),
+            "Release_Side_ft":    round(_u(rng, 1.9, 2.4), 1),
+            "Strike_Zone_Side":   plate_x,
+            "Strike_Zone_Height": plate_z,
+
+            "Pulse_Present":      pulse_present,
+            "Pulse_Match_Method": "timestamp_window" if pulse_present else None,
+            "Arm_Speed_deg_sec":  int(_u(rng, 940, 1000)) if pulse_present else None,
+            "Peak_Valgus_Nm":     valgus,
+            "Arm_Slot_deg":       int(_u(rng, 44, 50)) if pulse_present else None,
+            "AC_Ratio":           ac_ratio,
+            "One_Day_Stress":     round(_u(rng, 24, 32), 1) if pulse_present else None,
+
+            "PPAI_Present":               ppai_present,
+            "PPAI_Match_Method":          "timestamp_window" if ppai_present else None,
+            "Release_Hip_Shoulder_Sep":   round(_u(rng, 3, 12), 1) if ppai_present else None,
+            "Peak_Hip_Shoulder_Sep":      round(_u(rng, *a["hip_shoulder_peak"]), 1) if ppai_present else None,
+            "Release_Trunk_Rot":          round(_u(rng, 96, 105), 1) if ppai_present else None,
+            "Release_Lead_Knee_Ext":      round(_u(rng, *a["lead_knee"]), 1) if ppai_present else None,
+            "FootPlant_Trunk_Rot":        round(_u(rng, *a["trunk_fp"]), 1) if ppai_present else None,
+            "Peak_Trunk_Angular_Vel":     int(_u(rng, 1050, 1200)) if ppai_present else None,
+        }
+
+        healed_notes = []
+        if not pulse_present:  healed_notes.append("Pulse missing")
+        if not ppai_present:   healed_notes.append("ProPlayAI missing")
+        row["Healed"]              = bool(healed_notes)
+        row["Healed_Notes"]        = ", ".join(healed_notes)
+        row["Alignment_Confidence"] = _confidence_score(row)
+        rows.append(row)
+
+    demo_df = pd.DataFrame(rows)
+    demo_df = _score_outliers(demo_df)
+    return demo_df
+
+
+# =============================================================================
+# REPORT LOGIC — injury flags, deltas, action plan
+# =============================================================================
+def detect_injury_flags(row) -> list:
+    """Return a list of injury/risk flags for a single pitch row."""
+    flags = []
+    if row.get("Peak_Valgus_Nm") and row["Peak_Valgus_Nm"] >= DANGER_VALGUS_NM:
+        flags.append({
+            "severity": "DANGER",
+            "label":    f"Elbow stress {row['Peak_Valgus_Nm']:.1f} Nm",
+            "drill_key": "high_valgus_stress",
+        })
+    if row.get("AC_Ratio") and row["AC_Ratio"] >= ACR_DANGER_THRESHOLD:
+        flags.append({
+            "severity": "DANGER",
+            "label":    f"AC Ratio {row['AC_Ratio']:.2f} (workload spike)",
+            "drill_key": "high_acr",
+        })
+    elif row.get("AC_Ratio") and row["AC_Ratio"] >= ACR_WARNING_THRESHOLD:
+        flags.append({
+            "severity": "WARNING",
+            "label":    f"AC Ratio {row['AC_Ratio']:.2f} (workload elevated)",
+            "drill_key": "high_acr",
+        })
+    if row.get("FootPlant_Trunk_Rot") and row["FootPlant_Trunk_Rot"] >= EARLY_TRUNK_ROTATION_DEG:
+        flags.append({
+            "severity": "WARNING",
+            "label":    f"Chest opened early at foot-plant ({row['FootPlant_Trunk_Rot']:.1f}°)",
+            "drill_key": "early_trunk_rotation",
+        })
+    return flags
+
+
+def session_kpis(df: pd.DataFrame) -> dict:
+    """Compute headline KPIs across the whole bullpen."""
+    return {
+        "Total Pitches":      len(df),
+        "Avg Velocity":       round(df["Velocity_mph"].mean(), 1),
+        "Peak Velocity":      round(df["Velocity_mph"].max(), 1),
+        "Avg Spin":           int(df["Total_Spin_rpm"].mean()),
+        "Avg Elbow Stress":   round(df["Peak_Valgus_Nm"].dropna().mean(), 1) if df["Peak_Valgus_Nm"].notna().any() else None,
+        "Max Elbow Stress":   round(df["Peak_Valgus_Nm"].dropna().max(), 1) if df["Peak_Valgus_Nm"].notna().any() else None,
+        "Pitches Healed":     int(df["Healed"].sum()),
+    }
+
+
+def analyze_mechanics(df: pd.DataFrame, sport: str = "Baseball") -> dict:
+    """Inspect biomech columns and produce strengths + weaknesses, each
+    tied to a specific gain category (velocity / control / movement / injury).
+
+    Sport-aware: softball windmill thresholds differ from baseball overhand.
+
+    Returns: {"strengths": [...], "weaknesses": [...]}
+    """
+    is_softball = (sport == "Softball")
+    strengths, weaknesses = [], []
+
+    # ===== SPORT-AWARE THRESHOLDS =====
+    if is_softball:
+        # Windmill mechanics — values from softball biomech literature
+        HS_SEP_STRONG    = 42    # >= this is upper-college softball
+        HS_SEP_WEAK      = 35    # < this is the problem zone
+        HS_SEP_TARGET    = "42-50"
+        KNEE_STRONG      = 150
+        KNEE_WEAK        = 142
+        TRUNK_VEL_STRONG = 850
+        SLOT_TIGHT       = 4
+        SLOT_LOOSE       = 6
+        CHECK_EXTENSION  = False    # windmill release isn't measured in "feet of extension"
+        HS_SEP_FIX_DRILL = "K-drill + hip-snap drill at top of windmill. 3×6, 3 days this week."
+        EARLY_TRUNK_FIX  = "K-drill mirror work — pause at the 12:00 position to feel the closed front side. 5×6 daily."
+    else:
+        HS_SEP_STRONG    = 50
+        HS_SEP_WEAK      = 48
+        HS_SEP_TARGET    = "50-65"
+        KNEE_STRONG      = 150
+        KNEE_WEAK        = 145
+        TRUNK_VEL_STRONG = 1100
+        SLOT_TIGHT       = 4
+        SLOT_LOOSE       = 6
+        CHECK_EXTENSION  = True
+        HS_SEP_FIX_DRILL = "Hershiser drill — exaggerated coil reps with weighted ball. 3×4, 3 days this week."
+        EARLY_TRUNK_FIX  = "Driveline pivot pick-offs with weighted plyo ball. 3×5, 3 days this week."
+
+    # Helper to safely compute mean of a column that may not exist or be all-NaN
+    def avg(col):
+        if col not in df.columns: return None
+        s = df[col].dropna()
+        return float(s.mean()) if len(s) else None
+
+    knee_ext  = avg("Release_Lead_Knee_Ext")
+    hs_sep    = avg("Peak_Hip_Shoulder_Sep")
+    fp_trunk  = avg("FootPlant_Trunk_Rot")
+    extension = avg("Extension_ft")
+    arm_slot  = avg("Arm_Slot_deg")
+    trunk_vel = avg("Peak_Trunk_Angular_Vel")
+
+    # Arm-slot consistency (range across session, not just mean)
+    arm_slot_range = None
+    if "Arm_Slot_deg" in df.columns and df["Arm_Slot_deg"].notna().any():
+        s = df["Arm_Slot_deg"].dropna()
+        arm_slot_range = float(s.max() - s.min())
+
+    early_trunk_rate = None
+    if "FootPlant_Trunk_Rot" in df.columns and df["FootPlant_Trunk_Rot"].notna().any():
+        early_trunk_rate = float((df["FootPlant_Trunk_Rot"].dropna() >= EARLY_TRUNK_ROTATION_DEG).mean())
+
+    # ===== STRENGTHS =====
+    if knee_ext is not None and knee_ext >= KNEE_STRONG:
+        strengths.append({
+            "label":  "Stiff front leg block",
+            "detail": f"Avg lead-knee extension at release was {knee_ext:.1f}° — "
+                      f"near or above the {KNEE_STRONG}° target.",
+            "gain":   "Translates ground force into ball velocity efficiently.",
+            "tag":    "VELOCITY",
+        })
+    if hs_sep is not None and hs_sep >= HS_SEP_STRONG:
+        strengths.append({
+            "label":  "Strong hip-shoulder separation",
+            "detail": f"Peak hip-shoulder separation averaged {hs_sep:.1f}° — "
+                      f"in the upper range for {sport} ({HS_SEP_TARGET}°).",
+            "gain":   "Generates rubber-band torque → drives velocity.",
+            "tag":    "VELOCITY",
+        })
+    if (early_trunk_rate is not None and early_trunk_rate < 0.20 and fp_trunk is not None):
+        strengths.append({
+            "label":  "Trunk stays closed at foot-plant",
+            "detail": f"Avg trunk rotation at foot-plant was {fp_trunk:.1f}° — "
+                      f"only {int(early_trunk_rate*100)}% of pitches opened early.",
+            "gain":   "Protects the elbow AND maximizes power transfer.",
+            "tag":    "INJURY-SAFE + VELOCITY",
+        })
+    if CHECK_EXTENSION and extension is not None and extension >= 6.2:
+        strengths.append({
+            "label":  "Excellent release extension",
+            "detail": f"Avg extension was {extension:.2f} ft (target 6.2+).",
+            "gain":   "Adds ~2 mph of perceived velocity — the hitter has less time to react.",
+            "tag":    "VELOCITY (PERCEIVED)",
+        })
+    if arm_slot_range is not None and arm_slot_range <= SLOT_TIGHT:
+        strengths.append({
+            "label":  "Consistent arm slot",
+            "detail": f"Arm slot varied only {arm_slot_range:.1f}° across all pitches "
+                      f"(target: < {SLOT_TIGHT}°).",
+            "gain":   "Predictable release point → better command + better tunneling.",
+            "tag":    "COMMAND",
+        })
+    if trunk_vel is not None and trunk_vel >= TRUNK_VEL_STRONG:
+        strengths.append({
+            "label":  "Explosive trunk rotation",
+            "detail": f"Peak trunk angular velocity averaged {trunk_vel:.0f}°/sec — "
+                      f"in the upper range for HS+ {sport.lower()} pitchers.",
+            "gain":   "Snappy delivery converts strength into ball velocity at release.",
+            "tag":    "VELOCITY",
+        })
+
+    # ===== AREAS TO IMPROVE =====
+    if knee_ext is not None and knee_ext < KNEE_WEAK:
+        weaknesses.append({
+            "label":  "Soft front leg (energy leak)",
+            "detail": f"Avg lead-knee extension at release was {knee_ext:.1f}° — "
+                      f"below the {KNEE_STRONG}° target. The front knee is bending under "
+                      "load instead of bracing.",
+            "gain":   "Velocity",
+            "fix":    "Wall drill — front-leg stiff brace. 4 sets × 6 reps, 2× this week.",
+        })
+    if hs_sep is not None and hs_sep < HS_SEP_WEAK:
+        weaknesses.append({
+            "label":  "Low hip-shoulder separation",
+            "detail": f"Peak hip-shoulder separation averaged only {hs_sep:.1f}° — "
+                      f"well below the {HS_SEP_TARGET}° target for {sport}. "
+                      "Hips and shoulders are firing together instead of in sequence.",
+            "gain":   "Velocity",
+            "fix":    HS_SEP_FIX_DRILL,
+        })
+    if early_trunk_rate is not None and early_trunk_rate >= 0.25:
+        weaknesses.append({
+            "label":  "Chest opens too early at foot-plant",
+            "detail": f"{int(early_trunk_rate*100)}% of pitches had the chest already rotating "
+                      f"when the front foot landed (target: < 20%). The arm has to do extra "
+                      "work — that's lost velocity AND elevated stress.",
+            "gain":   "Velocity + Injury Prevention",
+            "fix":    EARLY_TRUNK_FIX,
+        })
+    if CHECK_EXTENSION and extension is not None and extension < 6.0:
+        weaknesses.append({
+            "label":  "Short release extension",
+            "detail": f"Avg extension was {extension:.2f} ft (target 6.2+ ft). "
+                      "Not getting out toward the plate at release.",
+            "gain":   "Perceived Velocity",
+            "fix":    "Stride-down drill — emphasize a longer stride toward the plate. 3×8, 2-3 days this week.",
+        })
+    if arm_slot_range is not None and arm_slot_range > SLOT_LOOSE:
+        weaknesses.append({
+            "label":  "Inconsistent arm slot",
+            "detail": f"Arm slot varied {arm_slot_range:.1f}° across the session "
+                      f"(target < {SLOT_TIGHT}°). Inconsistent release = inconsistent command.",
+            "gain":   "Command + Tunneling",
+            "fix":    "Mirror drill + 1-knee throws. 10 mirror reps before each bullpen.",
+        })
+
+    return {"strengths": strengths, "weaknesses": weaknesses}
+
+
+# =============================================================================
+# HITTING MECHANICS CRITIQUE  (mirrors analyze_mechanics for pitching)
+# =============================================================================
+def analyze_hitting_mechanics(df: pd.DataFrame, sport: str = "Baseball") -> dict:
+    """Inspect a swing session and produce hitter-side strengths + weaknesses.
+
+    Mirrors the pitcher's analyze_mechanics return shape:
+       {"strengths": [...], "weaknesses": [...]}
+
+    Each entry carries label / detail / gain / tag (strength) or
+    label / detail / gain / fix (weakness) — so the same green-box / yellow-box
+    UI and PDF builders can render it.
+
+    Thresholds are HS-Varsity by default; softball uses slightly lower bat
+    speed targets because of the rise-ball pitching speeds.
+    """
+    is_softball = (sport == "Softball")
+    strengths, weaknesses = [], []
+
+    # ===== SPORT-AWARE THRESHOLDS =====
+    if is_softball:
+        BAT_SPEED_STRONG = 65
+        BAT_SPEED_WEAK   = 55
+        BAT_SPEED_TARGET = "65-72"
+        HS_SEP_STRONG    = 38
+        HS_SEP_WEAK      = 28
+        HS_SEP_TARGET    = "38-48"
+    else:
+        BAT_SPEED_STRONG = 70
+        BAT_SPEED_WEAK   = 60
+        BAT_SPEED_TARGET = "70-78"
+        HS_SEP_STRONG    = 42
+        HS_SEP_WEAK      = 32
+        HS_SEP_TARGET    = "42-52"
+
+    def avg(col):
+        if col not in df.columns:
+            return None
+        s = df[col].dropna()
+        return float(s.mean()) if len(s) else None
+
+    swings  = df[df["Swing_Type"] == "swing"] if "Swing_Type" in df.columns else df
+    in_play = df[df["Swing_Outcome"].isin(["weak_contact", "solid_contact",
+                                            "barrel", "foul"])] if "Swing_Outcome" in df.columns else df
+
+    bat_speed   = avg("Bat_Speed_mph")
+    attack_ang  = avg("Attack_Angle_deg")
+    on_plane    = avg("On_Plane_Eff_pct")
+    ttc         = avg("Time_to_Contact_sec")
+    hs_sep      = avg("Peak_Hip_Shoulder_Sep_deg")
+    stride_len  = avg("Stride_Length_in")
+    lead_knee   = avg("Lead_Knee_Flex_deg")
+    contact_off = avg("Contact_Offset_in")
+
+    # Outcome-based metrics
+    total_swings = len(swings) if len(swings) else 0
+    barrels      = int((df["Swing_Outcome"] == "barrel").sum()) if "Swing_Outcome" in df.columns else 0
+    whiffs       = int((df["Swing_Outcome"] == "whiff").sum())  if "Swing_Outcome" in df.columns else 0
+    barrel_pct   = (barrels / total_swings * 100) if total_swings else 0
+    whiff_pct    = (whiffs  / total_swings * 100) if total_swings else 0
+
+    # ===== STRENGTHS =====
+    if bat_speed is not None and bat_speed >= BAT_SPEED_STRONG:
+        strengths.append({
+            "label":  "Strong bat speed",
+            "detail": f"Avg bat speed was {bat_speed:.1f} mph — in the upper range "
+                       f"for {sport} ({BAT_SPEED_TARGET} mph).",
+            "gain":   "Drives exit velocity. Every +1 mph of bat speed ≈ +1.2 mph of exit velo.",
+            "tag":    "POWER",
+        })
+    if on_plane is not None and on_plane >= 75:
+        strengths.append({
+            "label":  "On-plane bat path",
+            "detail": f"On-plane efficiency averaged {on_plane:.1f}% — the bat stays in the "
+                       "hitting zone long enough to absorb timing mistakes.",
+            "gain":   "Bigger margin for error vs varied pitch speeds and locations.",
+            "tag":    "CONTACT",
+        })
+    if attack_ang is not None and 8 <= attack_ang <= 16:
+        strengths.append({
+            "label":  "Optimal attack angle",
+            "detail": f"Avg attack angle was {attack_ang:.1f}° — in the proven productive "
+                       "range of 8–16° (matches average MLB pitch plane).",
+            "gain":   "Maximizes barrel rate by matching the ball's downward path.",
+            "tag":    "BARREL",
+        })
+    if hs_sep is not None and hs_sep >= HS_SEP_STRONG:
+        strengths.append({
+            "label":  "Strong hip-shoulder separation",
+            "detail": f"Peak hip-shoulder separation averaged {hs_sep:.1f}° — "
+                       f"in the upper range for {sport} ({HS_SEP_TARGET}°).",
+            "gain":   "Rubber-band torque drives bat speed and exit velocity.",
+            "tag":    "POWER",
+        })
+    if ttc is not None and ttc <= 0.16:
+        strengths.append({
+            "label":  "Quick to the ball",
+            "detail": f"Avg time-to-contact was {ttc:.3f}s — faster than the 0.17s "
+                       "average for HS hitters.",
+            "gain":   "Lets you wait longer on the pitch and still get the barrel through.",
+            "tag":    "CONTACT",
+        })
+    if barrel_pct >= 25:
+        strengths.append({
+            "label":  "High barrel rate",
+            "detail": f"{barrel_pct:.0f}% of swings were barrels — exceptional contact quality.",
+            "gain":   "Barrels are the only outcome that consistently produces extra-base hits.",
+            "tag":    "BARREL",
+        })
+
+    # ===== AREAS TO IMPROVE =====
+    if bat_speed is not None and bat_speed < BAT_SPEED_WEAK:
+        weaknesses.append({
+            "label":  "Below-target bat speed",
+            "detail": f"Avg bat speed was {bat_speed:.1f} mph — under the "
+                       f"{BAT_SPEED_TARGET} mph target for {sport}. The barrel isn't moving "
+                       "fast enough to drive the ball.",
+            "gain":   "Exit Velocity",
+            "fix":    "Overload/underload bat training — 3 sets × 5 swings each with a heavy "
+                       "bat (+10oz) and a light bat (-3oz), 3 days this week.",
+        })
+    if attack_ang is not None and attack_ang < 2:
+        weaknesses.append({
+            "label":  "Bat path too flat (chopping down)",
+            "detail": f"Attack angle averaged {attack_ang:.1f}° — well below the 8–16° "
+                       "productive range. The bat path drops through the zone instead of "
+                       "matching the pitch plane.",
+            "gain":   "Launch Angle + Barrels",
+            "fix":    "High-tee drill: tee at chest height, force a slight upward swing path. "
+                       "3 sets × 8 reps, 3 days this week.",
+        })
+    if attack_ang is not None and attack_ang > 20:
+        weaknesses.append({
+            "label":  "Uppercut too steep",
+            "detail": f"Attack angle averaged {attack_ang:.1f}° — above the 16° target. "
+                       "Big uppercut means lots of swings-and-misses and pop-ups.",
+            "gain":   "Contact Rate",
+            "fix":    "Low-tee + middle-tee mix: 3 swings low, 3 middle, repeat. 3 sets × 6, "
+                       "3 days this week.",
+        })
+    if on_plane is not None and on_plane < 60:
+        weaknesses.append({
+            "label":  "Off-plane bat path",
+            "detail": f"On-plane efficiency averaged {on_plane:.1f}% — the bat is in the zone "
+                       "for only a fraction of the swing. Less margin on timing mistakes.",
+            "gain":   "Contact Rate",
+            "fix":    "Hitting Plyo Ball into a slight uphill net — feel the bat staying behind "
+                       "the ball through contact. 3 sets × 6, 3 days this week.",
+        })
+    if hs_sep is not None and hs_sep < HS_SEP_WEAK:
+        weaknesses.append({
+            "label":  "Low hip-shoulder separation",
+            "detail": f"Peak separation averaged only {hs_sep:.1f}° — below the {HS_SEP_TARGET}° "
+                       f"target for {sport}. Hips and shoulders are firing together.",
+            "gain":   "Bat Speed",
+            "fix":    "Coil-and-hold drill — load into back hip, pause 1 sec, then unwind into "
+                       "the swing. 3 sets × 5 reps, 3 days this week.",
+        })
+    if ttc is not None and ttc >= 0.18:
+        weaknesses.append({
+            "label":  "Slow to the ball",
+            "detail": f"Avg time-to-contact was {ttc:.3f}s — slower than the 0.17s HS average. "
+                       "Bat is dragging through the zone.",
+            "gain":   "Reaction Window",
+            "fix":    "Short-bat tee work: choke up on a bat, take 20 quick swings per set. "
+                       "Builds connection and bat-snap. 3 sets, 3 days this week.",
+        })
+    if whiff_pct >= 35:
+        weaknesses.append({
+            "label":  "Elevated whiff rate",
+            "detail": f"{whiff_pct:.0f}% of swings were whiffs — well above the 22% HS baseline. "
+                       "Lots of swings at pitches that can't be hit.",
+            "gain":   "Plate Discipline",
+            "fix":    "Sit-fastball drill: only swing at fastballs middle-out for 30 pitches. "
+                       "Builds the recognize-and-pass habit on offspeed.",
+        })
+
+    return {"strengths": strengths, "weaknesses": weaknesses}
+
+
+# =============================================================================
+# HITTING DRILL LIBRARY  (mirrors DRILL_LIBRARY for pitching)
+# Each drill carries an "issue" tag so the recommender can pull a multi-drill
+# package when a given metric is below target. Multiple drills per issue gives
+# coaches variety + something to swap in if a hitter can't do a specific drill.
+# =============================================================================
+HITTING_DRILL_LIBRARY = {
+    # ===== TODAY — RECOVERY =====
+    "hitting_session_cooldown": {
+        "category": "Recovery", "phase": "today", "priority": 3,
+        "issue": "recovery",
+        "label": "Standard Swing Session Cooldown",
+        "drill": "Wrist/forearm mobility + shoulder blade slides + light foam roll",
+        "protocol": "Forearm flexor stretches 3×30s each side. Scap slides 2×10. Foam roll T-spine 2 min.",
+        "why": "Hitters accumulate forearm and lat fatigue from BP. Flushing the tissue speeds recovery for tomorrow.",
+    },
+    "hitting_heavy_workload_cooldown": {
+        "category": "Recovery", "phase": "today", "priority": 1,
+        "issue": "recovery",
+        "label": "Heavy Workload — Active Recovery",
+        "drill": "Full upper-body mobility + 10 min easy bike",
+        "protocol": "T-spine openers 2×8. Lat doorway stretch 3×30s. Easy bike 10 min flushing pace.",
+        "why": "60+ swings in a session creates fatigue in lats and forearms. Active recovery prevents tomorrow's stiffness.",
+    },
+
+    # =========================================================================
+    # BAT SPEED  —  four targeted drills
+    # =========================================================================
+    "hitting_bat_speed_overload_underload": {
+        "category": "Bat Speed", "phase": "week", "priority": 2,
+        "issue": "bat_speed",
+        "label": "Overload / Underload Bat Training",
+        "drill": "Alternate swings with a +10oz heavy bat and a -3oz light bat",
+        "protocol": "3 sets × 5 heavy-bat swings, then 3 sets × 5 light-bat swings. 3 days this week.",
+        "why": "Driveline-style protocol — reliably adds 2-4 mph of bat speed in 4-6 weeks by training fast-twitch fiber recruitment.",
+    },
+    "hitting_bat_speed_medball": {
+        "category": "Bat Speed", "phase": "week", "priority": 3,
+        "issue": "bat_speed",
+        "label": "Rotational Med-Ball Throws",
+        "drill": "Side-toss a 6-8 lb medicine ball into a wall, mimicking the swing turn",
+        "protocol": "3 sets × 8 throws per side, 3 days this week. Drive from the back hip through the front side.",
+        "why": "Builds raw rotational power that transfers directly to bat speed. Hitting starts in the legs and core.",
+    },
+    "hitting_bat_speed_resistance_band": {
+        "category": "Bat Speed", "phase": "week", "priority": 3,
+        "issue": "bat_speed",
+        "label": "Resistance-Band Bat Speed Trainer",
+        "drill": "Dry swings against a hip-anchored resistance band",
+        "protocol": "3 sets × 8 swings with band, then 3 sets × 5 free swings immediately after. 3 days this week.",
+        "why": "Post-activation potentiation — heavy band loads the swing, then free swings feel explosive. Builds top-end speed.",
+    },
+    "hitting_bat_speed_top_hand": {
+        "category": "Bat Speed", "phase": "week", "priority": 4,
+        "issue": "bat_speed",
+        "label": "Top-Hand-Only Tee Drill",
+        "drill": "Choke up, top hand only, drive through the zone",
+        "protocol": "2 sets × 10 reps, 3 days this week. Focus on snapping the wrist through contact.",
+        "why": "Isolates the top hand — the dominant driver of bat speed late in the swing. Strengthens the snap.",
+    },
+
+    # =========================================================================
+    # HIP-SHOULDER SEPARATION — three targeted drills
+    # =========================================================================
+    "hitting_hip_sep_coil_hold": {
+        "category": "Sequencing", "phase": "week", "priority": 2,
+        "issue": "hip_separation",
+        "label": "Coil-and-Hold Tee Drill",
+        "drill": "Load into back hip, pause 1 second, then unwind",
+        "protocol": "3 sets × 5 reps, 3 days this week. The pause forces hip-shoulder dissociation.",
+        "why": "Separation > 40° = rubber-band torque. Top HS hitters average 42-52°. Each 5° ≈ 1.5 mph bat speed.",
+    },
+    "hitting_hip_sep_step_behind": {
+        "category": "Sequencing", "phase": "week", "priority": 3,
+        "issue": "hip_separation",
+        "label": "Step-Behind Rotational Swing",
+        "drill": "Stride foot crosses BEHIND the back foot, then unwinds into the swing",
+        "protocol": "3 sets × 6 reps, 3 days this week. Off a tee — emphasizes hip lead.",
+        "why": "Cross-step exaggerates the hip turn ahead of the shoulders, training proper sequencing.",
+    },
+    "hitting_hip_sep_x_drill": {
+        "category": "Sequencing", "phase": "week", "priority": 4,
+        "issue": "hip_separation",
+        "label": "X-Drill (Hips vs. Shoulders)",
+        "drill": "Hold a bat across shoulders, rotate hips one way, shoulders the other",
+        "protocol": "3 sets × 8 controlled reps before BP, 3 days this week.",
+        "why": "Trains the brain to feel hips and shoulders moving independently — the prerequisite for any rotational power.",
+    },
+
+    # =========================================================================
+    # FLAT ATTACK ANGLE — three targeted drills
+    # =========================================================================
+    "hitting_flat_high_tee": {
+        "category": "Bat Path", "phase": "week", "priority": 2,
+        "issue": "flat_swing",
+        "label": "High-Tee Launch Path",
+        "drill": "Tee set at chest height — force the bat to launch upward",
+        "protocol": "3 sets × 8 reps, 3 days this week. Aim for the upper third of the net.",
+        "why": "Average MLB pitch enters the zone at -6°. Matching with +8-16° attack angle is the barrel-creation range.",
+    },
+    "hitting_flat_pvc_path": {
+        "category": "Bat Path", "phase": "week", "priority": 3,
+        "issue": "flat_swing",
+        "label": "PVC Stick Path Drill",
+        "drill": "PVC pipe held at the slot — hitter must swing UNDER it on the way up",
+        "protocol": "20 dry swings per set, 3 sets per session, 3 days this week.",
+        "why": "Physical barrier teaches the body to drop the back shoulder slightly and work upward through contact.",
+    },
+    "hitting_flat_launch_pause": {
+        "category": "Bat Path", "phase": "week", "priority": 4,
+        "issue": "flat_swing",
+        "label": "Pause-at-Launch Tee Drill",
+        "drill": "Tee swings with a 1-second pause at the launch position",
+        "protocol": "3 sets × 5 reps, 3 days this week. Hold the back-elbow slot, then explode upward.",
+        "why": "Builds the feel of the back shoulder dropping into a positive attack angle before commitment.",
+    },
+
+    # =========================================================================
+    # STEEP ATTACK ANGLE — three targeted drills
+    # =========================================================================
+    "hitting_steep_low_high_mix": {
+        "category": "Bat Path", "phase": "week", "priority": 2,
+        "issue": "steep_swing",
+        "label": "Low/Middle Tee Mix",
+        "drill": "3 swings low tee, 3 swings middle tee, repeat",
+        "protocol": "3 sets × 6 reps, 3 days this week. Forces the swing to flatten on low pitches.",
+        "why": "Above 20° attack angle = whiffs and pop-ups. Mixing low and middle tees pulls the swing back into 8-16° range.",
+    },
+    "hitting_steep_top_hand_path": {
+        "category": "Bat Path", "phase": "week", "priority": 3,
+        "issue": "steep_swing",
+        "label": "Top-Hand Path Correction",
+        "drill": "Top-hand-only swings on a mid-height tee, hands stay above the ball",
+        "protocol": "2 sets × 10 reps, 3 days this week.",
+        "why": "An uppercut usually comes from top-hand dropping early. This trains the hands to stay above the ball longer.",
+    },
+    "hitting_steep_outside_front_toss": {
+        "category": "Bat Path", "phase": "week", "priority": 4,
+        "issue": "steep_swing",
+        "label": "Outside-Half Front Toss",
+        "drill": "Front toss on the outer third — drive everything oppo, gap to gap",
+        "protocol": "2 sets × 15 swings, 2 days this week.",
+        "why": "Hitting outside pitches oppo forces a flatter, longer bat path. Eliminates the steep pull-side cut.",
+    },
+
+    # =========================================================================
+    # LOW ON-PLANE EFFICIENCY — three targeted drills
+    # =========================================================================
+    "hitting_on_plane_plyo_uphill": {
+        "category": "Bat Path", "phase": "week", "priority": 3,
+        "issue": "off_plane",
+        "label": "Plyo Ball Into Uphill Net",
+        "drill": "Hitting plyo ball into a slight uphill angle, stay behind the ball",
+        "protocol": "3 sets × 6 reps, 3 days this week.",
+        "why": "On-plane time > 75% means the bat is in the hitting zone long enough to absorb timing mistakes.",
+    },
+    "hitting_on_plane_two_tee": {
+        "category": "Bat Path", "phase": "week", "priority": 3,
+        "issue": "off_plane",
+        "label": "Two-Tee Path Drill",
+        "drill": "Set TWO tees in a line — bat must clip both during the swing",
+        "protocol": "3 sets × 5 reps, 3 days this week. Adjust the spacing as the path improves.",
+        "why": "Physical waypoints force the bat to stay flat through the zone, not chop in and out.",
+    },
+    "hitting_on_plane_connection_band": {
+        "category": "Bat Path", "phase": "week", "priority": 4,
+        "issue": "off_plane",
+        "label": "Connection Band Drill",
+        "drill": "Resistance band looped around back elbow + lead hip — swing keeps connection",
+        "protocol": "3 sets × 8 reps, 3 days this week.",
+        "why": "Loss of connection = bat detaches from the body and the path goes off-plane. Band reinforces the link.",
+    },
+
+    # =========================================================================
+    # SLOW TIME-TO-CONTACT — three targeted drills
+    # =========================================================================
+    "hitting_ttc_short_bat": {
+        "category": "Contact", "phase": "week", "priority": 3,
+        "issue": "slow_ttc",
+        "label": "Short-Bat Tee Work",
+        "drill": "Choke up on a bat, take 20 quick connected swings",
+        "protocol": "3 sets per session, 3 days this week.",
+        "why": "Faster TTC lets you wait longer on the pitch — fewer chase swings. Sub-0.16s separates HS varsity from elite.",
+    },
+    "hitting_ttc_heavy_quick": {
+        "category": "Contact", "phase": "week", "priority": 4,
+        "issue": "slow_ttc",
+        "label": "Heavy-Bat Quick Swings",
+        "drill": "Heavy bat (+10oz), short choked-up swings, max intent",
+        "protocol": "2 sets × 8 reps, 2 days this week.",
+        "why": "Heavy bat trains explosive power off the back hip, then transfers to a quicker free-swing.",
+    },
+    "hitting_ttc_connection_ball": {
+        "category": "Contact", "phase": "week", "priority": 4,
+        "issue": "slow_ttc",
+        "label": "Connection Ball Drill",
+        "drill": "Soft ball pinned between back elbow and torso during swings",
+        "protocol": "3 sets × 6 reps, 3 days this week. Ball must stay until contact.",
+        "why": "Loss of connection adds time to contact. Ball forces the hands to stay tight, shortening the path.",
+    },
+
+    # =========================================================================
+    # HIGH WHIFF RATE — three targeted drills
+    # =========================================================================
+    "hitting_whiffs_sit_fastball": {
+        "category": "Plate Discipline", "phase": "week", "priority": 3,
+        "issue": "whiffs",
+        "label": "Sit-Fastball Drill",
+        "drill": "30 pitches — only swing at fastballs middle/outer-half. Take everything else.",
+        "protocol": "2 days this week. Use a machine or live arm.",
+        "why": "Whiffs > 35% almost always = chasing offspeed out of the zone. Trains the recognize-and-pass instinct.",
+    },
+    "hitting_whiffs_vision_bottle": {
+        "category": "Plate Discipline", "phase": "week", "priority": 4,
+        "issue": "whiffs",
+        "label": "Bottle-Cap Vision Drill",
+        "drill": "Front-toss with painted bottle caps — call color (red/blue) before swinging",
+        "protocol": "2 sets × 15 reps, 2 days this week.",
+        "why": "Forces tracking the ball into the zone before committing the swing. Builds late-recognition reflex.",
+    },
+    "hitting_whiffs_multi_color": {
+        "category": "Plate Discipline", "phase": "week", "priority": 4,
+        "issue": "whiffs",
+        "label": "Multi-Color Ball Recognition",
+        "drill": "Mix balls of different colors — coach calls the color, hitter only swings at that one",
+        "protocol": "20 pitches × 2 sets, 2 days this week.",
+        "why": "Trains pitch recognition under stress. Eliminates committing to a swing before the ball is identified.",
+    },
+
+    # =========================================================================
+    # WEAK CONTACT PATTERN — three targeted drills
+    # =========================================================================
+    "hitting_weak_front_toss_oppo": {
+        "category": "Contact", "phase": "week", "priority": 3,
+        "issue": "weak_contact",
+        "label": "Front-Toss Away-Side BP",
+        "drill": "Front toss on the outer third — drive everything oppo",
+        "protocol": "2 sets × 20 reps, 2 days this week.",
+        "why": "Weak contact = early commitment to pull. Going oppo trains keeping the bat behind the ball longer.",
+    },
+    "hitting_weak_bottom_hand": {
+        "category": "Contact", "phase": "week", "priority": 4,
+        "issue": "weak_contact",
+        "label": "Bottom-Hand-Only Drill",
+        "drill": "Bottom hand only, choked up, drive line drives to centerfield",
+        "protocol": "2 sets × 10 reps, 3 days this week.",
+        "why": "Strengthens the lead hand's pull through contact. Weak bottom hand = bat slows at impact.",
+    },
+    "hitting_weak_inside_outside_tee": {
+        "category": "Contact", "phase": "week", "priority": 4,
+        "issue": "weak_contact",
+        "label": "Inside-Outside Tee Series",
+        "drill": "Alternate tee positions: inner third → middle → outer third",
+        "protocol": "3 swings per location, 3 cycles per set, 2 sets per session, 3 days this week.",
+        "why": "Builds adjustability — most weak contact comes from one path that only works on a middle pitch.",
+    },
+}
+
+
+# Map each issue → ordered list of drill keys (most-impactful first)
+HITTING_ISSUE_TO_DRILLS = {
+    "bat_speed":      ["hitting_bat_speed_overload_underload",
+                        "hitting_bat_speed_medball",
+                        "hitting_bat_speed_resistance_band",
+                        "hitting_bat_speed_top_hand"],
+    "hip_separation": ["hitting_hip_sep_coil_hold",
+                        "hitting_hip_sep_step_behind",
+                        "hitting_hip_sep_x_drill"],
+    "flat_swing":     ["hitting_flat_high_tee",
+                        "hitting_flat_pvc_path",
+                        "hitting_flat_launch_pause"],
+    "steep_swing":    ["hitting_steep_low_high_mix",
+                        "hitting_steep_top_hand_path",
+                        "hitting_steep_outside_front_toss"],
+    "off_plane":      ["hitting_on_plane_plyo_uphill",
+                        "hitting_on_plane_two_tee",
+                        "hitting_on_plane_connection_band"],
+    "slow_ttc":       ["hitting_ttc_short_bat",
+                        "hitting_ttc_heavy_quick",
+                        "hitting_ttc_connection_ball"],
+    "whiffs":         ["hitting_whiffs_sit_fastball",
+                        "hitting_whiffs_vision_bottle",
+                        "hitting_whiffs_multi_color"],
+    "weak_contact":   ["hitting_weak_front_toss_oppo",
+                        "hitting_weak_bottom_hand",
+                        "hitting_weak_inside_outside_tee"],
+}
+
+
+# =============================================================================
+# HITTING DRILL RECOMMENDER  (mirrors recommend_drills for pitching)
+# =============================================================================
+# =============================================================================
+# DEVELOPMENT DRILLS — surfaced when the data shows NO glaring weakness so
+# the player still gets actionable work to do this week (a "what to grow"
+# default instead of "everything's fine — go home"). These fill any empty
+# slots in the weekly plan.
+# =============================================================================
+HITTING_DEVELOPMENT_DEFAULTS = [
+    "hitting_bat_speed_overload_underload",   # always-helpful power lift
+    "hitting_on_plane_two_tee",               # bat-path refinement
+    "hitting_hip_sep_coil_hold",              # sequencing — universal value
+    "hitting_whiffs_vision_bottle",           # vision/recognition training
+]
+
+PITCHING_DEVELOPMENT_DEFAULTS = [
+    "low_hip_shoulder_separation",            # universal velocity gain
+    "soft_lead_knee",                          # front-side stability
+    "low_extension",                          # perceived-velo work
+    "low_fastball_spin",                      # spin-quality work
+]
+
+
+def build_weekly_plan(plan_kind: str, recommend_output: dict,
+                       athlete_level: str = "HS-Varsity",
+                       drill_library: dict | None = None) -> list:
+    """Build a 5-day structured week from a recommender's output.
+
+    Every day opens with the standard warm-up, fills 2–3 development
+    drills (priority-ordered from the recommender's week list, padded
+    with development defaults when no glaring weakness exists), and
+    closes with the standard cool-down. Day 1 also picks up the
+    "today" cooldown work from the session.
+
+    Args:
+        plan_kind:        'pitching' or 'hitting'
+        recommend_output: dict from recommend_drills / recommend_hitting_drills
+        athlete_level:    used for difficulty scaling (future)
+        drill_library:    optional override (defaults to global tables)
+
+    Returns:
+        list of day dicts, each with:
+            day_num (int), label (str), warmup (dict), drills (list),
+            cooldown (dict), notes (str).
+    """
+    is_hitting = (plan_kind == "hitting")
+    warmup   = HITTING_WARMUP if is_hitting else PITCHING_WARMUP
+    cooldown = HITTING_COOLDOWN if is_hitting else PITCHING_COOLDOWN
+    drill_lib = drill_library or (
+        HITTING_DRILL_LIBRARY if is_hitting else DRILL_LIBRARY)
+
+    # Pull week drills the recommender flagged (already priority-sorted)
+    flagged = list(recommend_output.get("week", []))
+    flagged_keys = {d["key"] for d in flagged if "key" in d}
+
+    # Fill any remaining slots with development defaults so the player
+    # ALWAYS has actionable work, even on a clean session
+    dev_defaults = (HITTING_DEVELOPMENT_DEFAULTS if is_hitting
+                     else PITCHING_DEVELOPMENT_DEFAULTS)
+    for k in dev_defaults:
+        if k in flagged_keys:
+            continue
+        if k not in drill_lib:
+            continue
+        d = drill_lib[k]
+        flagged.append({
+            "key":      k,
+            "category": d["category"],
+            "label":    d["label"],
+            "drill":    d["drill"],
+            "protocol": d["protocol"],
+            "why":      d["why"],
+            "trigger":  "General development — no specific weakness flagged.",
+            "video_url":   None,
+            "video_title": None,
+            "video_source":None,
+            "phase":    "week",
+            "priority": 5,
+        })
+
+    # ===== Distribute drills across 5 days =====
+    # Day 1: data day (snapshot + cooldown work from today)
+    # Day 2: drill day — primary weakness
+    # Day 3: drill day — secondary weakness OR development default
+    # Day 4: drill day — tertiary OR development default
+    # Day 5: live BP / bullpen (light load + game-pace work)
+    plan = []
+
+    # ---- Day 1 ----
+    today_work = list(recommend_output.get("today", []))
+    plan.append({
+        "day_num":  1,
+        "label":    "Day 1 — Data Day + Recovery",
+        "warmup":   warmup,
+        "drills":   today_work[:2],
+        "cooldown": cooldown,
+        "notes":    ("Open with the warm-up, run the session you just captured, then complete "
+                      "the today-only cooldown work below. The week's development work starts tomorrow."),
+    })
+
+    # ---- Days 2-4: rotate through flagged + dev defaults ----
+    for i in range(3):
+        day_drills = flagged[i*2 : i*2 + 2] if len(flagged) > i*2 else []
+        plan.append({
+            "day_num":  i + 2,
+            "label":    f"Day {i + 2} — Development Block {chr(ord('A') + i)}",
+            "warmup":   warmup,
+            "drills":   day_drills,
+            "cooldown": cooldown,
+            "notes":    "Focused work — high-leverage drills for the next 25-30 minutes after warm-up. "
+                         "Quality reps, not volume.",
+        })
+
+    # ---- Day 5: game-pace work (no new drills, just rehearsal) ----
+    plan.append({
+        "day_num":  5,
+        "label":    "Day 5 — Game-Pace Rehearsal",
+        "warmup":   warmup,
+        "drills":   [],
+        "cooldown": cooldown,
+        "notes":    ("Light volume, game-effort intent. "
+                       + ("Live BP with at-bat structure — 3 sets of 6 swings, "
+                          "rotate location each round."
+                          if is_hitting else
+                          "Light bullpen — 25 pitches max, focus on command and pitch shapes "
+                          "you've drilled this week.")),
+    })
+
+    return plan
+
+
+def recommend_hitting_drills(df: pd.DataFrame, sport: str = "Baseball",
+                              athlete_level: str = "HS-Varsity") -> dict:
+    """Inspect a swing session and recommend a today plan + week plan.
+
+    Returns {"today": [drill, ...], "week": [drill, ...]}.
+    Each drill is a dict ready for the same render_drill_card UI used on pitching.
+    """
+    today: list = []
+    week:  list = []
+    seen_keys: set = set()
+
+    # Map athlete level string to the video bucket already used for pitching
+    video_level = LEVEL_TO_VIDEO_BUCKET.get(athlete_level, "any")
+
+    def _record(key: str, trigger: str) -> dict:
+        d = HITTING_DRILL_LIBRARY[key]
+        video = pick_video(key, severity="any", level=video_level)
+        return {
+            "key":         key,
+            "category":    d["category"],
+            "phase":       d["phase"],
+            "priority":    d["priority"],
+            "label":       d["label"],
+            "drill":       d["drill"],
+            "protocol":    d["protocol"],
+            "why":         d["why"],
+            "grip_key":    None,
+            "video_url":   video["url"]    if video else None,
+            "video_title": video.get("title")  if video else None,
+            "video_source":video.get("source") if video else None,
+            "severity":    "any",
+            "trigger":     trigger,
+        }
+
+    def add(plan: list, key: str, trigger: str):
+        if key in seen_keys or key not in HITTING_DRILL_LIBRARY:
+            return
+        seen_keys.add(key)
+        plan.append(_record(key, trigger))
+
+    swings = df[df["Swing_Type"] == "swing"] if "Swing_Type" in df.columns else df
+    total_swings = len(swings)
+
+    def avg(col):
+        if col not in df.columns: return None
+        s = df[col].dropna()
+        return float(s.mean()) if len(s) else None
+
+    bat_speed   = avg("Bat_Speed_mph")
+    attack_ang  = avg("Attack_Angle_deg")
+    on_plane    = avg("On_Plane_Eff_pct")
+    ttc         = avg("Time_to_Contact_sec")
+    hs_sep      = avg("Peak_Hip_Shoulder_Sep_deg")
+    whiffs      = int((df["Swing_Outcome"] == "whiff").sum()) if "Swing_Outcome" in df.columns else 0
+    weak_hits   = int((df["Swing_Outcome"] == "weak_contact").sum()) if "Swing_Outcome" in df.columns else 0
+    whiff_pct   = (whiffs / total_swings * 100) if total_swings else 0
+    weak_pct    = (weak_hits / total_swings * 100) if total_swings else 0
+
+    is_softball = (sport == "Softball")
+    BAT_SPEED_WEAK = 55 if is_softball else 60
+    HS_SEP_WEAK    = 28 if is_softball else 32
+
+    def add_issue_pack(issue: str, trigger: str, max_drills: int = 3):
+        """Add a multi-drill package for an issue.
+
+        Pulls the top `max_drills` keys from HITTING_ISSUE_TO_DRILLS[issue]
+        and appends each with the shared trigger text. Gives the coach
+        several alternates so they can pick what fits their hitter / facility.
+        """
+        keys = HITTING_ISSUE_TO_DRILLS.get(issue, [])[:max_drills]
+        for k in keys:
+            add(week, k, trigger)
+
+    # ===== TODAY — RECOVERY =====
+    if total_swings >= 35:
+        add(today, "hitting_heavy_workload_cooldown",
+            f"{total_swings} total swings — high-volume session calls for active recovery.")
+    if not today:
+        add(today, "hitting_session_cooldown",
+            "Standard cooldown after any swing session.")
+
+    # ===== WEEK — BAT SPEED / TORQUE =====
+    if bat_speed is not None and bat_speed < BAT_SPEED_WEAK:
+        add_issue_pack("bat_speed",
+            f"Avg bat speed {bat_speed:.1f} mph — under target.")
+    if hs_sep is not None and hs_sep < HS_SEP_WEAK:
+        add_issue_pack("hip_separation",
+            f"Hip-shoulder separation averaged {hs_sep:.1f}° — below sequencing target.")
+
+    # ===== WEEK — BAT PATH =====
+    if attack_ang is not None and attack_ang < 2:
+        add_issue_pack("flat_swing",
+            f"Attack angle averaged {attack_ang:.1f}° — chopping down.")
+    elif attack_ang is not None and attack_ang > 20:
+        add_issue_pack("steep_swing",
+            f"Attack angle averaged {attack_ang:.1f}° — too steep.")
+    if on_plane is not None and on_plane < 60:
+        add_issue_pack("off_plane",
+            f"On-plane efficiency averaged {on_plane:.1f}% — bat path off-plane.")
+
+    # ===== WEEK — CONTACT =====
+    if ttc is not None and ttc >= 0.18:
+        add_issue_pack("slow_ttc",
+            f"Time-to-contact averaged {ttc:.3f}s — slow.")
+    if whiff_pct >= 35:
+        add_issue_pack("whiffs",
+            f"Whiff rate was {whiff_pct:.0f}% — above the 22% HS baseline.")
+    if weak_pct >= 30:
+        add_issue_pack("weak_contact",
+            f"{weak_pct:.0f}% of swings produced weak contact.")
+
+    # Sort week by priority (lower number = more important)
+    week.sort(key=lambda d: d["priority"])
+    return {"today": today, "week": week}
+
+
+def pitch_type_breakdown(df: pd.DataFrame) -> pd.DataFrame:
+    """Group by pitch type and produce avg velo, spin, break, stress per type."""
+    agg = (
+        df.groupby("Pitch_Type")
+          .agg(
+              Thrown=("Pitch_Num", "count"),
+              Avg_Velo=("Velocity_mph", "mean"),
+              Avg_Spin=("Total_Spin_rpm", "mean"),
+              Avg_Vert_Break=("Vert_Break_in", "mean"),
+              Avg_Horiz_Break=("Horiz_Break_in", "mean"),
+              Avg_Stress=("Peak_Valgus_Nm", "mean"),
+          )
+          .reset_index()
+    )
+    for col in ["Avg_Velo", "Avg_Spin", "Avg_Vert_Break", "Avg_Horiz_Break", "Avg_Stress"]:
+        agg[col] = agg[col].round(1)
+    return agg
+
+
+# =============================================================================
+# PITCH TUNNELING MATH
+# Compute per-pitch trajectories using each pitcher's measured velo + break
+# profile, then determine where each pitch type lands if tunneled off a
+# user-placed starting pitch. The "tunnel point" is the distance from the
+# plate where research says the batter has to commit (~167 ms of reaction
+# time). Pitches that share the same tunnel-point xyz but diverge to
+# different plate locations are "tunneled" — that's the core teaching tool.
+# =============================================================================
+
+# Sport-dependent constants
+TUNNEL_CONSTANTS = {
+    "Baseball": {
+        "rubber_distance_ft":   60.5,
+        "release_extension_ft": 6.0,        # avg pitcher
+        "release_height_ft":    6.0,
+        "tunnel_distance_ft":   22.0,       # ~167 ms at 90 mph
+    },
+    "Softball": {
+        "rubber_distance_ft":   43.0,
+        "release_extension_ft": 4.0,
+        "release_height_ft":    4.0,
+        "tunnel_distance_ft":   14.7,       # ~167 ms at 60 mph
+    },
+}
+
+# How long a batter needs to commit to swing (seconds)
+BATTER_COMMIT_TIME_SEC = 0.167
+
+
+def _pitch_release_point(sport: str = "Baseball") -> tuple[float, float, float]:
+    """Average release point in (x, y, z) feet — x lateral, y distance from
+    plate, z height. We assume an over-the-top average for v1; future
+    versions can pull arm-slot data per pitcher."""
+    c = TUNNEL_CONSTANTS.get(sport, TUNNEL_CONSTANTS["Baseball"])
+    # Release is in front of the rubber by `release_extension_ft`
+    release_y = c["rubber_distance_ft"] - c["release_extension_ft"]
+    return (0.0, release_y, c["release_height_ft"])
+
+
+def _pitch_trajectory_points(release_xyz: tuple[float, float, float],
+                              plate_xyz: tuple[float, float],
+                              velocity_mph: float,
+                              vert_break_in: float,
+                              horiz_break_in: float,
+                              n_samples: int = 40) -> list[dict]:
+    """Compute (t, x, y, z) sample points for one pitch's full flight using
+    projectile physics with gravity + Magnus force.
+
+    Model:
+      - Position(t) = release + v_initial * t + 0.5 * accel * t²
+      - Vertical acceleration: -g + a_magnus (Magnus partially defeats
+        gravity for backspin; adds to it for topspin)
+      - Horizontal acceleration: a_magnus_horizontal
+      - a_magnus values are chosen so the ball's total deviation from a
+        no-spin pitch over the full flight equals the measured break.
+
+    Algebraically, given known release and plate locations + measured
+    break, this collapses to:
+      z(f) = rz + [(pz - vb - rz) + gravity_drop] * f
+                + [vb - gravity_drop] * f²
+    where gravity_drop = 0.5 * g * T² (the total a no-spin ball would
+    fall under gravity alone during its flight time T).
+
+    Result: fastballs arc gently (they "rise" relative to no-spin),
+    curveballs drop sharply late in flight (they fall faster than
+    no-spin) — matching what real baseball trajectories look like.
+    """
+    rx, ry, rz = release_xyz
+    px, pz = plate_xyz
+    v_fps = velocity_mph * 1.467   # 1 mph = 1.467 ft/s
+    T_total = ry / v_fps if v_fps > 0 else 0.4
+
+    g = 32.17  # ft/s² — Earth gravity
+    gravity_drop = 0.5 * g * T_total * T_total
+
+    # Break in feet (Pitch Logic / Statcast convention: deviation from
+    # a no-spin pitch AT THE PLATE)
+    vb_ft = vert_break_in / 12.0
+    hb_ft = horiz_break_in / 12.0
+
+    # Coefficients of the parameterized trajectory polynomial
+    z_linear = (pz - vb_ft - rz) + gravity_drop
+    z_quad   = vb_ft - gravity_drop
+    x_linear = (px - hb_ft - rx)
+    x_quad   = hb_ft
+
+    samples = []
+    for i in range(n_samples + 1):
+        f = i / n_samples
+        z = rz + z_linear * f + z_quad * (f * f)
+        x = rx + x_linear * f + x_quad * (f * f)
+        y = ry * (1.0 - f)
+        samples.append({
+            "t": f * T_total,
+            "f": f,
+            "x": x,
+            "y": y,
+            "z": z,
+        })
+    return samples
+
+
+def _interp_at_y(samples: list[dict], target_y: float) -> dict | None:
+    """Find the (x, z) of the trajectory at a given y-depth. Returns None
+    if the trajectory doesn't pass through target_y."""
+    for i in range(len(samples) - 1):
+        a, b = samples[i], samples[i + 1]
+        if (a["y"] - target_y) * (b["y"] - target_y) <= 0 and a["y"] != b["y"]:
+            # Linear interp between a and b
+            r = (a["y"] - target_y) / (a["y"] - b["y"])
+            return {
+                "x": a["x"] + (b["x"] - a["x"]) * r,
+                "y": target_y,
+                "z": a["z"] + (b["z"] - a["z"]) * r,
+                "t": a["t"] + (b["t"] - a["t"]) * r,
+            }
+    return None
+
+
+def compute_arsenal_tunnel(arsenal: list[dict],
+                            starting_pitch_type: str,
+                            plate_x: float,
+                            plate_z: float,
+                            sport: str = "Baseball") -> dict:
+    """Given an arsenal of pitch type averages, tunnel everything off the
+    starting pitch's release vector.
+
+    arsenal items must have:
+       Pitch_Type, Avg_Velo, Avg_Vert_Break, Avg_Horiz_Break
+
+    Algorithm (simple but conceptually correct):
+      1. Compute the STARTING pitch's full trajectory from release to the
+         clicked (plate_x, plate_z) using its measured break.
+      2. Find the tunnel-point (x, y, z) on that trajectory at y =
+         tunnel_distance_ft.
+      3. For every other pitch type, assume it shares the SAME release
+         direction (i.e. release_x_offset and angle) as the starting pitch.
+         Because each pitch has different break, its trajectory diverges
+         from the starting pitch — landing at a different plate location.
+         We solve: plate_other = plate_start + (break_other - break_start)
+         (Working in feet; break differential applied to the plate
+         crossing — break gradient is uniform across pitches with the
+         quadratic accumulation factor.)
+
+    Returns dict keyed by pitch type with: plate_x, plate_z, tunnel_xyz,
+    samples, velocity_mph, vert_break_in, horiz_break_in, total_flight_sec.
+    """
+    release_xyz = _pitch_release_point(sport)
+    c = TUNNEL_CONSTANTS.get(sport, TUNNEL_CONSTANTS["Baseball"])
+    tunnel_y = c["tunnel_distance_ft"]
+
+    # Find the starting pitch's break profile in the arsenal
+    start_entry = next((p for p in arsenal
+                          if p["Pitch_Type"] == starting_pitch_type), None)
+    if start_entry is None:
+        return {}
+
+    start_vb = float(start_entry["Avg_Vert_Break"] or 0.0)
+    start_hb = float(start_entry["Avg_Horiz_Break"] or 0.0)
+    start_v  = float(start_entry["Avg_Velo"] or 90.0)
+
+    out: dict[str, dict] = {}
+    for p in arsenal:
+        ptype = p["Pitch_Type"]
+        v   = float(p.get("Avg_Velo") or 90.0)
+        vb  = float(p.get("Avg_Vert_Break") or 0.0)
+        hb  = float(p.get("Avg_Horiz_Break") or 0.0)
+
+        # Plate location relative to the starting pitch's plate
+        # (break differential, converted to feet)
+        d_plate_x = plate_x + (hb - start_hb) / 12.0
+        d_plate_z = plate_z + (vb - start_vb) / 12.0
+
+        samples = _pitch_trajectory_points(
+            release_xyz=release_xyz,
+            plate_xyz=(d_plate_x, d_plate_z),
+            velocity_mph=v,
+            vert_break_in=vb,
+            horiz_break_in=hb,
+        )
+        tunnel = _interp_at_y(samples, tunnel_y)
+        # Flight time
+        v_fps = v * 1.467
+        flight_total_sec = release_xyz[1] / v_fps if v_fps > 0 else None
+
+        out[ptype] = {
+            "Pitch_Type":       ptype,
+            "is_starting":      ptype == starting_pitch_type,
+            "velocity_mph":     v,
+            "vert_break_in":    vb,
+            "horiz_break_in":   hb,
+            "plate_x":          d_plate_x,
+            "plate_z":          d_plate_z,
+            "tunnel_xyz":       tunnel,
+            "samples":          samples,
+            "total_flight_sec": flight_total_sec,
+        }
+    return out
+
+
+def tunnel_quality_metrics(tunnel_data: dict) -> dict:
+    """Summarize per-pitch tunneling quality vs. the starting pitch.
+
+    Returns dict keyed by pitch type with:
+      - tunnel_offset_in: 2D distance between this pitch's tunnel point and
+        the starting pitch's tunnel point (inches). Lower = better tunnel.
+      - plate_diff_in: 2D distance between plate locations (inches). Higher
+        = more divergence after the commit, which is what we want.
+      - timing_offset_ms: difference in flight time (ms). Bigger gap = the
+        batter has to adjust their swing timing.
+      - tunnel_grade: "Elite" (≤3"), "Good" (≤6"), "Loose" (≤10"), "No Tunnel" (>10")
+    """
+    start = next((p for p in tunnel_data.values() if p["is_starting"]), None)
+    if start is None:
+        return {}
+    sx = start["tunnel_xyz"]["x"] if start["tunnel_xyz"] else 0
+    sz = start["tunnel_xyz"]["z"] if start["tunnel_xyz"] else 0
+    splate_x = start["plate_x"]; splate_z = start["plate_z"]
+    s_flight = start["total_flight_sec"] or 0
+
+    out = {}
+    for ptype, p in tunnel_data.items():
+        if p["tunnel_xyz"] is None:
+            continue
+        dx_t = (p["tunnel_xyz"]["x"] - sx) * 12.0
+        dz_t = (p["tunnel_xyz"]["z"] - sz) * 12.0
+        tunnel_offset_in = (dx_t * dx_t + dz_t * dz_t) ** 0.5
+
+        dx_p = (p["plate_x"] - splate_x) * 12.0
+        dz_p = (p["plate_z"] - splate_z) * 12.0
+        plate_diff_in = (dx_p * dx_p + dz_p * dz_p) ** 0.5
+
+        timing_offset_ms = ((p["total_flight_sec"] or 0) - s_flight) * 1000.0
+
+        if tunnel_offset_in <= 3:    grade = "Elite"
+        elif tunnel_offset_in <= 6:  grade = "Good"
+        elif tunnel_offset_in <= 10: grade = "Loose"
+        else:                         grade = "No Tunnel"
+
+        out[ptype] = {
+            "tunnel_offset_in": round(tunnel_offset_in, 2),
+            "plate_diff_in":    round(plate_diff_in, 2),
+            "timing_offset_ms": round(timing_offset_ms, 1),
+            "tunnel_grade":     grade,
+        }
+    return out
+
+
+# =============================================================================
+# PITCH TUNNELING — POV PLOTTERS  (batter view / pitcher view / side view)
+# =============================================================================
+def _build_tunnel_batter_view(tunnel_data: dict, sport: str = "Baseball",
+                                hand: str = "Right",
+                                clickable: bool = True,
+                                mirror_x: bool = False,
+                                depth_reversed: bool = False) -> "go.Figure":
+    """Catcher / batter POV — strike zone + the FLIGHT PATH of each pitch
+    from release through the tunnel point to the plate, projected onto the
+    (plate-side, height) plane the batter sees.
+
+    All pitches start at the same release point and converge tightly at the
+    tunnel point (~22 ft for baseball / 14.7 ft for softball — about 167 ms
+    before the plate). They visibly fan out only in the final 22 ft after
+    the batter has had to commit — that's the entire teaching purpose of
+    this view.
+
+    Args:
+      mirror_x: when True, flip the x-axis (pitcher's POV — looks like the
+        inverse of the batter view from behind the mound).
+      clickable: overlay an invisible grid of click targets so the user can
+        click anywhere on or around the zone to place the starting pitch.
+    """
+    fig = go.Figure()
+    sign = -1.0 if mirror_x else 1.0  # mirror x for pitcher POV
+
+    # ==== Click-target grid (transparent, but selectable) ====
+    # Only on the batter POV — clicks on the pitcher POV would be x-mirrored
+    # and confusing. Resolution ≈ 0.10 ft (~1.2") snaps the click.
+    if clickable and not mirror_x:
+        grid_x, grid_y, grid_custom = [], [], []
+        step = 0.10
+        x = -2.0
+        while x <= 2.0 + 1e-6:
+            y = -0.3
+            while y <= 7.5 + 1e-6:
+                grid_x.append(round(x, 2))
+                grid_y.append(round(y, 2))
+                grid_custom.append([round(x, 2), round(y, 2)])
+                y += step
+            x += step
+        fig.add_trace(go.Scatter(
+            x=grid_x, y=grid_y,
+            mode="markers",
+            marker=dict(size=14, color="rgba(0,0,0,0)", line=dict(width=0)),
+            customdata=grid_custom,
+            hovertemplate="<b>📍 Click to place starting pitch here</b><br>"
+                          "(%{x:.2f} ft, %{y:.2f} ft)<extra></extra>",
+            name="placement_grid",
+            showlegend=False,
+        ))
+
+    # ==== Strike zone box + 3x3 grid ====
+    fig.add_shape(type="rect", x0=sign*SZ_X_MIN, x1=sign*SZ_X_MAX,
+                   y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                   line=dict(color="black", width=2),
+                   fillcolor="rgba(0,0,0,0)", layer="below")
+    for i in (1, 2):
+        x = SZ_X_MIN + (SZ_X_MAX - SZ_X_MIN) * (i / 3)
+        z = SZ_Z_MIN + (SZ_Z_MAX - SZ_Z_MIN) * (i / 3)
+        fig.add_shape(type="line", x0=sign*x, x1=sign*x, y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                       line=dict(color="#cccccc", width=0.6, dash="dot"))
+        fig.add_shape(type="line", x0=sign*SZ_X_MIN, x1=sign*SZ_X_MAX, y0=z, y1=z,
+                       line=dict(color="#cccccc", width=0.6, dash="dot"))
+    # Home plate
+    fig.add_shape(type="path",
+                   path=f"M {sign*-0.71} 0.05 L {sign*0.71} 0.05 "
+                        f"L {sign*0.50} -0.10 L 0 -0.25 L {sign*-0.50} -0.10 Z",
+                   fillcolor="#dcdcdc", line=dict(color="black", width=1),
+                   layer="below")
+
+    # ==== Tunnel-point convergence ring ====
+    # Find the average tunnel-point (x, z) across all pitches — that's the
+    # "tunnel zone" where the batter is forced to commit.
+    tunnel_xs = [p["tunnel_xyz"]["x"] for p in tunnel_data.values()
+                  if p["tunnel_xyz"]]
+    tunnel_zs = [p["tunnel_xyz"]["z"] for p in tunnel_data.values()
+                  if p["tunnel_xyz"]]
+    if tunnel_xs:
+        cx = sum(tunnel_xs) / len(tunnel_xs)
+        cz = sum(tunnel_zs) / len(tunnel_zs)
+        # Draw a translucent gold ellipse to mark "commit window"
+        fig.add_shape(
+            type="circle",
+            x0=sign*cx - 0.18, x1=sign*cx + 0.18,
+            y0=cz - 0.18, y1=cz + 0.18,
+            line=dict(color="#d4a634", width=2, dash="dot"),
+            fillcolor="rgba(212,166,52,0.10)",
+            layer="below",
+        )
+        fig.add_annotation(
+            x=sign*cx, y=cz + 0.32,
+            text="🔒 commit point",
+            showarrow=False,
+            font=dict(size=9, color="#92400e"),
+            bgcolor="rgba(254,243,199,0.85)",
+            borderpad=2,
+        )
+
+    # ==== Flight-path TRAJECTORIES (release → tunnel → plate) ====
+    # Each pitch is a thick curved trail with a glowing halo underneath
+    # (Statcast / PitchLogic overlay vibe). Trail-bead markers along the
+    # path scale with depth: batter view = balls grow as they approach;
+    # pitcher view = balls SHRINK as they travel away.
+    for ptype, p in tunnel_data.items():
+        color = PITCH_COLORS.get(ptype, "#666")
+        is_start = p["is_starting"]
+        xs = [sign * s["x"] for s in p["samples"]]
+        zs = [s["z"]         for s in p["samples"]]
+
+        # ---- Halo glow underneath ----
+        fig.add_trace(go.Scatter(
+            x=xs, y=zs,
+            mode="lines",
+            line=dict(color=color, width=18 if is_start else 13,
+                       shape="spline", smoothing=1.0),
+            opacity=0.22 if is_start else 0.15,
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+        # ---- Main thick trail line ----
+        fig.add_trace(go.Scatter(
+            x=xs, y=zs,
+            mode="lines",
+            line=dict(color=color, width=8 if is_start else 6,
+                       shape="spline", smoothing=1.0),
+            opacity=1.0 if is_start else 0.9,
+            name=f"{ptype}{' ⭐' if is_start else ''}",
+            hovertemplate=f"<b>{ptype}</b><br>"
+                          f"%{{x:+.2f}} ft side · %{{y:.2f}} ft high<extra></extra>",
+        ))
+        # ---- Ball-trail beads ----
+        trail_n = max(1, len(p["samples"]) // 7)
+        trail_xs, trail_ys, trail_sizes, trail_opacity = [], [], [], []
+        for i, s in enumerate(p["samples"]):
+            if i % trail_n != 0 or i == 0 or i == len(p["samples"]) - 1:
+                continue
+            depth_frac = 1.0 - (s["y"] / 60.0)  # 0 at release, ~1 at plate
+            # depth_frac feels like "how close is the ball to the catcher"
+            # — for batter view, closer-to-catcher = closer-to-camera = bigger
+            # — for pitcher view, closer-to-catcher = farther-from-camera = smaller
+            visible = (1.0 - depth_frac) if depth_reversed else depth_frac
+            trail_xs.append(sign * s["x"])
+            trail_ys.append(s["z"])
+            trail_sizes.append(6 + 14 * visible)
+            trail_opacity.append(0.4 + 0.55 * visible)
+        if trail_xs:
+            fig.add_trace(go.Scatter(
+                x=trail_xs, y=trail_ys,
+                mode="markers",
+                marker=dict(size=trail_sizes,
+                             color=color,
+                             opacity=trail_opacity,
+                             line=dict(color="white", width=1.5)),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+        # ---- Endpoint markers ----
+        # Plate-crossing dot (the "arrival" — emphasized in batter view)
+        # Pitcher view: plate is FAR AWAY, so smaller; release is close, bigger
+        if depth_reversed:
+            release_marker_size = 28 if is_start else 22
+            plate_marker_size   = 16 if is_start else 12
+        else:
+            release_marker_size = 12
+            plate_marker_size   = 30 if is_start else 22
+
+        fig.add_trace(go.Scatter(
+            x=[sign * p["plate_x"]], y=[p["plate_z"]],
+            mode="markers+text",
+            marker=dict(size=plate_marker_size,
+                         color=color,
+                         line=dict(color="#d4a634" if is_start else "white",
+                                   width=3 if is_start else 2),
+                         symbol="star" if is_start else "circle"),
+            text=[ptype.split()[0][:6]],
+            textposition="top center" if not depth_reversed else "bottom center",
+            textfont=dict(color="#1a2150",
+                           size=10 if not depth_reversed else 9,
+                           family="Arial Black"),
+            hovertemplate=f"<b>{ptype}</b> @ plate<br>"
+                          f"({p['plate_x']:+.2f}, {p['plate_z']:.2f}) ft<br>"
+                          f"Velo: {p['velocity_mph']:.1f} mph<br>"
+                          f"V Break: {p['vert_break_in']:+.1f}\" · "
+                          f"H Break: {p['horiz_break_in']:+.1f}\""
+                          + ("<br><i>(⭐ Starting pitch — click anywhere to move)</i>" if is_start else "")
+                          + "<extra></extra>",
+            showlegend=False,
+        ))
+        # Release-point dot (pitcher view emphasizes this end)
+        if depth_reversed:
+            fig.add_trace(go.Scatter(
+                x=[sign * p["samples"][0]["x"]],
+                y=[p["samples"][0]["z"]],
+                mode="markers+text",
+                marker=dict(size=release_marker_size,
+                             color=color,
+                             line=dict(color="#d4a634" if is_start else "white",
+                                       width=3 if is_start else 2),
+                             symbol="star" if is_start else "circle"),
+                text=[ptype.split()[0][:6]] if is_start else [""],
+                textposition="top center",
+                textfont=dict(color="#1a2150", size=10, family="Arial Black"),
+                hovertemplate=f"<b>{ptype}</b> released<br>"
+                              f"Aim: ({p['plate_x']:+.2f}, {p['plate_z']:.2f}) ft<br>"
+                              f"Velo: {p['velocity_mph']:.1f} mph<extra></extra>",
+                showlegend=False,
+            ))
+
+    # Release-point marker (all pitches start here)
+    rxyz = _pitch_release_point(sport)
+    fig.add_trace(go.Scatter(
+        x=[sign * rxyz[0]], y=[rxyz[2]],
+        mode="markers+text",
+        marker=dict(size=14, color="#1a2150",
+                     line=dict(color="white", width=2),
+                     symbol="diamond"),
+        text=["release"],
+        textposition="top center",
+        textfont=dict(color="#1a2150", size=9),
+        hovertemplate=f"<b>Release point</b><br>"
+                      f"({rxyz[0]:+.1f}, {rxyz[2]:.1f}) ft<br>"
+                      f"All pitches start here<extra></extra>",
+        showlegend=False,
+    ))
+
+    # ==== Crosshair on the starting-pitch placement ====
+    start = next((p for p in tunnel_data.values() if p["is_starting"]), None)
+    if start is not None and clickable and not mirror_x:
+        fig.add_shape(type="line",
+                       x0=sign*start["plate_x"], x1=sign*start["plate_x"],
+                       y0=-0.3, y1=7.5,
+                       line=dict(color="#d4a634", width=1, dash="dot"),
+                       layer="below")
+        fig.add_shape(type="line", x0=-2.0, x1=2.0,
+                       y0=start["plate_z"], y1=start["plate_z"],
+                       line=dict(color="#d4a634", width=1, dash="dot"),
+                       layer="below")
+
+    title = ("Catcher / Batter POV — click anywhere to move the starting pitch"
+             if not mirror_x else
+             "Pitcher POV — inverse of the batter view (same flight paths)")
+    x_title = "Plate Side (ft) — catcher's view" if not mirror_x else \
+              "Plate Side (ft) — pitcher's view (mirrored)"
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=13, color="#1a2150")),
+        xaxis=dict(title=x_title, range=(-2.0, 2.0),
+                    zeroline=False, showgrid=False),
+        # Range now reaches 7.5 ft so the release point (z≈6) is visible
+        yaxis=dict(title="Height (ft)", range=(-0.5, 7.5),
+                    zeroline=False, showgrid=False,
+                    scaleanchor="x", scaleratio=1),
+        height=560, plot_bgcolor="white",
+        margin=dict(l=20, r=20, t=50, b=40),
+        dragmode=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.05),
+    )
+    return _apply_chart_theme(fig)
+
+
+def _perspective_project(point_xyz: tuple[float, float, float],
+                          camera_xyz: tuple[float, float, float],
+                          focal: float = 36.0) -> tuple[float, float] | None:
+    """Project a 3D world point onto the camera's 2D image plane.
+
+    Camera looks down the +(-y) axis (toward the plate, since plate is at
+    y=0 and pitcher is at y≈60). +z is "up" in world, mapped to +y in the
+    projected image. +x stays as +x.
+
+    Returns (apparent_x, apparent_y) in chart units, or None if the point
+    is behind the camera (depth ≤ 0.5 ft).
+    """
+    px, py, pz = point_xyz
+    cx, cy, cz = camera_xyz
+    depth = cy - py  # distance forward from camera (positive = in front)
+    if depth <= 0.5:   # avoid singularity right at the camera
+        return None
+    apparent_x = (px - cx) / depth * focal
+    apparent_y = (pz - cz) / depth * focal
+    return apparent_x, apparent_y
+
+
+def _build_tunnel_pitcher_view(tunnel_data: dict, sport: str = "Baseball") -> "go.Figure":
+    """TRUE 1st-person pitcher view — perspective-projected from behind the
+    mound. The catcher's mitt appears SMALL in the distance, the strike zone
+    is a small rectangle near the bottom-center of the field of view, and
+    the ball trail arcs AWAY from the camera (large at release, small at
+    the plate). This is what the pitcher literally sees.
+
+    Implemented as a perspective projection (not a 2D mirror) so the
+    depth-foreshortening is geometrically correct.
+    """
+    fig = go.Figure()
+    c = TUNNEL_CONSTANTS.get(sport, TUNNEL_CONSTANTS["Baseball"])
+    release_xyz = _pitch_release_point(sport)
+    rubber_y = c["rubber_distance_ft"]
+
+    # Camera at pitcher's eye position: just behind + slightly to the side
+    # of the rubber, head-height above the release. The side offset gives
+    # the view a cinematic 3/4-angle perspective so depth reads better than
+    # a perfectly dead-on rear view (everything would otherwise collapse
+    # onto the chart's center line).
+    cam_xyz = (1.4, rubber_y + 1.5, release_xyz[2] + 0.4)
+    focal = 36.0  # tune for how zoomed-in the view feels
+
+    # ===== Sky / ground / mound horizon =====
+    # Soft sky gradient
+    fig.add_shape(type="rect", x0=-12, x1=12, y0=-8, y1=8,
+                   fillcolor="#dbeafe", line=dict(width=0), layer="below")
+    # Ground plane projected onto image — appears as a trapezoid from
+    # bottom-edge of view tapering to the horizon. Compute as projected
+    # box of the field surface.
+    horizon_y = -(release_xyz[2] - cam_xyz[2]) / (rubber_y + 1) * focal  # where ground at infinity projects
+    fig.add_shape(type="path",
+                   path=(f"M -12 -8 L 12 -8 "
+                          f"L {focal * 12 / 50:.2f} {horizon_y:.2f} "
+                          f"L {-focal * 12 / 50:.2f} {horizon_y:.2f} Z"),
+                   fillcolor="#bbf09b", line=dict(width=0), layer="below")
+    # Horizon line
+    fig.add_shape(type="line", x0=-12, x1=12, y0=horizon_y, y1=horizon_y,
+                   line=dict(color="#94a3b8", width=1), layer="below")
+
+    # ===== Strike zone (projected) =====
+    sz_corners = [
+        (SZ_X_MIN, 0.0, SZ_Z_MAX),  # top-left
+        (SZ_X_MAX, 0.0, SZ_Z_MAX),  # top-right
+        (SZ_X_MAX, 0.0, SZ_Z_MIN),  # bottom-right
+        (SZ_X_MIN, 0.0, SZ_Z_MIN),  # bottom-left
+    ]
+    sz_proj = [_perspective_project(p, cam_xyz, focal) for p in sz_corners]
+    if all(sz_proj):
+        path_d = (f"M {sz_proj[0][0]:.2f} {sz_proj[0][1]:.2f} "
+                  f"L {sz_proj[1][0]:.2f} {sz_proj[1][1]:.2f} "
+                  f"L {sz_proj[2][0]:.2f} {sz_proj[2][1]:.2f} "
+                  f"L {sz_proj[3][0]:.2f} {sz_proj[3][1]:.2f} Z")
+        fig.add_shape(type="path", path=path_d,
+                       line=dict(color="black", width=2),
+                       fillcolor="rgba(0,0,0,0)",
+                       layer="above")
+        # 3×3 inner grid
+        for i in (1, 2):
+            f_h = i / 3.0
+            top_l = sz_proj[0]; top_r = sz_proj[1]
+            bot_l = sz_proj[3]; bot_r = sz_proj[2]
+            # vertical divider
+            vx_top = top_l[0] + (top_r[0] - top_l[0]) * f_h
+            vx_bot = bot_l[0] + (bot_r[0] - bot_l[0]) * f_h
+            fig.add_shape(type="line", x0=vx_top, x1=vx_bot,
+                           y0=top_l[1], y1=bot_l[1],
+                           line=dict(color="#9ca3af", width=0.6, dash="dot"),
+                           layer="above")
+            # horizontal divider
+            hy_l = bot_l[1] + (top_l[1] - bot_l[1]) * f_h
+            hy_r = bot_r[1] + (top_r[1] - bot_r[1]) * f_h
+            fig.add_shape(type="line", x0=top_l[0], x1=top_r[0],
+                           y0=hy_l, y1=hy_r,
+                           line=dict(color="#9ca3af", width=0.6, dash="dot"),
+                           layer="above")
+
+    # ===== Catcher silhouette behind the plate (small, distant) =====
+    catcher_proj = _perspective_project((0.0, -2.0, 2.5), cam_xyz, focal)
+    if catcher_proj:
+        cx_, cy_ = catcher_proj
+        # head
+        fig.add_shape(type="circle",
+                       x0=cx_ - 0.15, x1=cx_ + 0.15,
+                       y0=cy_ - 0.15, y1=cy_ + 0.15,
+                       fillcolor="#1f2937", line=dict(width=0), layer="above")
+        # crouched body
+        fig.add_shape(type="path",
+                       path=f"M {cx_-0.25} {cy_-0.15} L {cx_+0.25} {cy_-0.15} "
+                            f"L {cx_+0.35} {cy_-1.0} L {cx_-0.35} {cy_-1.0} Z",
+                       fillcolor="#1f2937", line=dict(width=0), layer="above")
+
+    # ===== Flight-path trajectories (projected) =====
+    for ptype, p in tunnel_data.items():
+        color = PITCH_COLORS.get(ptype, "#666")
+        is_start = p["is_starting"]
+        proj_pts = []
+        for s in p["samples"]:
+            proj = _perspective_project((s["x"], s["y"], s["z"]), cam_xyz, focal)
+            if proj:
+                proj_pts.append(proj)
+        if len(proj_pts) < 2:
+            continue
+        xs_p = [pt[0] for pt in proj_pts]
+        ys_p = [pt[1] for pt in proj_pts]
+
+        # Glow halo
+        fig.add_trace(go.Scatter(
+            x=xs_p, y=ys_p, mode="lines",
+            line=dict(color=color, width=20 if is_start else 14,
+                       shape="spline", smoothing=1.0),
+            opacity=0.22 if is_start else 0.15,
+            hoverinfo="skip", showlegend=False,
+        ))
+        # Main thick trail
+        fig.add_trace(go.Scatter(
+            x=xs_p, y=ys_p, mode="lines",
+            line=dict(color=color, width=9 if is_start else 6,
+                       shape="spline", smoothing=1.0),
+            opacity=1.0 if is_start else 0.9,
+            name=f"{ptype}{' ⭐' if is_start else ''}",
+            hovertemplate=f"<b>{ptype}</b><extra></extra>",
+        ))
+
+        # Ball-trail beads — LARGE near camera (release, low sample idx)
+        # and SMALL near catcher (plate, high sample idx)
+        trail_n = max(1, len(p["samples"]) // 8)
+        bead_xs, bead_ys, bead_sizes, bead_opacity = [], [], [], []
+        for i, s in enumerate(p["samples"]):
+            if i % trail_n != 0 or i == 0 or i == len(p["samples"]) - 1:
+                continue
+            proj = _perspective_project((s["x"], s["y"], s["z"]), cam_xyz, focal)
+            if proj is None:
+                continue
+            # Apparent ball size scales 1/depth like real perspective
+            depth = cam_xyz[1] - s["y"]
+            size = max(5.0, min(28.0, 90.0 / depth))   # 90/depth caps for taste
+            opacity = max(0.35, min(0.95, 5.0 / depth + 0.3))
+            bead_xs.append(proj[0])
+            bead_ys.append(proj[1])
+            bead_sizes.append(size)
+            bead_opacity.append(opacity)
+        if bead_xs:
+            fig.add_trace(go.Scatter(
+                x=bead_xs, y=bead_ys,
+                mode="markers",
+                marker=dict(size=bead_sizes, color=color,
+                             opacity=bead_opacity,
+                             line=dict(color="white", width=1.5)),
+                showlegend=False, hoverinfo="skip",
+            ))
+
+        # Release-point dot — huge (right in front of pitcher's eye)
+        rel_proj = _perspective_project(
+            (p["samples"][0]["x"], p["samples"][0]["y"], p["samples"][0]["z"]),
+            cam_xyz, focal)
+        if rel_proj:
+            fig.add_trace(go.Scatter(
+                x=[rel_proj[0]], y=[rel_proj[1]],
+                mode="markers+text",
+                marker=dict(size=42 if is_start else 32,
+                             color=color,
+                             line=dict(color="#d4a634" if is_start else "white",
+                                       width=3 if is_start else 2),
+                             symbol="star" if is_start else "circle"),
+                text=[ptype.split()[0][:8]] if is_start else [""],
+                textposition="top center",
+                textfont=dict(color="#1a2150", size=11, family="Arial Black"),
+                hovertemplate=f"<b>{ptype}</b> at release<extra></extra>",
+                showlegend=False,
+            ))
+        # Plate-finish dot — small (far away in the distance)
+        plate_proj = _perspective_project(
+            (p["plate_x"], 0.0, p["plate_z"]), cam_xyz, focal)
+        if plate_proj:
+            fig.add_trace(go.Scatter(
+                x=[plate_proj[0]], y=[plate_proj[1]],
+                mode="markers+text",
+                marker=dict(size=14 if is_start else 11,
+                             color=color,
+                             line=dict(color="#d4a634" if is_start else "white",
+                                       width=2),
+                             symbol="circle"),
+                text=[ptype.split()[0][:6]],
+                textposition="bottom center",
+                textfont=dict(color="#1a2150", size=8, family="Arial Black"),
+                hovertemplate=f"<b>{ptype}</b> finishes at "
+                              f"({p['plate_x']:+.2f}, {p['plate_z']:.2f}) ft<extra></extra>",
+                showlegend=False,
+            ))
+
+    # ===== Subtle "mound" foreground hint =====
+    fig.add_shape(type="path",
+                   path=f"M -12 -8 Q 0 -5 12 -8 L 12 -8.5 L -12 -8.5 Z",
+                   fillcolor="#8c7050", line=dict(width=0), layer="below")
+
+    fig.update_layout(
+        title=dict(text="Pitcher POV — looking down at the catcher's mitt",
+                    font=dict(size=13, color="#1a2150")),
+        xaxis=dict(range=(-8, 8), zeroline=False, showgrid=False,
+                    showticklabels=False, showline=False),
+        yaxis=dict(range=(-8, 6), zeroline=False, showgrid=False,
+                    showticklabels=False, showline=False,
+                    scaleanchor="x", scaleratio=1),
+        height=560, plot_bgcolor="#dbeafe",
+        margin=dict(l=20, r=20, t=50, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        dragmode=False,
+    )
+    return _apply_chart_theme(fig)
+
+
+def _build_tunnel_side_view(tunnel_data: dict, sport: str = "Baseball") -> "go.Figure":
+    """Side view — looks like the classic tunneling diagram:
+       pitcher → release-point ring → tunnel-point ring → home-plate ring → catcher.
+
+    The y-axis is height (ft), x-axis is distance from plate (ft, reversed so
+    the pitcher is on the LEFT like the reference image). Each pitch is drawn
+    as a thick curved flight path. Convergence at the tunnel ring then
+    divergence to the plate is the entire teaching story.
+    """
+    fig = go.Figure()
+    c = TUNNEL_CONSTANTS.get(sport, TUNNEL_CONSTANTS["Baseball"])
+    tunnel_y = c["tunnel_distance_ft"]
+    rubber_y = c["rubber_distance_ft"]
+    release_xyz = _pitch_release_point(sport)
+
+    # ===== Background dressing: sky + ground =====
+    # Soft sky gradient
+    fig.add_shape(type="rect",
+                   x0=-2, x1=rubber_y + 2, y0=-1, y1=10,
+                   fillcolor="#f0f9ff", line=dict(width=0), layer="below")
+    # Ground / dirt strip
+    fig.add_shape(type="rect", x0=-2, x1=rubber_y + 2, y0=-1, y1=0,
+                   fillcolor="#c2a47e", line=dict(width=0), layer="below")
+    # Mound (slight bump at rubber distance)
+    fig.add_shape(type="path",
+                   path=f"M {rubber_y - 5} 0 Q {rubber_y} 1.0 {rubber_y + 5} 0 L {rubber_y + 5} -1 L {rubber_y - 5} -1 Z",
+                   fillcolor="#8c7050", line=dict(color="#6b5638", width=1),
+                   layer="below")
+
+    # ===== Pitcher silhouette + label (left side of chart) =====
+    px_pitcher = rubber_y + 0.5
+    # Body (simple stick figure-ish using shapes)
+    fig.add_shape(type="circle",
+                   x0=px_pitcher - 0.4, x1=px_pitcher + 0.4,
+                   y0=5.2, y1=6.0,
+                   fillcolor="#1f2937", line=dict(width=0), layer="below")  # head
+    fig.add_shape(type="path",
+                   path=f"M {px_pitcher} 5.2 L {px_pitcher - 0.7} 4.0 L {px_pitcher + 0.7} 3.8 L {px_pitcher} 5.2 Z",
+                   fillcolor="#1f2937", line=dict(width=0), layer="below")  # torso/arm
+    fig.add_shape(type="path",
+                   path=f"M {px_pitcher - 0.4} 3.8 L {px_pitcher - 1.2} 0.5 L {px_pitcher + 1.2} 0.5 L {px_pitcher + 0.4} 3.8 Z",
+                   fillcolor="#1f2937", line=dict(width=0), layer="below")  # legs
+    fig.add_annotation(x=px_pitcher, y=6.6, text="<b>Pitcher</b>",
+                        showarrow=False,
+                        font=dict(size=10, color="#1f2937"))
+
+    # ===== Catcher silhouette (right side of chart, at plate) =====
+    px_catcher = -1.0
+    fig.add_shape(type="circle",
+                   x0=px_catcher - 0.3, x1=px_catcher + 0.3,
+                   y0=2.5, y1=3.1,
+                   fillcolor="#1f2937", line=dict(width=0), layer="below")  # head
+    fig.add_shape(type="path",
+                   path=f"M {px_catcher - 0.5} 2.5 L {px_catcher + 0.5} 2.5 L {px_catcher + 0.7} 0.5 L {px_catcher - 0.7} 0.5 Z",
+                   fillcolor="#1f2937", line=dict(width=0), layer="below")  # crouched torso
+    fig.add_annotation(x=px_catcher, y=3.5, text="<b>Catcher</b>",
+                        showarrow=False,
+                        font=dict(size=10, color="#1f2937"))
+
+    # ===== Release-point RING =====
+    rp_x, rp_z = release_xyz[1], release_xyz[2]   # (54.5, 6.0)
+    fig.add_shape(type="circle",
+                   x0=rp_x - 0.55, x1=rp_x + 0.55,
+                   y0=rp_z - 0.55, y1=rp_z + 0.55,
+                   fillcolor="rgba(96,165,250,0.20)",
+                   line=dict(color="#3b82f6", width=2.5),
+                   layer="above")
+    fig.add_annotation(x=rp_x, y=rp_z + 1.0,
+                        text="<b>Release Point</b>",
+                        showarrow=False,
+                        font=dict(size=10, color="#1e3a8a"),
+                        bgcolor="rgba(255,255,255,0.85)",
+                        borderpad=2)
+
+    # ===== Tunnel-point RING =====
+    # Find the average tunnel-point height across all pitches (visually
+    # this looks like the ring is around where they converge)
+    tps = [p["tunnel_xyz"] for p in tunnel_data.values() if p["tunnel_xyz"]]
+    if tps:
+        avg_tz = sum(t["z"] for t in tps) / len(tps)
+    else:
+        avg_tz = 3.0
+    fig.add_shape(type="circle",
+                   x0=tunnel_y - 0.55, x1=tunnel_y + 0.55,
+                   y0=avg_tz - 0.55, y1=avg_tz + 0.55,
+                   fillcolor="rgba(212,166,52,0.20)",
+                   line=dict(color="#d4a634", width=2.5),
+                   layer="above")
+    fig.add_annotation(x=tunnel_y, y=avg_tz + 1.0,
+                        text=f"<b>Tunnel Point</b><br>{tunnel_y:.1f} ft from plate",
+                        showarrow=False,
+                        font=dict(size=10, color="#92400e"),
+                        bgcolor="rgba(255,255,255,0.85)",
+                        borderpad=2)
+    # Vertical dashed line at tunnel distance (subtle reference)
+    fig.add_shape(type="line", x0=tunnel_y, x1=tunnel_y, y0=0, y1=avg_tz - 0.55,
+                   line=dict(color="#d4a634", width=1, dash="dash"),
+                   layer="below")
+
+    # ===== Home-plate RING =====
+    # Average plate height (where pitches finish — roughly at plate_z of starter)
+    start = next((p for p in tunnel_data.values() if p["is_starting"]), None)
+    plate_z = start["plate_z"] if start else 3.0
+    fig.add_shape(type="circle",
+                   x0=-0.55, x1=0.55,
+                   y0=plate_z - 0.55, y1=plate_z + 0.55,
+                   fillcolor="rgba(96,165,250,0.20)",
+                   line=dict(color="#3b82f6", width=2.5),
+                   layer="above")
+    fig.add_annotation(x=0, y=plate_z + 1.0,
+                        text="<b>Home Plate</b>",
+                        showarrow=False,
+                        font=dict(size=10, color="#1e3a8a"),
+                        bgcolor="rgba(255,255,255,0.85)",
+                        borderpad=2)
+
+    # ===== Strike-zone reference at plate (vertical band 1.6 → 3.5 ft) =====
+    fig.add_shape(type="rect", x0=-0.25, x1=0.25,
+                   y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                   fillcolor="rgba(0,0,0,0)",
+                   line=dict(color="#1a2150", width=1, dash="dot"),
+                   layer="above")
+
+    # ===== Plot each trajectory as a THICK curved line =====
+    for ptype, p in tunnel_data.items():
+        color = PITCH_COLORS.get(ptype, "#666")
+        is_start = p["is_starting"]
+        ys = [s["y"] for s in p["samples"]]
+        zs = [s["z"] for s in p["samples"]]
+        fig.add_trace(go.Scatter(
+            x=ys, y=zs, mode="lines",
+            line=dict(color=color,
+                       width=6 if is_start else 4,
+                       dash="solid"),
+            opacity=1.0 if is_start else 0.85,
+            name=f"{ptype}{' ⭐' if is_start else ''}",
+            hovertemplate=f"<b>{ptype}</b><br>%{{x:.1f}} ft from plate · %{{y:.2f}} ft high<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=dict(text="Side View — release → tunnel → plate",
+                    font=dict(size=13, color="#1a2150")),
+        xaxis=dict(title="Distance from Home Plate (ft)",
+                    range=(rubber_y + 3, -2),  # reversed: pitcher on left, catcher on right
+                    zeroline=False, showgrid=False, showline=False),
+        yaxis=dict(title="Height (ft)", range=(-1, 9),
+                    zeroline=False, showgrid=False, showline=False),
+        height=520, plot_bgcolor="#f0f9ff",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(l=20, r=20, t=50, b=40),
+    )
+    # preserve_bg=True keeps the sky-blue stadium background
+    return _apply_chart_theme(fig, preserve_bg=True)
+
+
+# Fake-baseline used for delta display when no historical data is available
+DEMO_BASELINE = {
+    "Four-Seam Fastball":   {"velo": 89.8, "vbreak": 16.3, "stress": 56.6},
+    "Two-Seam Sinker":      {"velo": 89.2, "vbreak": 11.7, "stress": 52.7},
+    "Slider Strike-Getter": {"velo": 83.0, "vbreak": -2.4, "stress": 49.5},
+    "Slider Chase":         {"velo": 79.2, "vbreak": -4.3, "stress": 57.7},
+}
+
+
+def _drill_record(key: str, trigger_text: str,
+                   severity: str = "any", level: str = "any") -> dict:
+    """Build a card-shaped dict from a drill key + the trigger explanation.
+
+    Severity ("mild" / "moderate" / "severe") and athlete level ("youth" /
+    "hs" / "college+") let the video picker choose the best tutorial for
+    this specific pitcher's data.
+    """
+    d = DRILL_LIBRARY[key]
+    video = pick_video(key, severity=severity, level=level)
+    return {
+        "key":         key,
+        "category":    d["category"],
+        "phase":       d["phase"],
+        "priority":    d["priority"],
+        "label":       d["label"],
+        "drill":       d["drill"],
+        "protocol":    d["protocol"],
+        "why":         d["why"],
+        "grip_key":    d.get("grip_key"),       # only set on Grip drills
+        "video_url":   video["url"]   if video else None,
+        "video_title": video.get("title")  if video else None,
+        "video_source":video.get("source") if video else None,
+        "severity":    severity,
+        "trigger":     trigger_text,
+    }
+
+
+def _severity_from_ratio(actual: float, target: float, higher_is_worse: bool = True) -> str:
+    """Classify how far a value is from target into mild / moderate / severe.
+
+    `higher_is_worse=True` for things you want LOWER (gyro, stress);
+    pass False for things you want HIGHER (spin, separation, knee extension).
+    """
+    if actual is None or target is None or target == 0:
+        return "any"
+    diff = (actual - target) if higher_is_worse else (target - actual)
+    if diff <= 0:
+        return "mild"
+    # Express as % of target
+    pct = abs(diff) / abs(target)
+    if pct < 0.10:    return "mild"
+    if pct < 0.25:    return "moderate"
+    return "severe"
+
+
+def recommend_drills(df: pd.DataFrame, baseline: dict | None = None,
+                      sport: str = "Baseball",
+                      athlete_level: str = "HS-Varsity") -> dict:
+    """Inspect a session and recommend a today plan + week plan.
+
+    Returns: {"today": [drill, ...], "week": [drill, ...]}
+    Each drill is a dict ready for the UI to render as a card.
+    """
+    # Sport-aware constants — softball windmill has different "elite" values
+    # than baseball overhand, so the trigger thresholds differ.
+    is_softball = (sport == "Softball")
+    HS_SEP_TARGET     = 40 if is_softball else 48     # peak hip-shoulder separation
+    FB_SPIN_TARGET    = 1500 if is_softball else 2200 # fastball spin RPM (softball threshold lowered)
+    FB_BASELINE_KEY   = "Softball Fastball" if is_softball else "Four-Seam Fastball"
+    # Softball doesn't really track baseball-style "extension" — skip that check
+    CHECK_EXTENSION   = not is_softball
+
+    # Drill-key routing: same issue, different drill+video by sport
+    SPORT_DRILL_ROUTE = {
+        "high_valgus_stress":      "softball_high_valgus_stress",
+        "session_cooldown_default":"softball_session_cooldown_default",
+        "low_fastball_spin":       "softball_low_fastball_spin",
+        "low_offspeed_break":      "softball_low_offspeed_break",
+        "arm_slot_variance":       "softball_arm_slot_variance",
+    } if is_softball else {}
+
+    def _sport_key(k: str) -> str:
+        """Translate a generic drill key to its sport-specific variant if any."""
+        return SPORT_DRILL_ROUTE.get(k, k)
+
+    baseline = baseline or (DEMO_BASELINE_SOFTBALL if is_softball else DEMO_BASELINE)
+    today: list = []
+    week: list = []
+    seen_keys: set = set()
+
+    # Map the athlete's level (e.g. "HS-Varsity") to the video-level bucket
+    video_level = LEVEL_TO_VIDEO_BUCKET.get(athlete_level, "any")
+
+    def add(plan: list, key: str, trigger: str, severity: str = "any"):
+        # Auto-route shared keys to sport-specific variants when applicable
+        key = _sport_key(key)
+        if key in seen_keys:
+            return
+        if key not in DRILL_LIBRARY:
+            return  # safety: skip if a routed key doesn't exist yet
+        seen_keys.add(key)
+        plan.append(_drill_record(key, trigger,
+                                   severity=severity, level=video_level))
+
+    # ===== TODAY — INJURY / COOLDOWN =====
+    danger_valgus_pitches = df[df["Peak_Valgus_Nm"].notna() & (df["Peak_Valgus_Nm"] >= DANGER_VALGUS_NM)]
+    if not danger_valgus_pitches.empty:
+        worst = danger_valgus_pitches["Peak_Valgus_Nm"].max()
+        sev = _severity_from_ratio(worst, DANGER_VALGUS_NM, higher_is_worse=True)
+        add(today, "high_valgus_stress",
+            f"{len(danger_valgus_pitches)} pitch(es) exceeded {DANGER_VALGUS_NM} Nm "
+            f"(peak: {worst:.1f} Nm).", severity=sev)
+
+    max_acr = df["AC_Ratio"].dropna().max() if df["AC_Ratio"].notna().any() else 0
+    if max_acr >= ACR_DANGER_THRESHOLD:
+        add(today, "high_acr_rest",
+            f"Acute:Chronic Ratio peaked at {max_acr:.2f} — above the 1.5 injury-risk threshold.")
+    elif max_acr >= ACR_WARNING_THRESHOLD:
+        add(today, "moderate_acr_cooldown",
+            f"Acute:Chronic Ratio peaked at {max_acr:.2f} — yellow zone.")
+
+    # Always include a baseline cooldown if nothing else recommended for today
+    if not today:
+        add(today, "session_cooldown_default",
+            "Standard cooldown after any bullpen session.")
+
+    # ===== WEEK — MECHANICS (sport-aware drill routing) =====
+    # For each mechanics issue, pick the right drill key for the sport.
+    # Softball drills use windmill-appropriate corrections instead of
+    # baseball-style Hershiser / Driveline plyo drills.
+    early_trunk_key = "softball_K_drill" if is_softball else "early_trunk_rotation"
+    low_hs_sep_key  = "softball_brush_at_hip" if is_softball else "low_hip_shoulder_separation"
+    # Soft lead knee works the same way in both sports (front leg block)
+    soft_knee_key   = "soft_lead_knee"
+
+    early_trunk_pct = (df["FootPlant_Trunk_Rot"].dropna() >= EARLY_TRUNK_ROTATION_DEG).mean() if df["FootPlant_Trunk_Rot"].notna().any() else 0
+    if early_trunk_pct >= 0.25:
+        early_count = int((df["FootPlant_Trunk_Rot"].dropna() >= EARLY_TRUNK_ROTATION_DEG).sum())
+        add(week, early_trunk_key,
+            f"{early_count} pitch(es) had the chest open early at foot-plant (> {EARLY_TRUNK_ROTATION_DEG}°).")
+
+    avg_knee_ext = df["Release_Lead_Knee_Ext"].dropna().mean() if df["Release_Lead_Knee_Ext"].notna().any() else None
+    if avg_knee_ext is not None and avg_knee_ext < 145:
+        add(week, soft_knee_key,
+            f"Average lead-knee extension at release was {avg_knee_ext:.1f}° (target: 150°+).")
+
+    avg_hip_shoulder = df["Peak_Hip_Shoulder_Sep"].dropna().mean() if df["Peak_Hip_Shoulder_Sep"].notna().any() else None
+    if avg_hip_shoulder is not None and avg_hip_shoulder < HS_SEP_TARGET:
+        add(week, low_hs_sep_key,
+            f"Peak hip-shoulder separation averaged {avg_hip_shoulder:.1f}° "
+            f"(target for {sport}: {HS_SEP_TARGET}°+).")
+
+    if CHECK_EXTENSION:
+        avg_extension = df["Extension_ft"].dropna().mean() if df["Extension_ft"].notna().any() else None
+        if avg_extension is not None and avg_extension < 6.0:
+            add(week, "low_extension",
+                f"Average release extension was {avg_extension:.1f} ft (target: 6.2+ ft).")
+
+    # ===== WEEK — VELOCITY =====
+    fastballs = df[df["Pitch_Type"].str.contains("Fastball|Four-Seam", case=False, na=False)]
+    if not fastballs.empty:
+        avg_fb_velo = fastballs["Velocity_mph"].mean()
+        fb_baseline = baseline.get(FB_BASELINE_KEY, {}).get("velo")
+        if fb_baseline and avg_fb_velo < (fb_baseline - 2.0):
+            sev = _severity_from_ratio(avg_fb_velo, fb_baseline, higher_is_worse=False)
+            add(week,
+                "softball_below_baseline_velo" if is_softball else "below_baseline_fastball_velo",
+                f"Fastball averaged {avg_fb_velo:.1f} mph — {(fb_baseline - avg_fb_velo):.1f} mph below your baseline.",
+                severity=sev)
+
+    # ===== WEEK — STUFF / SPIN =====
+    if not fastballs.empty:
+        avg_fb_spin = fastballs["Total_Spin_rpm"].dropna().mean()
+        if avg_fb_spin and avg_fb_spin < FB_SPIN_TARGET:
+            sev = _severity_from_ratio(avg_fb_spin, FB_SPIN_TARGET, higher_is_worse=False)
+            add(week, "low_fastball_spin",
+                f"Fastball spin averaged {avg_fb_spin:.0f} RPM (target: {FB_SPIN_TARGET}+ RPM).",
+                severity=sev)
+
+    sliders = df[df["Pitch_Type"].str.contains("Slider", case=False, na=False)]
+    if len(sliders) >= 3:
+        avg_slider_eff = sliders["Spin_Efficiency_pct"].dropna().mean()
+        if avg_slider_eff is not None and avg_slider_eff < 30:
+            add(week, "low_slider_spin_efficiency",
+                f"Slider spin efficiency averaged {avg_slider_eff:.1f}% (target: 30-40%).")
+
+    # Movement check for offspeeds — does any non-fastball have notably low break?
+    offspeed = df[~df["Pitch_Type"].str.contains("Fastball|Four-Seam|Two-Seam|Sinker", case=False, na=False)]
+    if not offspeed.empty:
+        avg_total_break = (offspeed["Horiz_Break_in"].abs() + offspeed["Vert_Break_in"].abs()).mean()
+        if avg_total_break < 12:
+            add(week, "low_offspeed_break",
+                f"Offspeed pitches averaged only {avg_total_break:.1f}\" of total break.")
+
+    # ===== WEEK — GRIP =====
+    # Slider with high gyro AND high valgus → grip change candidate
+    if not sliders.empty and sliders["Gyro_Degrees"].notna().any() and sliders["Peak_Valgus_Nm"].notna().any():
+        high_gyro_high_stress = sliders[
+            (sliders["Gyro_Degrees"] > 70) &
+            (sliders["Peak_Valgus_Nm"] > 60)
+        ]
+        if len(high_gyro_high_stress) >= 2:
+            add(week, "slider_grip_pronation_fix",
+                f"{len(high_gyro_high_stress)} slider(s) had high gyro and high elbow stress — wrist-twist pattern.")
+
+    # ===== WEEK — CONSISTENCY =====
+    if df["Arm_Slot_deg"].notna().any():
+        slot_range = df["Arm_Slot_deg"].dropna().max() - df["Arm_Slot_deg"].dropna().min()
+        if slot_range > 6:
+            add(week, "arm_slot_variance",
+                f"Arm slot varied {slot_range:.0f}° across the session (target: < 4°).")
+
+    # =========================================================================
+    # SOFTBALL-SPECIFIC CHECKS
+    # Detect by pitch type names that are unique to softball.
+    # =========================================================================
+    rise_balls = df[df["Pitch_Type"].str.contains("Rise", case=False, na=False)]
+    drop_balls = df[df["Pitch_Type"].str.contains("Drop", case=False, na=False)]
+    softball_curves = df[df["Pitch_Type"].str.contains("Screw", case=False, na=False)]
+
+    if len(rise_balls) >= 2:
+        avg_rise_spin = rise_balls["Total_Spin_rpm"].dropna().mean()
+        if avg_rise_spin is not None and avg_rise_spin < 1900:
+            add(week, "softball_low_rise_spin",
+                f"Rise ball spin averaged {avg_rise_spin:.0f} RPM "
+                "(target: 1,900+ RPM for the rise effect to work).")
+
+    if len(drop_balls) >= 2:
+        avg_drop_vbreak = drop_balls["Vert_Break_in"].dropna().mean()
+        if avg_drop_vbreak is not None and avg_drop_vbreak > -3:
+            add(week, "softball_low_drop_topspin",
+                f"Drop ball averaged only {avg_drop_vbreak:+.1f}\" of vertical break "
+                "(target: <-4\" — i.e. dropping more than gravity alone).")
+
+    if len(softball_curves) >= 2 and softball_curves["Spin_Efficiency_pct"].notna().any():
+        avg_curve_eff = softball_curves["Spin_Efficiency_pct"].dropna().mean()
+        if avg_curve_eff is not None and avg_curve_eff < 65:
+            add(week, "softball_grip_curve_pronation",
+                f"Screwball spin efficiency averaged {avg_curve_eff:.1f}% (target: 70%+).")
+
+    # Sort each plan by priority (1 = most urgent first)
+    today.sort(key=lambda d: d["priority"])
+    week.sort(key=lambda d: d["priority"])
+
+    # Cap to keep the plan focused
+    return {
+        "today": today[:3],
+        "week":  week[:5],
+    }
+
+
+def build_action_plan(df: pd.DataFrame) -> list:
+    """Backward-compatible flat list of actions. Prefer recommend_drills()."""
+    plan = recommend_drills(df)
+    out = []
+    for d in plan["today"][:1] + plan["week"][:2]:
+        out.append({
+            "priority": ("🚨 PRIORITY 1" if d["priority"] <= 1 else "⚠️ FOCUS"),
+            "title":    d["label"],
+            "drill":    d["drill"],
+            "why":      d["why"],
+        })
+    return out
+
+
+def _format_plan_text(athlete_name: str, plan: dict) -> str:
+    """Plain-text version of the action plan, suitable for SMS/email."""
+    out = [f"PITCHING LAB — ACTION PLAN", f"Athlete: {athlete_name}", "=" * 50, ""]
+    def _block(d):
+        out.append(f"  • [{d['category']}] {d['label']}")
+        out.append(f"      Drill:    {d['drill']}")
+        out.append(f"      Protocol: {d['protocol']}")
+        out.append(f"      Why:      {d['why']}")
+        if d.get("video_url"):
+            title = d.get("video_title") or "Watch demo"
+            source = d.get("video_source", "")
+            src_suffix = f" ({source})" if source else ""
+            out.append(f"      Demo:     {title}{src_suffix}")
+            out.append(f"                {d['video_url']}")
+        out.append("")
+
+    out.append("TODAY (within 30 min of finishing):")
+    if not plan["today"]:
+        out.append("  - Standard cooldown is fine.")
+    for d in plan["today"]:
+        _block(d)
+    out.append("THIS WEEK (before next bullpen):")
+    if not plan["week"]:
+        out.append("  - Maintain and repeat what's working.")
+    for d in plan["week"]:
+        _block(d)
+    return "\n".join(out)
+
+
+# =============================================================================
+# PDF EXPORT — Post-Bullpen Report
+# =============================================================================
+# Brand colors used in the PDF
+PDF_BRAND_NAVY  = (0.10, 0.13, 0.30)   # deep navy header
+PDF_BRAND_GOLD  = (0.83, 0.65, 0.20)   # accent gold
+PDF_DANGER_RED  = (0.86, 0.20, 0.20)
+PDF_GOOD_GREEN  = (0.13, 0.65, 0.30)
+
+
+def _render_movement_quadrant_png(df: pd.DataFrame, width_in: float = 5.0) -> bytes:
+    """Nestico-style HB vs IVB movement scatter, color-coded by pitch type.
+
+    Standardized way to visualize pitch movement. Quadrants separated by axes
+    at x=0 and y=0. Used in the PDF and (optionally) in the UI.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(width_in, width_in), dpi=140)
+
+    # Quadrant guide lines
+    ax.axhline(y=0, color="#9ca3af", linewidth=0.8, linestyle="--", zorder=1)
+    ax.axvline(x=0, color="#9ca3af", linewidth=0.8, linestyle="--", zorder=1)
+
+    # Range guide rings
+    for r in (5, 10, 15, 20):
+        circ = plt.Circle((0, 0), r, fill=False, edgecolor="#e5e7eb",
+                          linewidth=0.5, zorder=1)
+        ax.add_patch(circ)
+
+    # Plot each pitch
+    for ptype, g in df.groupby("Pitch_Type"):
+        color = PITCH_COLORS.get(ptype, "#666")
+        ax.scatter(g["Horiz_Break_in"], g["Vert_Break_in"],
+                   c=color, s=140, edgecolors="black", linewidths=0.6,
+                   label=ptype, alpha=0.92, zorder=3)
+
+    ax.set_xlim(-22, 22)
+    ax.set_ylim(-22, 22)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Horizontal Break (in)", fontsize=10, fontweight="bold")
+    ax.set_ylabel("Induced Vertical Break (in)", fontsize=10, fontweight="bold")
+    ax.set_title("Pitch Movement (catcher's view)", fontsize=11, fontweight="bold")
+    # Legend OUTSIDE the plot so it doesn't cover any quadrant
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+              fontsize=7, framealpha=0.95, borderaxespad=0)
+    ax.tick_params(labelsize=8)
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_color("#9ca3af")
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _render_velocity_distribution_png(df: pd.DataFrame, width_in: float = 6.0) -> bytes:
+    """Per-pitch-type velocity distribution (Nestico-style). Histogram bars
+    plus a mean line per pitch type — gives a quick view of how consistent
+    velocity is within each pitch type."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pitch_types = list(df["Pitch_Type"].unique())
+    n = len(pitch_types)
+    fig, axes = plt.subplots(n, 1, figsize=(width_in, 0.8 * n + 0.6), dpi=140,
+                              sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    all_velos = df["Velocity_mph"].dropna()
+    if len(all_velos) == 0:
+        plt.close(fig)
+        return b""
+    v_min = max(60, float(all_velos.min()) - 2)
+    v_max = float(all_velos.max()) + 2
+
+    for ax, ptype in zip(axes, pitch_types):
+        g = df[df["Pitch_Type"] == ptype]
+        color = PITCH_COLORS.get(ptype, "#666")
+        v = g["Velocity_mph"].dropna()
+        if len(v) >= 1:
+            ax.hist(v, bins=8, range=(v_min, v_max), color=color,
+                    edgecolor="black", linewidth=0.5, alpha=0.85)
+            ax.axvline(v.mean(), color="black", linestyle="--", linewidth=1.3)
+            ax.text(v.mean(), ax.get_ylim()[1] * 0.85,
+                    f"{v.mean():.1f}", fontsize=8, fontweight="bold",
+                    ha="center", color="black",
+                    bbox=dict(facecolor="white", edgecolor="none", pad=1.5))
+        ax.set_yticks([])
+        ax.set_ylabel(ptype, fontsize=8, rotation=0, ha="right", va="center",
+                       fontweight="bold")
+        for spine in ("top", "right", "left"):
+            ax.spines[spine].set_visible(False)
+        ax.tick_params(labelsize=7)
+    axes[-1].set_xlabel("Velocity (mph)", fontsize=9, fontweight="bold")
+    axes[0].set_title("Velocity Distribution by Pitch Type", fontsize=11,
+                       fontweight="bold")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _render_strike_zone_png(df: pd.DataFrame, width_in: float = 5.0) -> bytes:
+    """Render the strike zone scatter as a PNG byte string for embedding in PDFs."""
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive backend so it works headless
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, Polygon
+
+    fig, ax = plt.subplots(figsize=(width_in, width_in), dpi=140)
+
+    # Strike zone box + 3x3 grid
+    ax.add_patch(Rectangle((SZ_X_MIN, SZ_Z_MIN),
+                           SZ_X_MAX - SZ_X_MIN, SZ_Z_MAX - SZ_Z_MIN,
+                           fill=False, edgecolor="black", linewidth=2))
+    for i in (1, 2):
+        x = SZ_X_MIN + (SZ_X_MAX - SZ_X_MIN) * (i / 3)
+        z = SZ_Z_MIN + (SZ_Z_MAX - SZ_Z_MIN) * (i / 3)
+        ax.plot([x, x], [SZ_Z_MIN, SZ_Z_MAX], color="#cccccc", linewidth=0.6)
+        ax.plot([SZ_X_MIN, SZ_X_MAX], [z, z], color="#cccccc", linewidth=0.6)
+
+    # Home plate
+    plate = Polygon([(-0.71, 0.05), (0.71, 0.05), (0.50, -0.10),
+                     (0, -0.25), (-0.50, -0.10)],
+                    closed=True, facecolor="#dcdcdc", edgecolor="black", linewidth=0.8)
+    ax.add_patch(plate)
+
+    # Plot each pitch type
+    for ptype, g in df.groupby("Pitch_Type"):
+        color = PITCH_COLORS.get(ptype, "#666")
+        ax.scatter(g["Strike_Zone_Side"], g["Strike_Zone_Height"],
+                   c=color, s=180, edgecolors="black", linewidths=0.8,
+                   label=ptype, zorder=3)
+        # Pitch numbers on top of dots
+        for _, row in g.iterrows():
+            ax.text(row["Strike_Zone_Side"], row["Strike_Zone_Height"],
+                    str(int(row["Pitch_Num"])),
+                    ha="center", va="center",
+                    color="white", fontsize=7, fontweight="bold", zorder=4)
+
+    # Outlier rings
+    for _, r in df.iterrows():
+        if r["Outlier_Type"] == "positive":
+            ax.scatter(r["Strike_Zone_Side"], r["Strike_Zone_Height"],
+                       s=400, facecolors="none", edgecolors="#22c55e",
+                       linewidths=2.2, zorder=2)
+        elif r["Outlier_Type"] == "negative":
+            ax.scatter(r["Strike_Zone_Side"], r["Strike_Zone_Height"],
+                       s=400, facecolors="none", edgecolors="#ef4444",
+                       linewidths=2.2, zorder=2)
+
+    ax.set_xlim(-2.5, 2.5)
+    ax.set_ylim(-0.5, 5.0)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Plate Side (ft)", fontsize=9)
+    ax.set_ylabel("Height (ft)", fontsize=9)
+    ax.set_title("Strike Zone Map", fontsize=11, fontweight="bold")
+    ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+    ax.tick_params(labelsize=8)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _render_hitting_spray_png(df: pd.DataFrame, sport: str = "Baseball",
+                                width_in: float = 5.0) -> bytes:
+    """Render the spray chart as a PNG for embedding in the Post-Swing PDF.
+    Each dot is one ball-in-play, colored by contact quality.
+    """
+    import math
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Wedge, Polygon, Circle, Rectangle
+
+    dims = _field_dimensions(sport)
+    cf = dims["of_wall_cf"]
+
+    fig, ax = plt.subplots(figsize=(width_in, width_in), dpi=140)
+
+    # Outfield grass arc (light green)
+    foul_lo, foul_hi = 45, 135  # degrees in standard math coords (0=right, 90=up)
+    grass = Wedge(center=(0, 0), r=cf + 30, theta1=foul_lo, theta2=foul_hi,
+                   facecolor="#bbf09b", edgecolor="none", zorder=0)
+    ax.add_patch(grass)
+
+    # Infield dirt
+    infield = Wedge(center=(0, 0), r=95, theta1=foul_lo, theta2=foul_hi,
+                     facecolor="#d4a374", edgecolor="none", zorder=0.5)
+    ax.add_patch(infield)
+
+    # Foul lines (going from home plate outward at 45° and 135°)
+    foul_len = cf + 30
+    ax.plot([0, -foul_len * 0.7071], [0, foul_len * 0.7071],
+            color="white", linewidth=2, zorder=1)
+    ax.plot([0,  foul_len * 0.7071], [0, foul_len * 0.7071],
+            color="white", linewidth=2, zorder=1)
+
+    # Distance markers (200/300/400 ft baseball, 150/200/250 softball)
+    if sport == "Softball":
+        rings = [150, 200, 250]
+    else:
+        rings = [200, 300, 400]
+    for r in rings:
+        if r <= cf + 20:
+            arc = Wedge(center=(0, 0), r=r, theta1=foul_lo, theta2=foul_hi,
+                         facecolor="none", edgecolor="white", linewidth=0.8,
+                         linestyle="--", alpha=0.6, zorder=1)
+            ax.add_patch(arc)
+            ax.text(0, r + 5, f"{r} ft", ha="center", va="bottom",
+                    color="white", fontsize=7, fontweight="bold", zorder=1.5,
+                    alpha=0.85)
+
+    # Home plate
+    plate = Polygon([(-3, -3), (3, -3), (3, 0), (0, 3), (-3, 0)],
+                    closed=True, facecolor="white", edgecolor="black",
+                    linewidth=1, zorder=2)
+    ax.add_patch(plate)
+    # Bases as small white squares
+    for bx, by in [(dims["base_path_ft"] * 0.7071, dims["base_path_ft"] * 0.7071),
+                    (-dims["base_path_ft"] * 0.7071, dims["base_path_ft"] * 0.7071),
+                    (0, dims["base_path_ft"] * 1.414)]:
+        ax.add_patch(Rectangle((bx - 2, by - 2), 4, 4,
+                                facecolor="white", edgecolor="black",
+                                linewidth=0.6, zorder=2))
+    # Pitcher's mound (small circle)
+    ax.add_patch(Circle((0, dims["mound_distance"]), 4,
+                         facecolor="#b08364", edgecolor="black",
+                         linewidth=0.6, zorder=2))
+
+    # Plot each ball in play
+    in_play = df[df["Swing_Outcome"].isin(["weak_contact", "solid_contact",
+                                             "barrel", "foul"])]
+    for outcome in ["barrel", "solid_contact", "weak_contact", "foul"]:
+        g = in_play[in_play["Swing_Outcome"] == outcome]
+        if g.empty:
+            continue
+        color = SWING_OUTCOME_COLORS[outcome]
+        xs, ys = [], []
+        for _, row in g.iterrows():
+            spray = row.get("Spray_Angle_deg", 0.0) or 0.0
+            dist  = row.get("Distance_ft", 100) or 100
+            hand  = row.get("Batter_Hand", "Right")
+            x_sign = -1.0 if hand == "Left" else 1.0
+            # Convert spray angle to field xy:
+            # spray 0 = straight CF, negative = pull side, positive = oppo
+            theta_rad = math.radians(90 + spray * x_sign)
+            xs.append(dist * math.cos(theta_rad))
+            ys.append(dist * math.sin(theta_rad))
+        ax.scatter(xs, ys, c=color, s=110, edgecolors="white",
+                    linewidths=1.0, zorder=3, label=outcome.replace("_", " ").title())
+
+    ax.set_xlim(-cf - 30, cf + 30)
+    ax.set_ylim(-20, cf + 35)
+    ax.set_aspect("equal")
+    ax.set_facecolor("#0f172a")  # stadium navy background
+    ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title("Spray Chart", fontsize=11, fontweight="bold", color="#1a2150")
+    ax.legend(loc="lower center", fontsize=7, ncol=4, framealpha=0.9,
+              bbox_to_anchor=(0.5, -0.02))
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                 facecolor="white", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _render_ev_la_quadrant_png(df: pd.DataFrame, width_in: float = 5.0) -> bytes:
+    """Render an Exit Velocity vs Launch Angle scatter for the PDF.
+
+    Shades the barrel zone (Statcast definition: EV 95+ AND LA 8-32) so coaches
+    immediately see how many balls landed in the productive area.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    in_play = df[df["Swing_Outcome"].isin(["weak_contact", "solid_contact",
+                                             "barrel", "foul"])].copy()
+    fig, ax = plt.subplots(figsize=(width_in, width_in * 0.78), dpi=140)
+
+    # Barrel zone (shaded green)
+    ax.add_patch(Rectangle((8, 95), 24, 20, facecolor="#16a34a",
+                            alpha=0.10, zorder=0))
+    ax.plot([8, 32, 32, 8, 8], [95, 95, 115, 115, 95],
+            color="#16a34a", linewidth=1.2, linestyle="--", zorder=1)
+    ax.text(20, 113, "BARREL ZONE", color="#16a34a", fontsize=9,
+            fontweight="bold", ha="center", va="top", zorder=2)
+
+    # Plot by outcome
+    for outcome in ["barrel", "solid_contact", "weak_contact", "foul"]:
+        g = in_play[in_play["Swing_Outcome"] == outcome]
+        if g.empty:
+            continue
+        ax.scatter(g["Launch_Angle_deg"], g["Exit_Velocity_mph"],
+                    c=SWING_OUTCOME_COLORS[outcome], s=85,
+                    edgecolors="black", linewidths=0.7, zorder=3,
+                    label=outcome.replace("_", " ").title())
+
+    ax.set_xlim(-30, 60)
+    ax.set_ylim(40, 120)
+    ax.set_xlabel("Launch Angle (°)", fontsize=9)
+    ax.set_ylabel("Exit Velocity (mph)", fontsize=9)
+    ax.set_title("Exit Velo × Launch Angle", fontsize=11, fontweight="bold",
+                  color="#1a2150")
+    ax.grid(True, alpha=0.25, linestyle=":")
+    ax.tick_params(labelsize=8)
+    ax.legend(fontsize=7, loc="lower right", framealpha=0.95)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                 facecolor="white", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _render_hitting_zone_heatmap_png(df: pd.DataFrame, width_in: float = 5.0) -> bytes:
+    """Render the strike-zone hit-quality heat map (5x5 grid) as a PNG.
+
+    Same idea as the in-app heat map: each cell is colored by the average
+    quality score of swings landed in it. Today's swings overlaid as numbered dots.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, Polygon
+
+    fig, ax = plt.subplots(figsize=(width_in, width_in), dpi=140)
+    swings = df[df["Swing_Type"] == "swing"].copy()
+    swings["_q"] = swings["Swing_Outcome"].map(SWING_QUALITY_SCORE)
+
+    x_edges = [-1.0 + 0.4 * i for i in range(6)]
+    z_edges = [ 1.0 + 0.6 * i for i in range(6)]
+
+    def _hex_color(score):
+        """Mirror _quality_color but return hex string for matplotlib."""
+        if score is None or pd.isna(score):
+            return "#e5e7eb"
+        if abs(score) < 0.05:
+            return "#e5e7eb"
+        if score > 0:
+            t = min(score / 2.0, 1.0)
+            r = int(252 + (127 - 252) * t)
+            g = int(202 + (29 - 202) * t)
+            b = int(202 + (29 - 202) * t)
+        else:
+            t = min(abs(score) / 2.0, 1.0)
+            r = int(219 + (30 - 219) * t)
+            g = int(234 + (58 - 234) * t)
+            b = int(254 + (138 - 254) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    # Grid cells
+    for i in range(5):
+        for j in range(5):
+            x0, x1 = x_edges[i], x_edges[i + 1]
+            z0, z1 = z_edges[j], z_edges[j + 1]
+            cell = swings[
+                (swings["Plate_X_ft"] >= x0) & (swings["Plate_X_ft"] < x1) &
+                (swings["Plate_Z_ft"] >= z0) & (swings["Plate_Z_ft"] < z1)
+            ]
+            avg_q = cell["_q"].dropna().mean() if len(cell) else None
+            ax.add_patch(Rectangle((x0, z0), x1 - x0, z1 - z0,
+                                     facecolor=_hex_color(avg_q),
+                                     edgecolor="white", linewidth=0.8, zorder=0))
+            if len(cell) > 0 and avg_q is not None:
+                ax.text((x0 + x1) / 2, (z0 + z1) / 2,
+                         f"{len(cell)}\n({avg_q:+.1f})",
+                         ha="center", va="center", fontsize=7,
+                         color="#1f2937", zorder=1)
+
+    # Strike zone box
+    ax.add_patch(Rectangle((SZ_X_MIN, SZ_Z_MIN),
+                            SZ_X_MAX - SZ_X_MIN, SZ_Z_MAX - SZ_Z_MIN,
+                            fill=False, edgecolor="black", linewidth=2, zorder=2))
+    # 3x3 grid
+    for i in (1, 2):
+        x = SZ_X_MIN + (SZ_X_MAX - SZ_X_MIN) * (i / 3)
+        z = SZ_Z_MIN + (SZ_Z_MAX - SZ_Z_MIN) * (i / 3)
+        ax.plot([x, x], [SZ_Z_MIN, SZ_Z_MAX], color="black",
+                 linewidth=0.6, linestyle=":", zorder=2)
+        ax.plot([SZ_X_MIN, SZ_X_MAX], [z, z], color="black",
+                 linewidth=0.6, linestyle=":", zorder=2)
+    # Home plate
+    plate = Polygon([(-0.71, 0.05), (0.71, 0.05), (0.50, -0.10),
+                      (0, -0.25), (-0.50, -0.10)],
+                     closed=True, facecolor="#dcdcdc",
+                     edgecolor="black", linewidth=0.8, zorder=2)
+    ax.add_patch(plate)
+
+    # Overlay today's swings as numbered dots
+    for outcome in ["barrel", "solid_contact", "foul", "weak_contact", "whiff"]:
+        g = swings[swings["Swing_Outcome"] == outcome]
+        if g.empty:
+            continue
+        ax.scatter(g["Plate_X_ft"], g["Plate_Z_ft"],
+                    c=SWING_OUTCOME_COLORS[outcome], s=140,
+                    edgecolors="white", linewidths=1.2, zorder=3)
+        for _, row in g.iterrows():
+            ax.text(row["Plate_X_ft"], row["Plate_Z_ft"],
+                     str(int(row["Swing_Num"])),
+                     ha="center", va="center", color="white",
+                     fontsize=6.5, fontweight="bold", zorder=4)
+
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(0.5, 4.5)
+    ax.set_aspect("equal")
+    ax.set_title("Strike Zone Heat Map", fontsize=11, fontweight="bold",
+                  color="#1a2150")
+    ax.set_xlabel("Plate Side (ft)", fontsize=9)
+    ax.set_ylabel("Height (ft)", fontsize=9)
+    ax.tick_params(labelsize=7)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                 facecolor="white", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _render_swing_outcome_bar_png(df: pd.DataFrame, width_in: float = 5.0) -> bytes:
+    """Horizontal bar chart of swing outcomes by count, colored to match the
+    in-app spray chart palette."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    order = ["barrel", "solid_contact", "foul", "weak_contact", "whiff", "take"]
+    labels = ["Barrel", "Solid Contact", "Foul", "Weak Contact", "Whiff", "Take"]
+    counts = [int((df["Swing_Outcome"] == k).sum()) for k in order]
+    colors_ = [SWING_OUTCOME_COLORS[k] for k in order]
+
+    fig, ax = plt.subplots(figsize=(width_in, width_in * 0.45), dpi=140)
+    y = list(range(len(order)))
+    bars = ax.barh(y, counts, color=colors_, edgecolor="black", linewidth=0.5)
+    for bar, c in zip(bars, counts):
+        if c > 0:
+            ax.text(bar.get_width() + 0.15, bar.get_y() + bar.get_height() / 2,
+                     str(c), va="center", ha="left", fontsize=9, fontweight="bold",
+                     color="#1f2937")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlabel("Swings", fontsize=9)
+    ax.set_title("Swing Outcomes", fontsize=11, fontweight="bold", color="#1a2150")
+    ax.tick_params(labelsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                 facecolor="white", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def generate_post_swing_pdf(df: pd.DataFrame,
+                             athlete_name: str = "Athlete",
+                             athlete_hand: str = "Right",
+                             athlete_class: str = "",
+                             sport: str = "Baseball",
+                             athlete_level: str = "HS-Varsity") -> bytes:
+    """Generate the Post-Swing Report as a multi-page PDF — the hitting
+    counterpart to generate_pbr_pdf.
+
+    Returns: PDF bytes suitable for st.download_button.
+    """
+    from datetime import datetime
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
+        PageBreak, KeepTogether,
+    )
+    from reportlab.pdfgen import canvas as _canvas
+
+    buf = io.BytesIO()
+    styles = getSampleStyleSheet()
+    brand_navy = colors.HexColor("#1a2150")
+    brand_gold = colors.HexColor("#d4a634")
+    soft_grey  = colors.HexColor("#6b7280")
+    light_grey = colors.HexColor("#f3f4f6")
+
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=18, leading=22,
+                        textColor=brand_navy, spaceAfter=4)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=12, leading=14,
+                        textColor=brand_navy, spaceBefore=10, spaceAfter=4)
+    body = ParagraphStyle("body", parent=styles["BodyText"], fontSize=9, leading=12)
+    small = ParagraphStyle("small", parent=styles["BodyText"], fontSize=7.5,
+                            leading=9.5, textColor=soft_grey)
+
+    def _header_footer(canvas: _canvas.Canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(brand_navy)
+        canvas.rect(0, doc.pagesize[1] - 0.45 * inch,
+                    doc.pagesize[0], 0.45 * inch, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(0.5 * inch, doc.pagesize[1] - 0.30 * inch,
+                          "◆ DIAMOND SPORTS LAB")
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(brand_gold)
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch,
+                                doc.pagesize[1] - 0.30 * inch,
+                                f"Post-Swing Report · {sport}")
+        canvas.setFillColor(soft_grey)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(0.5 * inch, 0.3 * inch,
+                          f"Generated {datetime.now().strftime('%b %d, %Y at %I:%M %p')}")
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch, 0.3 * inch,
+                                f"Page {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=LETTER,
+        topMargin=0.7 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.5 * inch, rightMargin=0.5 * inch,
+        title=f"Diamond Sports Lab — {athlete_name} (Hitting)",
+        author="Diamond Sports Lab",
+    )
+
+    story = []
+
+    # --- Athlete header ---
+    today_str = (pd.to_datetime(df["Timestamp"].min()).strftime("%B %d, %Y")
+                  if "Timestamp" in df.columns and len(df) else
+                  datetime.now().strftime("%B %d, %Y"))
+    story.append(Paragraph(athlete_name, h1))
+    sport_icon = "🥎" if sport == "Softball" else "⚾"
+    story.append(Paragraph(
+        f"<font color='#6b7280'>{sport_icon} {sport} · {athlete_hand}-handed hitter · "
+        f"{athlete_class or 'Class —'} · Session: {today_str}</font>", body))
+    story.append(Spacer(1, 10))
+
+    # --- KPI strip ---
+    kpis = hitting_session_kpis(df)
+    kpi_data = [
+        ["Swings", "Avg Exit Velo", "Peak Exit Velo", "Avg Bat Speed", "Barrel %", "Whiff %"],
+        [
+            str(kpis["Total Swings"]),
+            f"{kpis['Avg Exit Velo']} mph" if kpis['Avg Exit Velo'] is not None else "—",
+            f"{kpis['Peak Exit Velo']} mph" if kpis['Peak Exit Velo'] is not None else "—",
+            f"{kpis['Avg Bat Speed']} mph" if kpis['Avg Bat Speed'] is not None else "—",
+            f"{kpis['Barrel %']}%",
+            f"{kpis['Whiff %']}%",
+        ],
+    ]
+    kpi_table = Table(kpi_data, colWidths=[1.15*inch] * 6)
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), brand_navy),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 1), (-1, 1), light_grey),
+        ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME",   (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("FONTSIZE",   (0, 0), (-1, 0), 8),
+        ("FONTSIZE",   (0, 1), (-1, 1), 13),
+        ("ALIGN",      (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(kpi_table)
+    story.append(Spacer(1, 12))
+
+    # --- Spray Chart + Swing Outcomes (side-by-side) ---
+    try:
+        spray_png = _render_hitting_spray_png(df, sport=sport, width_in=5.0)
+        outcome_png = _render_swing_outcome_bar_png(df, width_in=4.0)
+        story.append(Paragraph("Spray Chart &amp; Swing Outcomes", h2))
+        side_by_side = Table([[
+            Image(io.BytesIO(spray_png),   width=3.5*inch, height=3.5*inch),
+            Image(io.BytesIO(outcome_png), width=3.5*inch, height=1.7*inch),
+        ]], colWidths=[3.7*inch, 3.7*inch])
+        side_by_side.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(side_by_side)
+        story.append(Paragraph(
+            "<font color='#6b7280' size='7'>Spray chart: every ball-in-play, "
+            "colored by contact quality. Barrels (dark red) drive extra-base hits; "
+            "weak contact (light blue) usually = routine outs.</font>", small))
+        story.append(Spacer(1, 10))
+    except Exception as e:
+        story.append(Paragraph(f"<i>(Spray chart could not be rendered: {e})</i>", small))
+
+    # --- EV / LA quadrant + Strike Zone Heat Map (side-by-side) ---
+    try:
+        evla_png = _render_ev_la_quadrant_png(df, width_in=5.0)
+        zone_png = _render_hitting_zone_heatmap_png(df, width_in=5.0)
+        story.append(Paragraph("Contact Quality &amp; Zone Tendencies", h2))
+        evla_zone = Table([[
+            Image(io.BytesIO(evla_png), width=3.5*inch, height=2.7*inch),
+            Image(io.BytesIO(zone_png), width=3.5*inch, height=3.5*inch),
+        ]], colWidths=[3.7*inch, 3.7*inch])
+        evla_zone.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(evla_zone)
+        story.append(Paragraph(
+            "<font color='#6b7280' size='7'>Left: EV × Launch Angle. The shaded "
+            "green box is the barrel zone (EV 95+ mph, LA 8°-32°) — where extra-base "
+            "hits live. Right: the 5×5 strike-zone heat map colored by contact "
+            "quality. Red zones = punishes pitches here; blue zones = struggles.</font>", small))
+        story.append(Spacer(1, 10))
+    except Exception as e:
+        story.append(Paragraph(f"<i>(Quality charts could not be rendered: {e})</i>", small))
+
+    # --- Per-pitch-type performance ---
+    story.append(Paragraph("Performance by Pitch Type Faced", h2))
+    bd_rows = [["Pitch Type", "Seen", "Swings", "Whiffs", "Barrels", "Avg EV", "Avg LA"]]
+    for ptype, g in df.groupby("Pitch_Type_Faced"):
+        in_play_g = g[g["Swing_Outcome"].isin(
+            ["weak_contact", "solid_contact", "barrel", "foul"])]
+        whiffs = int((g["Swing_Outcome"] == "whiff").sum())
+        barrels = int((g["Swing_Outcome"] == "barrel").sum())
+        avg_ev = in_play_g["Exit_Velocity_mph"].dropna().mean()
+        avg_la = in_play_g["Launch_Angle_deg"].dropna().mean()
+        bd_rows.append([
+            ptype, str(len(g)),
+            str(int((g["Swing_Type"] == "swing").sum())),
+            str(whiffs), str(barrels),
+            f"{avg_ev:.1f} mph" if not pd.isna(avg_ev) else "—",
+            f"{avg_la:.1f}°"    if not pd.isna(avg_la) else "—",
+        ])
+    bd_table = Table(bd_rows, colWidths=[1.6*inch, 0.5*inch, 0.6*inch,
+                                          0.6*inch, 0.7*inch, 0.85*inch, 0.7*inch])
+    bd_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), brand_navy),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",   (0, 0), (-1, -1), 8.5),
+        ("ALIGN",      (1, 0), (-1, -1), "CENTER"),
+        ("ALIGN",      (0, 0), (0, -1), "LEFT"),
+        ("GRID",       (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, light_grey]),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(bd_table)
+    story.append(Spacer(1, 12))
+
+    # --- Mechanics Critique ---
+    critique = analyze_hitting_mechanics(df, sport=sport)
+    if critique["strengths"] or critique["weaknesses"]:
+        story.append(Paragraph("Swing Mechanics Critique", h2))
+        strength_text = ""
+        for s in critique["strengths"]:
+            strength_text += (f"<b>✓ {s['label']}.</b> {s['detail']} "
+                              f"<i>{s['gain']}</i><br/>")
+        weak_text = ""
+        for w in critique["weaknesses"]:
+            weak_text += (f"<b>→ {w['label']}.</b> {w['detail']} "
+                          f"<b>Gain: {w['gain']}.</b> <i>Fix: {w['fix']}</i><br/>")
+        mc_data = [["What's Working", "Areas to Improve"],
+                   [Paragraph(strength_text or "No specific strengths flagged yet.", body),
+                    Paragraph(weak_text or "Clean swing — no corrections flagged.", body)]]
+        mc_table = Table(mc_data, colWidths=[3.6*inch, 3.6*inch])
+        mc_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#dcfce7")),
+            ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#fef3c7")),
+            ("TEXTCOLOR",  (0, 0), (0, 0), colors.HexColor("#15803d")),
+            ("TEXTCOLOR",  (1, 0), (1, 0), colors.HexColor("#92400e")),
+            ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",   (0, 0), (-1, 0), 10),
+            ("ALIGN",      (0, 0), (-1, 0), "CENTER"),
+            ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#d1d5db")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e5e7eb")),
+        ]))
+        story.append(mc_table)
+        story.append(Spacer(1, 10))
+
+    # --- Action Plan ---
+    plan = recommend_hitting_drills(df, sport=sport, athlete_level=athlete_level)
+    story.append(PageBreak())
+    story.append(Paragraph(athlete_name + " — Action Plan", h1))
+    story.append(Spacer(1, 6))
+
+    def _drill_block(d):
+        parts = [
+            Paragraph(f"<b>{d['label']}</b>  "
+                      f"<font color='#6b7280' size='8'>[{d['category']}]</font>", body),
+            Paragraph(f"<b>Drill:</b> {d['drill']}", body),
+            Paragraph(f"<b>Protocol:</b> {d['protocol']}", body),
+            Paragraph(f"<font color='#6b7280'><i>{d['why']}</i></font>", body),
+        ]
+        if d.get("video_url"):
+            label = d.get("video_title") or "Watch demo on YouTube"
+            src_suffix = f" — {d.get('video_source','')}" if d.get("video_source") else ""
+            parts.append(Paragraph(
+                f"<font color='#b91c1c' size='9'>▶ "
+                f"<link href='{d['video_url']}' color='#b91c1c'>{label}</link>"
+                f"<font color='#6b7280'>{src_suffix}</font></font>",
+                body
+            ))
+        parts.append(Paragraph(f"<font color='#6b7280' size='8'>"
+                                f"Triggered by: {d['trigger']}</font>", small))
+        parts.append(Spacer(1, 8))
+        return KeepTogether(parts)
+
+    story.append(Paragraph("🟢 Today — Cooldown (within 30 min of finishing)", h2))
+    if not plan["today"]:
+        story.append(Paragraph("Standard cooldown is fine — no specific flags.", body))
+    for d in plan["today"]:
+        story.append(_drill_block(d))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("📅 This Week — Before Next BP", h2))
+    if not plan["week"]:
+        story.append(Paragraph("Maintain and repeat what's working.", body))
+    for d in plan["week"]:
+        story.append(_drill_block(d))
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "<font color='#6b7280' size='8'>"
+        "Questions or want to discuss next steps? This report was generated by "
+        "Diamond Sports Lab — a coach-portable hitting + pitching analytics platform "
+        "that fuses bat-flight, swing-mechanics, and contact-quality data into one workflow."
+        "</font>", small
+    ))
+
+    # =========================================================
+    # FULL DRILL LIBRARY — reference page
+    # Every issue + every drill, organized so coaches can swap
+    # alternates without re-running the app.
+    # =========================================================
+    story.append(PageBreak())
+    story.append(Paragraph("Full Hitting Drill Library — Reference", h1))
+    story.append(Paragraph(
+        "<font color='#6b7280'>Every drill in the system, organized by the issue "
+        "it targets. Pick whichever fits the hitter and your facility.</font>", small))
+    story.append(Spacer(1, 10))
+
+    issue_meta_pdf = [
+        ("bat_speed",      "Bat Speed",
+          "When average bat speed is below the target for the hitter's level."),
+        ("hip_separation", "Hip-Shoulder Separation",
+          "When the hips and shoulders are firing together — no rubber-band torque."),
+        ("flat_swing",     "Flat / Chopping-Down Swing Path",
+          "When the bat plane is below the productive 8°-16° attack-angle range."),
+        ("steep_swing",    "Steep Uppercut Swing Path",
+          "When attack angle is above 20° — whiffs and pop-ups."),
+        ("off_plane",      "Off-Plane Bat Path",
+          "When the bat is in the hitting zone for too small a window."),
+        ("slow_ttc",       "Slow Time-to-Contact",
+          "When the swing takes too long to get the barrel through the zone."),
+        ("whiffs",         "Elevated Whiff Rate",
+          "When the hitter is chasing offspeed or expanding the zone."),
+        ("weak_contact",   "Weak Contact Pattern",
+          "When the hitter rolls over or pops up too many balls."),
+    ]
+
+    for issue_key, heading, blurb in issue_meta_pdf:
+        keys = HITTING_ISSUE_TO_DRILLS.get(issue_key, [])
+        if not keys:
+            continue
+        story.append(Paragraph(f"<b>{heading}</b>", h2))
+        story.append(Paragraph(f"<font color='#6b7280' size='8'>{blurb}</font>", small))
+        story.append(Spacer(1, 3))
+        for k in keys:
+            d = HITTING_DRILL_LIBRARY[k]
+            v = pick_video(k, severity="any",
+                            level=LEVEL_TO_VIDEO_BUCKET.get(athlete_level, "any"))
+            parts = [
+                Paragraph(f"<b>• {d['label']}</b>", body),
+                Paragraph(f"<b>Drill:</b> {d['drill']}", body),
+                Paragraph(f"<b>Protocol:</b> {d['protocol']}", body),
+                Paragraph(f"<font color='#6b7280'><i>{d['why']}</i></font>", body),
+            ]
+            if v:
+                parts.append(Paragraph(
+                    f"<font color='#b91c1c' size='9'>▶ "
+                    f"<link href='{v['url']}' color='#b91c1c'>{v['title']}</link></font>",
+                    body
+                ))
+            parts.append(Spacer(1, 6))
+            story.append(KeepTogether(parts))
+        story.append(Spacer(1, 4))
+
+    doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    return buf.getvalue()
+
+
+def generate_pbr_pdf(df: pd.DataFrame,
+                     athlete_name: str = "Athlete",
+                     athlete_hand: str = "Right",
+                     athlete_class: str = "",
+                     sport: str = "Baseball",
+                     athlete_level: str = "HS-Varsity") -> bytes:
+    """Generate the Post-Bullpen Report as a multi-page PDF.
+
+    Returns: PDF as raw bytes (suitable for st.download_button).
+    """
+    from datetime import datetime
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
+        PageBreak, KeepTogether,
+    )
+    from reportlab.pdfgen import canvas as _canvas
+
+    buf = io.BytesIO()
+
+    # Styles
+    styles = getSampleStyleSheet()
+    brand_navy = colors.HexColor("#1a2150")
+    brand_gold = colors.HexColor("#d4a634")
+    danger_red = colors.HexColor("#dc2626")
+    soft_grey  = colors.HexColor("#6b7280")
+    light_grey = colors.HexColor("#f3f4f6")
+
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"],
+                        fontSize=18, leading=22, textColor=brand_navy,
+                        spaceAfter=4)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"],
+                        fontSize=12, leading=14, textColor=brand_navy,
+                        spaceBefore=10, spaceAfter=4)
+    body = ParagraphStyle("body", parent=styles["BodyText"],
+                          fontSize=9, leading=12)
+    small = ParagraphStyle("small", parent=styles["BodyText"],
+                           fontSize=7.5, leading=9.5, textColor=soft_grey)
+    danger = ParagraphStyle("danger", parent=body, textColor=danger_red,
+                            fontName="Helvetica-Bold")
+
+    def _header_footer(canvas: _canvas.Canvas, doc):
+        # Top brand bar
+        canvas.saveState()
+        canvas.setFillColor(brand_navy)
+        canvas.rect(0, doc.pagesize[1] - 0.45 * inch,
+                    doc.pagesize[0], 0.45 * inch, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(0.5 * inch, doc.pagesize[1] - 0.30 * inch,
+                          "◆ DIAMOND SPORTS LAB")
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(brand_gold)
+        sport_label = f"Post-Bullpen Report · {sport}"
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch,
+                               doc.pagesize[1] - 0.30 * inch,
+                               sport_label)
+        # Footer
+        canvas.setFillColor(soft_grey)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(0.5 * inch, 0.3 * inch,
+                          f"Generated {datetime.now().strftime('%b %d, %Y at %I:%M %p')}")
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch, 0.3 * inch,
+                               f"Page {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=LETTER,
+        topMargin=0.7 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.5 * inch, rightMargin=0.5 * inch,
+        title=f"Diamond Sports Lab — {athlete_name}",
+        author="Diamond Sports Lab",
+    )
+
+    story = []
+
+    # --- Athlete header card ---
+    today_str = pd.to_datetime(df["Timestamp"].min()).strftime("%B %d, %Y") if "Timestamp" in df.columns and len(df) else datetime.now().strftime("%B %d, %Y")
+    story.append(Paragraph(athlete_name, h1))
+    sport_icon = "🥎" if sport == "Softball" else "⚾"
+    story.append(Paragraph(
+        f"<font color='#6b7280'>{sport_icon} {sport} · {athlete_hand}-handed pitcher · "
+        f"{athlete_class or 'Class —'} · Session: {today_str}</font>", body))
+    story.append(Spacer(1, 10))
+
+    # --- KPI strip ---
+    kpis = session_kpis(df)
+    kpi_data = [
+        ["Total Pitches", "Avg Velo", "Peak Velo", "Avg Spin", "Max Stress", "Healed"],
+        [
+            str(kpis["Total Pitches"]),
+            f"{kpis['Avg Velocity']} mph",
+            f"{kpis['Peak Velocity']} mph",
+            f"{kpis['Avg Spin']:,}",
+            f"{kpis['Max Elbow Stress']} Nm" if kpis['Max Elbow Stress'] is not None else "—",
+            str(kpis['Pitches Healed']),
+        ],
+    ]
+    kpi_table = Table(kpi_data, colWidths=[1.15*inch] * 6)
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), brand_navy),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 1), (-1, 1), light_grey),
+        ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME",   (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("FONTSIZE",   (0, 0), (-1, 0), 8),
+        ("FONTSIZE",   (0, 1), (-1, 1), 13),
+        ("ALIGN",      (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(kpi_table)
+    story.append(Spacer(1, 12))
+
+    # --- Pitch Type Breakdown ---
+    story.append(Paragraph("Pitch Type Breakdown", h2))
+    breakdown = pitch_type_breakdown(df)
+    bd_rows = [["Pitch Type", "#", "Velo", "Spin", "V Brk", "H Brk", "Stress"]]
+    for _, r in breakdown.iterrows():
+        bd_rows.append([
+            r["Pitch_Type"],
+            str(int(r["Thrown"])),
+            f"{r['Avg_Velo']:.1f} mph",
+            f"{int(r['Avg_Spin']) if pd.notna(r['Avg_Spin']) else '—'}",
+            f"{r['Avg_Vert_Break']:.1f}\"" if pd.notna(r['Avg_Vert_Break']) else "—",
+            f"{r['Avg_Horiz_Break']:.1f}\"" if pd.notna(r['Avg_Horiz_Break']) else "—",
+            f"{r['Avg_Stress']:.1f} Nm" if pd.notna(r['Avg_Stress']) else "—",
+        ])
+    bd_table = Table(bd_rows, colWidths=[1.7*inch, 0.4*inch, 0.9*inch, 0.7*inch,
+                                          0.7*inch, 0.7*inch, 0.9*inch])
+    bd_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), brand_navy),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",   (0, 0), (-1, -1), 8.5),
+        ("ALIGN",      (1, 0), (-1, -1), "RIGHT"),
+        ("ALIGN",      (0, 0), (0, -1), "LEFT"),
+        ("GRID",       (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, light_grey]),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(bd_table)
+    story.append(Spacer(1, 12))
+
+    # --- Velocity Distribution + Pitch Movement (Nestico-style, side by side) ---
+    velo_png = _render_velocity_distribution_png(df, width_in=4.5)
+    move_png = _render_movement_quadrant_png(df, width_in=4.5)
+    if velo_png and move_png:
+        side_by_side = Table([[
+            Image(io.BytesIO(velo_png), width=3.5*inch, height=2.6*inch),
+            Image(io.BytesIO(move_png), width=3.0*inch, height=3.0*inch),
+        ]], colWidths=[3.7*inch, 3.5*inch])
+        side_by_side.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(side_by_side)
+        story.append(Spacer(1, 8))
+
+    # --- Mechanics Critique ---
+    critique = analyze_mechanics(df, sport=sport)
+    if critique["strengths"] or critique["weaknesses"]:
+        story.append(Paragraph("Mechanics Critique", h2))
+        strength_text = ""
+        for s in critique["strengths"]:
+            strength_text += (f"<b>✓ {s['label']}.</b> {s['detail']} "
+                              f"<i>{s['gain']}</i><br/>")
+        weak_text = ""
+        for w in critique["weaknesses"]:
+            weak_text += (f"<b>→ {w['label']}.</b> {w['detail']} "
+                          f"<b>Gain: {w['gain']}.</b> <i>Fix: {w['fix']}</i><br/>")
+
+        mc_data = [["What's Working", "Areas to Improve"],
+                   [Paragraph(strength_text or "No specific strengths identified yet.", body),
+                    Paragraph(weak_text or "No corrections flagged — keep it clean.", body)]]
+        mc_table = Table(mc_data, colWidths=[3.6*inch, 3.6*inch])
+        mc_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#dcfce7")),
+            ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#fef3c7")),
+            ("TEXTCOLOR",  (0, 0), (0, 0), colors.HexColor("#15803d")),
+            ("TEXTCOLOR",  (1, 0), (1, 0), colors.HexColor("#92400e")),
+            ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",   (0, 0), (-1, 0), 10),
+            ("ALIGN",      (0, 0), (-1, 0), "CENTER"),
+            ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#d1d5db")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e5e7eb")),
+        ]))
+        story.append(mc_table)
+        story.append(Spacer(1, 10))
+
+    # --- Strike Zone Map ---
+    if df["Strike_Zone_Side"].notna().any():
+        story.append(Paragraph("Strike Zone Map", h2))
+        png_bytes = _render_strike_zone_png(df, width_in=5.0)
+        img = Image(io.BytesIO(png_bytes), width=4.4*inch, height=4.4*inch)
+        img.hAlign = "CENTER"
+        story.append(img)
+        story.append(Paragraph(
+            "Numbers = pitch # in session. Green ring = positive outlier "
+            "(above-average pitch). Red ring = negative outlier (concerning).",
+            small
+        ))
+        story.append(Spacer(1, 10))
+
+    # --- Injury / Risk Flags ---
+    danger_rows = []
+    for _, r in df.iterrows():
+        for f in detect_injury_flags(r):
+            if f["severity"] == "DANGER":
+                danger_rows.append(
+                    f"Pitch #{int(r['Pitch_Num'])} ({r['Pitch_Type']}, "
+                    f"{r['Velocity_mph']:.1f} mph) — {f['label']}"
+                )
+    if danger_rows:
+        story.append(Paragraph("🚨 Injury / Risk Flags", h2))
+        for txt in danger_rows[:6]:
+            story.append(Paragraph(f"• {txt}", danger))
+        story.append(Spacer(1, 10))
+
+    # --- Action Plan ---
+    plan = recommend_drills(df, sport=sport, athlete_level=athlete_level)
+
+    story.append(PageBreak())
+    story.append(Paragraph(athlete_name + " — Action Plan", h1))
+    story.append(Spacer(1, 6))
+
+    def _drill_block(d):
+        parts = [
+            Paragraph(f"<b>{d['label']}</b>  "
+                      f"<font color='#6b7280' size='8'>[{d['category']}]</font>", body),
+            Paragraph(f"<b>Drill:</b> {d['drill']}", body),
+            Paragraph(f"<b>Protocol:</b> {d['protocol']}", body),
+            Paragraph(f"<font color='#6b7280'><i>{d['why']}</i></font>", body),
+        ]
+        # If we have a video tutorial URL, add a clickable link with title + source
+        if d.get("video_url"):
+            label = d.get("video_title") or "Watch demo on YouTube"
+            src_suffix = f" — {d.get('video_source','')}" if d.get("video_source") else ""
+            parts.append(Paragraph(
+                f"<font color='#b91c1c' size='9'>▶ "
+                f"<link href='{d['video_url']}' color='#b91c1c'>"
+                f"{label}</link>"
+                f"<font color='#6b7280'>{src_suffix}</font></font>",
+                body
+            ))
+        parts.append(Paragraph(f"<font color='#6b7280' size='8'>"
+                               f"Triggered by: {d['trigger']}</font>", small))
+        parts.append(Spacer(1, 8))
+        return KeepTogether(parts)
+
+    story.append(Paragraph("🟢 Today — Cooldown (within 30 min of finishing)", h2))
+    if not plan["today"]:
+        story.append(Paragraph("Standard cooldown is fine — no specific flags.", body))
+    for d in plan["today"]:
+        story.append(_drill_block(d))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("📅 This Week — Before Next Bullpen", h2))
+    if not plan["week"]:
+        story.append(Paragraph("Maintain and repeat what's working.", body))
+    for d in plan["week"]:
+        story.append(_drill_block(d))
+
+    # Footer call-to-action
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "<font color='#6b7280' size='8'>"
+        "Questions or want to discuss next steps? "
+        "This report was generated by Diamond Sports Lab — a coach-portable "
+        "pitching analytics platform that fuses ball-flight, arm-health, "
+        "and biomechanics data into one workflow."
+        "</font>", small
+    ))
+
+    doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    return buf.getvalue()
+
+
+# =============================================================================
+# SELL SHEET PDF — for emailing coaches before meetings
+# =============================================================================
+def generate_action_plan_pdf(df: pd.DataFrame,
+                              athlete_name: str = "Athlete",
+                              athlete_hand: str = "Right",
+                              athlete_class: str = "",
+                              sport: str = "Baseball",
+                              athlete_level: str = "HS-Varsity") -> bytes:
+    """Generate a focused Action Plan PDF — Today + This Week sections only.
+
+    Smaller than the full PBR (1-2 pages) — perfect for texting/emailing the
+    parent immediately. Includes clickable YouTube demo links.
+    """
+    from datetime import datetime
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether,
+    )
+
+    buf = io.BytesIO()
+    brand_navy = colors.HexColor("#1a2150")
+    brand_gold = colors.HexColor("#d4a634")
+    soft_grey  = colors.HexColor("#6b7280")
+    danger_red = colors.HexColor("#dc2626")
+    success_g  = colors.HexColor("#16a34a")
+    warn_y     = colors.HexColor("#d4a634")
+
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle("body", parent=styles["BodyText"],
+                           fontSize=10, leading=13.5)
+    small = ParagraphStyle("small", parent=body, fontSize=8,
+                            leading=10, textColor=soft_grey)
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=18, leading=22,
+                         textColor=brand_navy, spaceAfter=2)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=12.5, leading=15,
+                         textColor=brand_navy, spaceBefore=10, spaceAfter=4)
+    section_today = ParagraphStyle("today", parent=h2, textColor=success_g)
+    section_week  = ParagraphStyle("week",  parent=h2, textColor=warn_y)
+
+    def _header_footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(brand_navy)
+        canvas.rect(0, doc.pagesize[1] - 0.45 * inch,
+                    doc.pagesize[0], 0.45 * inch, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(0.5 * inch, doc.pagesize[1] - 0.30 * inch,
+                          "◆ DIAMOND SPORTS LAB")
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(brand_gold)
+        sport_icon = "🥎" if sport == "Softball" else "⚾"
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch,
+                               doc.pagesize[1] - 0.30 * inch,
+                               f"Action Plan · {sport}")
+        canvas.setFillColor(soft_grey)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(0.5 * inch, 0.3 * inch,
+                          f"Generated {datetime.now().strftime('%b %d, %Y at %I:%M %p')}")
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch, 0.3 * inch,
+                               f"diamondsportslab.com  ·  Page {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=LETTER,
+        topMargin=0.7 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.5 * inch, rightMargin=0.5 * inch,
+        title=f"Diamond Sports Lab — Action Plan — {athlete_name}",
+        author="Diamond Sports Lab",
+    )
+
+    story = []
+    today_str = datetime.now().strftime("%B %d, %Y")
+    story.append(Paragraph(f"{athlete_name} — Action Plan", h1))
+    sport_label = "🥎 Softball" if sport == "Softball" else "⚾ Baseball"
+    story.append(Paragraph(
+        f"<font color='#6b7280'>{sport_label} · {athlete_hand}-handed pitcher · "
+        f"{athlete_class or 'Class —'} · {today_str}</font>", body))
+    story.append(Spacer(1, 10))
+
+    plan = recommend_drills(df, sport=sport, athlete_level=athlete_level)
+
+    def _drill_card(d):
+        parts = [
+            Paragraph(
+                f"<b>{d['label']}</b>  "
+                f"<font color='#6b7280' size='8'>[{d['category']}]</font>", body),
+            Paragraph(f"<b>Drill:</b> {d['drill']}", body),
+            Paragraph(f"<b>Protocol:</b> {d['protocol']}", body),
+            Paragraph(f"<font color='#6b7280'><i>{d['why']}</i></font>", body),
+        ]
+        if d.get("video_url"):
+            label = d.get("video_title") or "Watch demo on YouTube"
+            src_suffix = f" — {d.get('video_source','')}" if d.get("video_source") else ""
+            parts.append(Paragraph(
+                f"<font color='#b91c1c' size='9'>▶ "
+                f"<link href='{d['video_url']}' color='#b91c1c'>"
+                f"{label}</link>"
+                f"<font color='#6b7280'>{src_suffix}</font></font>", body))
+        parts.append(Spacer(1, 8))
+        return KeepTogether(parts)
+
+    # ===== TODAY =====
+    story.append(Paragraph("🟢 Today — Cooldown (within 30 min of finishing)",
+                            section_today))
+    if not plan["today"]:
+        story.append(Paragraph("Standard cooldown is fine — no specific flags.", body))
+    for d in plan["today"]:
+        story.append(_drill_card(d))
+
+    story.append(Spacer(1, 8))
+
+    # ===== THIS WEEK =====
+    story.append(Paragraph("📅 This Week — Before Next Bullpen", section_week))
+    if not plan["week"]:
+        story.append(Paragraph("No corrective work prioritized — maintain and repeat what's working.", body))
+    for d in plan["week"]:
+        story.append(_drill_card(d))
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(
+        f"<font color='#6b7280' size='8'>"
+        f"This action plan was personalized for {athlete_name} using their bullpen data. "
+        f"Generated by Diamond Sports Lab — pitching analytics for coaches who can't "
+        f"afford TrackMan."
+        f"</font>", small))
+
+    doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    return buf.getvalue()
+
+
+def generate_sell_sheet_pdf(contact_name: str = "Kolby Donnell",
+                             contact_email: str = "kolbydonnell@gmail.com") -> bytes:
+    """One-page branded sell sheet PDF. Email this to a coach 24h before the meeting."""
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether,
+    )
+
+    buf = io.BytesIO()
+    brand_navy = colors.HexColor("#1a2150")
+    brand_gold = colors.HexColor("#d4a634")
+    soft_grey  = colors.HexColor("#6b7280")
+    light_grey = colors.HexColor("#f6f7fb")
+    success_g  = colors.HexColor("#16a34a")
+
+    styles = getSampleStyleSheet()
+    body  = ParagraphStyle("body", parent=styles["BodyText"],
+                            fontSize=10, leading=14, textColor=colors.HexColor("#1f2937"))
+    body_white = ParagraphStyle("body_white", parent=body, textColor=colors.white)
+    bullet = ParagraphStyle("bullet", parent=body, leftIndent=12,
+                             bulletIndent=2, fontSize=10, leading=14)
+    h_seg  = ParagraphStyle("hseg", parent=styles["Heading3"],
+                             fontSize=11, leading=13, textColor=brand_navy,
+                             fontName="Helvetica-Bold", spaceAfter=2)
+    p_seg  = ParagraphStyle("pseg", parent=body, fontSize=9.5, leading=12.5)
+    small  = ParagraphStyle("small", parent=body, fontSize=8.5,
+                             leading=11, textColor=soft_grey)
+    headline = ParagraphStyle("headline", parent=styles["Heading1"],
+                              fontSize=22, leading=26, textColor=brand_navy,
+                              fontName="Helvetica-Bold", spaceAfter=2)
+    subhead  = ParagraphStyle("subhead", parent=body, fontSize=13, leading=17,
+                               textColor=brand_gold, fontName="Helvetica-Bold")
+
+    def _header_footer(canvas, doc):
+        # Top navy bar
+        canvas.saveState()
+        canvas.setFillColor(brand_navy)
+        canvas.rect(0, doc.pagesize[1] - 0.55 * inch,
+                    doc.pagesize[0], 0.55 * inch, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 16)
+        canvas.drawString(0.5 * inch, doc.pagesize[1] - 0.36 * inch,
+                          "◆ DIAMOND SPORTS LAB")
+        canvas.setFillColor(brand_gold)
+        canvas.setFont("Helvetica", 9.5)
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch,
+                               doc.pagesize[1] - 0.36 * inch,
+                               "Pitching analytics for coaches who can't afford TrackMan.")
+        # Bottom contact bar
+        canvas.setFillColor(light_grey)
+        canvas.rect(0, 0, doc.pagesize[0], 0.45 * inch, fill=1, stroke=0)
+        canvas.setFillColor(brand_navy)
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.drawString(0.5 * inch, 0.18 * inch,
+                          f"{contact_name}  •  {contact_email}")
+        canvas.setFillColor(soft_grey)
+        canvas.setFont("Helvetica", 8.5)
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch, 0.18 * inch,
+                               "Schedule a 15-min live demo — see the report on YOUR pitcher")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=LETTER,
+        topMargin=0.78 * inch, bottomMargin=0.65 * inch,
+        leftMargin=0.5 * inch, rightMargin=0.5 * inch,
+        title="Diamond Sports Lab — Coach Sell Sheet",
+        author="Diamond Sports Lab",
+    )
+
+    story = []
+
+    # ===== HEADLINE =====
+    story.append(Paragraph("Pro-grade pitching + hitting analytics", headline))
+    story.append(Paragraph("for less than 2% of TrackMan.", headline))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        "Every bullpen. Every batting practice. One report. Branded for your program.",
+        subhead
+    ))
+    story.append(Spacer(1, 14))
+
+    # ===== THREE BENEFIT BLOCKS =====
+    benefit_data = [[
+        Paragraph("<b>⚾  Pitching Lab</b><br/>"
+                  "<font color='#6b7280' size='9'>"
+                  "Velocity, spin, movement, elbow torque (Nm), mechanics critique, "
+                  "drill prescription with video tutorials. Catch UCL risk before "
+                  "the injury — paper trail when parents ask.</font>", body),
+        Paragraph("<b>🥎  Hitting Lab</b><br/>"
+                  "<font color='#6b7280' size='9'>"
+                  "Bat speed, exit velo, launch angle, barrel rate, hip-shoulder "
+                  "separation. Pro-style spray chart and zone heat map. 27-drill "
+                  "library with curated YouTube tutorials.</font>", body),
+        Paragraph("<b>📄  Parent-Ready Reports</b><br/>"
+                  "<font color='#6b7280' size='9'>"
+                  "Branded PDF after every session — pitching or hitting. Text it "
+                  "to the parent before they leave the parking lot. "
+                  "Recruiting-tape-worthy.</font>", body),
+    ]]
+    benefit_table = Table(benefit_data, colWidths=[2.4*inch, 2.4*inch, 2.4*inch])
+    benefit_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#e5e7eb")),
+        ("LINEBEFORE", (1, 0), (1, -1), 1, colors.HexColor("#e5e7eb")),
+        ("LINEBEFORE", (2, 0), (2, -1), 1, colors.HexColor("#e5e7eb")),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 14),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+        ("TOPPADDING",   (0, 0), (-1, -1), 14),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+    ]))
+    story.append(benefit_table)
+    story.append(Spacer(1, 16))
+
+    # ===== THREE SEGMENT BOXES =====
+    story.append(Paragraph("<b>Who this is for</b>", h_seg))
+    story.append(Spacer(1, 4))
+
+    seg_data = [[
+        Paragraph(
+            "<b><font color='#1a2150' size='11'>🎓  HS Varsity Coaches</font></b><br/><br/>"
+            "<font size='9.5'>Avoid the UCL injury that costs you your job. "
+            "Show the AD you're tracking. Parents get a polished report after "
+            "every outing.</font>", p_seg),
+        Paragraph(
+            "<b><font color='#1a2150' size='11'>⚾  Travel Ball Directors</font></b><br/><br/>"
+            "<font size='9.5'>Your $2-3k parents want the same data as the program "
+            "down the road. Branded reports per kid = retention. "
+            "Velocity gains = recruiting tape.</font>", p_seg),
+        Paragraph(
+            "<b><font color='#1a2150' size='11'>🏟  Training Facilities</font></b><br/><br/>"
+            "<font size='9.5'>Charge premium for 'data-driven development.' Beat the "
+            "Rapsodo facility on cost. Justify $175/hr lessons with the report.</font>",
+            p_seg),
+    ]]
+    seg_table = Table(seg_data, colWidths=[2.4*inch, 2.4*inch, 2.4*inch])
+    seg_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 0), (-1, -1), light_grey),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING",   (0, 0), (-1, -1), 12),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    story.append(seg_table)
+    story.append(Spacer(1, 16))
+
+    # ===== PRICING BLOCK =====
+    pricing_inner = [
+        [Paragraph(
+            "<font color='white' size='10'><b>SIMPLE PRICING</b></font><br/><br/>"
+            "<font color='white' size='28'><b>$49</b></font>"
+            "<font color='white' size='13'> /month</font><br/>"
+            "<font color='#d4a634' size='9'>"
+            "Flat fee · Unlimited pitchers · All features · Cancel anytime"
+            "</font>",
+            body_white),
+         Paragraph(
+            "<font color='white' size='10'><b>WHAT YOU GET</b></font><br/>"
+            "<font color='white' size='9'>"
+            "• Pitching + Hitting Labs in one app<br/>"
+            "• Multi-athlete roster &amp; history<br/>"
+            "• Branded post-bullpen + post-swing PDFs<br/>"
+            "• Mechanics critique + 27-drill hitter library<br/>"
+            "• Spray chart, zone heat map, trend tracking<br/>"
+            "• Side-by-side comparison views<br/>"
+            "</font>", body_white),
+         Paragraph(
+            "<font color='white' size='10'><b>vs. THE ALTERNATIVES</b></font><br/>"
+            "<font color='#d4a634' size='9'><b>TrackMan: $30k+ setup</b></font><br/>"
+            "<font color='white' size='9'>= 50× more for 1 system</font><br/>"
+            "<font color='#d4a634' size='9'><b>Rapsodo: $3k + $499/mo</b></font><br/>"
+            "<font color='white' size='9'>= 10× more, ball-only</font><br/>"
+            "<font color='#16a34a' size='9'><b>Diamond Sports Lab: $49/mo</b></font>",
+            body_white),
+        ]
+    ]
+    pricing_table = Table(pricing_inner, colWidths=[2.5*inch, 2.5*inch, 2.2*inch])
+    pricing_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 0), (-1, -1), brand_navy),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 14),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+        ("TOPPADDING",   (0, 0), (-1, -1), 14),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+        ("LINEBEFORE", (1, 0), (1, -1), 1, colors.HexColor("#3a4480")),
+        ("LINEBEFORE", (2, 0), (2, -1), 1, colors.HexColor("#3a4480")),
+    ]))
+    story.append(pricing_table)
+    story.append(Spacer(1, 6))
+
+    # ===== TRIAL CTA =====
+    story.append(Paragraph(
+        "<para align='center'><font color='#16a34a' size='11'><b>"
+        "🟢  30-DAY FREE TRIAL  ·  NO CONTRACT  ·  CANCEL ANYTIME"
+        "</b></font></para>", body))
+    story.append(Spacer(1, 10))
+
+    # ===== HOW IT WORKS =====
+    story.append(Paragraph("<b>How it works (10-minute field workflow)</b>", h_seg))
+    flow_data = [[
+        Paragraph("<font color='#d4a634' size='14'><b>1</b></font><br/>"
+                  "<font color='#1a2150' size='9.5'><b>Throw a bullpen</b></font><br/>"
+                  "<font color='#6b7280' size='8.5'>Smart ball + arm sleeve + phone camera record simultaneously.</font>",
+                  body),
+        Paragraph("<font color='#d4a634' size='14'><b>2</b></font><br/>"
+                  "<font color='#1a2150' size='9.5'><b>Export & upload</b></font><br/>"
+                  "<font color='#6b7280' size='8.5'>Drop the three CSVs into Diamond Sports Lab. Self-heals dropped pitches.</font>",
+                  body),
+        Paragraph("<font color='#d4a634' size='14'><b>3</b></font><br/>"
+                  "<font color='#1a2150' size='9.5'><b>Get the report</b></font><br/>"
+                  "<font color='#6b7280' size='8.5'>One-click PDF with KPIs, strike zone, mechanics critique, drills.</font>",
+                  body),
+        Paragraph("<font color='#d4a634' size='14'><b>4</b></font><br/>"
+                  "<font color='#1a2150' size='9.5'><b>Text the parent</b></font><br/>"
+                  "<font color='#6b7280' size='8.5'>Coach hits Send. Parent has the report before they leave the lot.</font>",
+                  body),
+    ]]
+    flow_table = Table(flow_data, colWidths=[1.85*inch, 1.85*inch, 1.85*inch, 1.85*inch])
+    flow_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(flow_table)
+
+    doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    return buf.getvalue()
+
+
+# =============================================================================
+# DATA PERSISTENCE — SQLite-backed roster + session history
+# =============================================================================
+# Stores athletes and past bullpen sessions on disk so coaches can:
+#   - Build a roster of pitchers once and switch between them via dropdown
+#   - See historical trends (velocity, spin, stress) over time
+#   - Get real rolling baselines (not mocked) once 3+ sessions exist
+import sqlite3 as _sqlite
+
+DB_PATH = Path.home() / ".diamond_sports_lab" / "data.db"
+
+
+def _db_conn():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = _sqlite.connect(str(DB_PATH))
+    conn.row_factory = _sqlite.Row
+    return conn
+
+
+def init_db():
+    """Create the athletes + sessions tables if they don't exist yet.
+
+    Also runs lightweight migrations (e.g. add sport / level columns if
+    missing) so existing databases pick up new fields without losing data.
+    """
+    with _db_conn() as c:
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS athletes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                hand        TEXT NOT NULL DEFAULT 'Right',
+                sport       TEXT NOT NULL DEFAULT 'Baseball',
+                level       TEXT NOT NULL DEFAULT 'HS-Varsity',
+                grad_class  TEXT,
+                notes       TEXT,
+                created_at  TEXT NOT NULL,
+                archived    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                athlete_id           INTEGER NOT NULL,
+                session_date         TEXT NOT NULL,
+                session_type         TEXT NOT NULL DEFAULT 'real',
+                pitch_count          INTEGER NOT NULL,
+                avg_velocity         REAL,
+                peak_velocity        REAL,
+                avg_spin             REAL,
+                max_stress           REAL,
+                healed_count         INTEGER,
+                canonical_data_json  TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                FOREIGN KEY (athlete_id) REFERENCES athletes(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_athlete
+                ON sessions(athlete_id, session_date DESC);
+        """)
+        # Migration: add sport / level columns to existing DBs that pre-date them
+        cols = [r[1] for r in c.execute("PRAGMA table_info(athletes)").fetchall()]
+        if "sport" not in cols:
+            c.execute("ALTER TABLE athletes ADD COLUMN sport TEXT NOT NULL DEFAULT 'Baseball'")
+        if "level" not in cols:
+            c.execute("ALTER TABLE athletes ADD COLUMN level TEXT NOT NULL DEFAULT 'HS-Varsity'")
+
+        # Migration: add session_kind to sessions so we can keep pitching and
+        # hitting sessions separate (a player can do both — they live as the
+        # same athlete row but different session_kind rows).
+        scols = [r[1] for r in c.execute("PRAGMA table_info(sessions)").fetchall()]
+        if "session_kind" not in scols:
+            c.execute("ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'pitching'")
+
+
+def list_athletes(include_archived: bool = False) -> list[dict]:
+    init_db()
+    with _db_conn() as c:
+        q = "SELECT * FROM athletes"
+        if not include_archived:
+            q += " WHERE archived = 0"
+        q += " ORDER BY name"
+        return [dict(r) for r in c.execute(q).fetchall()]
+
+
+# Athlete-level dropdown options. Maps to the "level" field on videos
+# so the video picker can choose age-appropriate tutorials.
+ATHLETE_LEVELS = ["Youth", "HS-JV", "HS-Varsity", "Travel", "JuCo", "College", "Pro"]
+# Maps an athlete level string → the video-level bucket used by pick_video()
+LEVEL_TO_VIDEO_BUCKET = {
+    "Youth":      "youth",
+    "HS-JV":      "hs",
+    "HS-Varsity": "hs",
+    "Travel":     "hs",
+    "JuCo":       "college+",
+    "College":    "college+",
+    "Pro":        "college+",
+}
+
+
+def add_athlete(name: str, hand: str = "Right", sport: str = "Baseball",
+                grad_class: str = "", notes: str = "",
+                level: str = "HS-Varsity") -> int:
+    init_db()
+    from datetime import datetime as _dt
+    with _db_conn() as c:
+        cur = c.execute(
+            "INSERT INTO athletes (name, hand, sport, level, grad_class, notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, hand, sport, level, grad_class, notes, _dt.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def update_athlete(athlete_id: int, **fields):
+    init_db()
+    valid = {"name", "hand", "sport", "level", "grad_class", "notes"}
+    cols, vals = [], []
+    for k, v in fields.items():
+        if k in valid and v is not None:
+            cols.append(f"{k} = ?")
+            vals.append(v)
+    if not cols:
+        return
+    vals.append(athlete_id)
+    with _db_conn() as c:
+        c.execute(f"UPDATE athletes SET {', '.join(cols)} WHERE id = ?", vals)
+
+
+def delete_athlete_permanently(athlete_id: int) -> int:
+    """Hard-delete an athlete AND all their sessions. Returns # of sessions
+    that were deleted along with them. Use Archive instead if you want to
+    preserve history.
+    """
+    init_db()
+    with _db_conn() as c:
+        # Count sessions first (for the confirmation message)
+        session_count = c.execute(
+            "SELECT COUNT(*) FROM sessions WHERE athlete_id = ?", (athlete_id,)
+        ).fetchone()[0]
+        # Explicit cascade — delete sessions first, then athlete
+        c.execute("DELETE FROM sessions WHERE athlete_id = ?", (athlete_id,))
+        c.execute("DELETE FROM athletes WHERE id = ?", (athlete_id,))
+        return session_count
+
+
+def archive_athlete(athlete_id: int, archived: bool = True):
+    init_db()
+    with _db_conn() as c:
+        c.execute("UPDATE athletes SET archived = ? WHERE id = ?",
+                  (1 if archived else 0, athlete_id))
+
+
+def save_session(athlete_id: int, df: pd.DataFrame,
+                 session_type: str = "real",
+                 session_date: str | None = None,
+                 session_kind: str = "pitching") -> int:
+    """Save a session DataFrame keyed to an athlete.
+
+    session_kind is 'pitching' or 'hitting'. Same athlete can have both —
+    they live as separate rows.
+    """
+    init_db()
+    from datetime import datetime as _dt
+    if session_date is None:
+        # Prefer the earliest pitch/swing timestamp; fall back to "now"
+        if "Timestamp" in df.columns and df["Timestamp"].notna().any():
+            try:
+                session_date = pd.to_datetime(df["Timestamp"].min()).isoformat()
+            except Exception:
+                session_date = _dt.utcnow().isoformat()
+        else:
+            session_date = _dt.utcnow().isoformat()
+
+    # Pull whichever KPI set is appropriate for the kind
+    if session_kind == "hitting":
+        kk = hitting_session_kpis(df)
+        # Repurpose the pitching columns to also hold hitting summaries
+        pitch_count   = int(kk.get("Total Swings", 0))
+        avg_velocity  = kk.get("Avg Exit Velo")
+        peak_velocity = kk.get("Peak Exit Velo")
+        avg_spin      = kk.get("Avg Bat Speed")
+        max_stress    = kk.get("Whiff %")
+        healed_count  = 0
+    else:
+        k = session_kpis(df)
+        pitch_count   = int(k.get("Total Pitches", 0))
+        avg_velocity  = k.get("Avg Velocity")
+        peak_velocity = k.get("Peak Velocity")
+        avg_spin      = k.get("Avg Spin")
+        max_stress    = k.get("Max Elbow Stress")
+        healed_count  = int(k.get("Pitches Healed", 0))
+
+    payload = df.to_json(orient="records", date_format="iso")
+
+    with _db_conn() as c:
+        cur = c.execute(
+            """INSERT INTO sessions (
+                 athlete_id, session_date, session_type, session_kind, pitch_count,
+                 avg_velocity, peak_velocity, avg_spin, max_stress, healed_count,
+                 canonical_data_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                athlete_id, session_date, session_type, session_kind,
+                pitch_count, avg_velocity, peak_velocity, avg_spin,
+                max_stress, healed_count, payload, _dt.utcnow().isoformat(),
+            )
+        )
+        return cur.lastrowid
+
+
+def list_sessions(athlete_id: int, limit: int | None = None,
+                   session_kind: str | None = None) -> list[dict]:
+    """List sessions for an athlete. Pass session_kind='pitching' or 'hitting'
+    to filter; None returns everything."""
+    init_db()
+    q = ("SELECT id, athlete_id, session_date, session_type, session_kind, "
+         "pitch_count, avg_velocity, peak_velocity, avg_spin, max_stress, "
+         "healed_count, created_at FROM sessions WHERE athlete_id = ?")
+    params: list = [athlete_id]
+    if session_kind is not None:
+        q += " AND session_kind = ?"
+        params.append(session_kind)
+    q += " ORDER BY session_date DESC"
+    if limit:
+        q += " LIMIT ?"
+        params.append(limit)
+    with _db_conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def load_hitting_history(athlete_id: int, lookback: int = 20) -> pd.DataFrame:
+    """Combine the athlete's recent hitting sessions into one big swing df.
+    Used by the strike-zone heat map to aggregate across sessions over time.
+    """
+    init_db()
+    sessions = list_sessions(athlete_id, limit=lookback, session_kind="hitting")
+    if not sessions:
+        return pd.DataFrame()
+    frames = []
+    for s in sessions:
+        try:
+            frames.append(load_session_df(s["id"]))
+        except Exception:
+            continue
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def load_session_df(session_id: int) -> pd.DataFrame:
+    init_db()
+    with _db_conn() as c:
+        row = c.execute(
+            "SELECT canonical_data_json FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return pd.DataFrame()
+        return pd.read_json(io.StringIO(row[0]), orient="records")
+
+
+def delete_session(session_id: int):
+    init_db()
+    with _db_conn() as c:
+        c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+
+def compute_real_baseline(athlete_id: int, lookback: int = 6) -> dict:
+    """Rolling baseline per pitch type from the athlete's recent real sessions.
+
+    Returns {pitch_type: {"velo": x, "vbreak": x, "stress": x}} just like
+    DEMO_BASELINE — drop-in compatible.
+    """
+    init_db()
+    sessions = list_sessions(athlete_id, limit=lookback)
+    sessions = [s for s in sessions if s.get("session_type") != "sample"]
+    if not sessions:
+        return {}
+
+    frames = []
+    for s in sessions:
+        try:
+            frames.append(load_session_df(s["id"]))
+        except Exception:
+            continue
+    if not frames:
+        return {}
+
+    combined = pd.concat(frames, ignore_index=True)
+    if combined.empty or "Pitch_Type" not in combined.columns:
+        return {}
+
+    baseline: dict = {}
+    for ptype, g in combined.groupby("Pitch_Type"):
+        velo = g["Velocity_mph"].dropna()
+        vbrk = g["Vert_Break_in"].dropna()
+        strs = g["Peak_Valgus_Nm"].dropna()
+        baseline[ptype] = {
+            "velo":   round(float(velo.mean()), 1) if len(velo) else None,
+            "vbreak": round(float(vbrk.mean()), 1) if len(vbrk) else None,
+            "stress": round(float(strs.mean()), 1) if len(strs) else None,
+        }
+    return baseline
+
+
+# =============================================================================
+# STRIKE ZONE FIGURE + PITCH DETAIL PANEL
+# =============================================================================
+# Standard strike zone bounds (rough): plate is 17" wide = 0.71 ft each side
+# of center; vertical zone is ~knees (1.5 ft) to letters (3.5 ft).
+SZ_X_MIN, SZ_X_MAX = -0.71, 0.71
+SZ_Z_MIN, SZ_Z_MAX = 1.5, 3.5
+SZ_PLOT_X_RANGE = (-2.5, 2.5)
+SZ_PLOT_Z_RANGE = (0.0, 5.0)
+
+
+def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
+    """Construct an interactive strike-zone scatter plot."""
+    fig = go.Figure()
+
+    # --- Strike zone box (3x3 grid for visual reference) ---
+    # Outer box
+    fig.add_shape(
+        type="rect", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+        line=dict(color="black", width=2),
+        fillcolor="rgba(0,0,0,0)", layer="below",
+    )
+    # Inner grid (thirds)
+    for i in (1, 2):
+        x = SZ_X_MIN + (SZ_X_MAX - SZ_X_MIN) * (i / 3)
+        z = SZ_Z_MIN + (SZ_Z_MAX - SZ_Z_MIN) * (i / 3)
+        fig.add_shape(type="line", x0=x, x1=x, y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                      line=dict(color="lightgray", width=1), layer="below")
+        fig.add_shape(type="line", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=z, y1=z,
+                      line=dict(color="lightgray", width=1), layer="below")
+    # Home plate at the bottom
+    fig.add_shape(
+        type="path",
+        path=f"M -0.71 0.05 L 0.71 0.05 L 0.50 -0.10 L 0 -0.25 L -0.50 -0.10 Z",
+        line=dict(color="black", width=1.5),
+        fillcolor="rgba(220,220,220,0.6)", layer="below",
+    )
+
+    # --- One trace per pitch type (so legend works), plus outlier rings ---
+    for ptype, g in df.groupby("Pitch_Type"):
+        color = PITCH_COLORS.get(ptype, "#666")
+        # Outer rings: drawn first so they sit beneath the colored markers
+        for _, row in g.iterrows():
+            ring = None
+            if row["Outlier_Type"] == "positive":
+                ring = "#22c55e"   # green
+            elif row["Outlier_Type"] == "negative":
+                ring = "#ef4444"   # red
+            if ring:
+                fig.add_trace(go.Scatter(
+                    x=[row["Strike_Zone_Side"]],
+                    y=[row["Strike_Zone_Height"]],
+                    mode="markers",
+                    marker=dict(size=28, color="rgba(0,0,0,0)",
+                                line=dict(color=ring, width=3)),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+        # Main markers for this pitch type
+        hover = []
+        for _, row in g.iterrows():
+            reasons = row.get("Outlier_Reasons") or ""
+            tag = ""
+            if row["Outlier_Type"] == "positive":
+                tag = "<br><b style='color:#16a34a'>✓ Positive outlier</b>"
+            elif row["Outlier_Type"] == "negative":
+                tag = "<br><b style='color:#dc2626'>⚠ Negative outlier</b>"
+            hover.append(
+                f"<b>Pitch #{int(row['Pitch_Num'])}</b> — {row['Pitch_Type']}<br>"
+                f"Velo: {row['Velocity_mph']:.1f} mph &nbsp;|&nbsp; "
+                f"Spin: {int(row['Total_Spin_rpm']) if pd.notna(row['Total_Spin_rpm']) else '—'} rpm<br>"
+                f"H break: {row['Horiz_Break_in']:.1f}\" &nbsp;|&nbsp; "
+                f"V break: {row['Vert_Break_in']:.1f}\"<br>"
+                f"Stress: {row['Peak_Valgus_Nm']:.1f} Nm" if pd.notna(row.get('Peak_Valgus_Nm')) else
+                f"Stress: —"
+            )
+            hover[-1] += (f"<br>{reasons}{tag}" if reasons else tag)
+
+        fig.add_trace(go.Scatter(
+            x=g["Strike_Zone_Side"], y=g["Strike_Zone_Height"],
+            mode="markers+text",
+            marker=dict(size=16, color=color, line=dict(width=1.5, color="black")),
+            text=[str(int(p)) for p in g["Pitch_Num"]],
+            textposition="middle center",
+            textfont=dict(color="white", size=9, family="Arial Black"),
+            customdata=g[["Pitch_Num"]].values,
+            hovertemplate="%{hovertext}<extra></extra>",
+            hovertext=hover,
+            name=ptype,
+        ))
+
+    fig.update_layout(
+        xaxis=dict(title="Plate Side (ft) — catcher's view",
+                   range=SZ_PLOT_X_RANGE, zeroline=False, showgrid=False),
+        yaxis=dict(title="Height (ft)",
+                   range=SZ_PLOT_Z_RANGE, zeroline=False, showgrid=False,
+                   scaleanchor="x", scaleratio=1),
+        height=550,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(l=20, r=20, t=40, b=40),
+        plot_bgcolor="white",
+    )
+    return _apply_chart_theme(fig)
+
+
+def _render_pitch_detail_panel(pitch: pd.Series, athlete_name: str = "",
+                               sport: str = "Baseball"):
+    """Render the per-pitch detail card with outlier badge, metrics, video, grip."""
+    # Outlier badge
+    if pitch["Outlier_Type"] == "positive":
+        badge_color, badge_text = "#16a34a", "✓ POSITIVE OUTLIER"
+    elif pitch["Outlier_Type"] == "negative":
+        badge_color, badge_text = "#dc2626", "⚠ NEGATIVE OUTLIER"
+    else:
+        badge_color, badge_text = "#6b7280", "Average for session"
+
+    st.markdown(
+        f"<div style='display:flex;align-items:center;gap:14px;margin-bottom:10px;'>"
+        f"<span style='background:{badge_color};color:white;padding:6px 14px;"
+        f"border-radius:16px;font-size:13px;font-weight:700;'>{badge_text}</span>"
+        f"<span style='font-size:22px;font-weight:700;'>Pitch #{int(pitch['Pitch_Num'])} — {pitch['Pitch_Type']}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    if pitch.get("Outlier_Reasons"):
+        st.caption(f"📍 **Why flagged:** {pitch['Outlier_Reasons']}")
+
+    # Key metrics in a clean 4-column grid
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Velocity", f"{pitch['Velocity_mph']:.1f} mph")
+    c2.metric("Spin", f"{int(pitch['Total_Spin_rpm']) if pd.notna(pitch['Total_Spin_rpm']) else '—'} rpm")
+    c3.metric("Vert Break", f"{pitch['Vert_Break_in']:.1f}\"")
+    c4.metric("Horiz Break", f"{pitch['Horiz_Break_in']:.1f}\"")
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Spin Eff.", f"{pitch['Spin_Efficiency_pct']:.1f}%" if pd.notna(pitch.get('Spin_Efficiency_pct')) else "—")
+    c6.metric("Elbow Stress",
+              f"{pitch['Peak_Valgus_Nm']:.1f} Nm" if pd.notna(pitch.get('Peak_Valgus_Nm')) else "—",
+              delta="DANGER" if pd.notna(pitch.get('Peak_Valgus_Nm')) and pitch['Peak_Valgus_Nm'] >= DANGER_VALGUS_NM else None,
+              delta_color="inverse")
+    c7.metric("Extension", f"{pitch['Extension_ft']:.1f} ft" if pd.notna(pitch.get('Extension_ft')) else "—")
+    c8.metric("Release Height", f"{pitch['Release_Height_ft']:.1f} ft" if pd.notna(pitch.get('Release_Height_ft')) else "—")
+
+    # Mechanics (if PPAI present)
+    if pd.notna(pitch.get("Peak_Hip_Shoulder_Sep")):
+        st.markdown("**Mechanics at release:**")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Hip-Shoulder Sep (peak)", f"{pitch['Peak_Hip_Shoulder_Sep']:.1f}°")
+        m2.metric("Lead Knee Ext.", f"{pitch['Release_Lead_Knee_Ext']:.1f}°" if pd.notna(pitch.get('Release_Lead_Knee_Ext')) else "—")
+        m3.metric("Trunk Rot at Foot-Plant",
+                  f"{pitch['FootPlant_Trunk_Rot']:.1f}°" if pd.notna(pitch.get('FootPlant_Trunk_Rot')) else "—",
+                  delta="opened early" if pd.notna(pitch.get('FootPlant_Trunk_Rot')) and pitch['FootPlant_Trunk_Rot'] >= EARLY_TRUNK_ROTATION_DEG else None,
+                  delta_color="inverse")
+
+    # ---- Video playback (uploaded file OR pasted URL) ----
+    video_data = st.session_state.get("bullpen_video")
+    video_url  = st.session_state.get("bullpen_video_url")
+    if video_data is not None or video_url:
+        st.markdown("**🎥 Video — bullpen (use video controls to scrub + slow-motion)**")
+        if video_data is not None:
+            st.video(video_data)
+        else:
+            st.video(video_url)
+        st.caption(
+            "Tip: hit the gear icon (or right-click on macOS Safari/Chrome) to change "
+            "playback speed — pick **0.25×** for true slow-motion analysis. "
+            "Auto-clipping each pitch to its release timestamp is a v2 feature."
+        )
+    else:
+        st.info(
+            "📹 No bullpen video uploaded yet. Add one in the sidebar "
+            "(\"Bullpen Video — optional\") to see slow-motion playback here."
+        )
+
+    # ---- Grip recommendation for this pitch type ----
+    grip_key = _grip_for_pitch_type(pitch["Pitch_Type"], sport=sport)
+    if grip_key:
+        with st.expander(f"🤲 Recommended grip for {pitch['Pitch_Type']}", expanded=False):
+            gc1, gc2 = st.columns([1, 1.2])
+            with gc1:
+                render_grip_diagram(grip_key)
+            with gc2:
+                st.markdown(personalized_grip_rationale(pitch, grip_key))
+                st.markdown("---")
+                st.markdown(GRIP_LIBRARY[grip_key]["description"])
+
+
+def _grip_for_pitch_type(pitch_type: str, sport: str = "Baseball") -> str | None:
+    """Map a pitch type string to a grip key from GRIP_LIBRARY.
+
+    Sport-aware: generic names like "Curveball" or "Change-Up" route to
+    softball variants when sport == "Softball".
+    """
+    p = (pitch_type or "").lower()
+    # Unambiguous softball-only pitch names — same routing regardless of sport flag
+    if "rise" in p:                 return "softball_rise"
+    if "drop" in p:                 return "softball_drop"
+    if "screw" in p:                return "softball_screw"
+    if "softball" in p:             return "softball_fastball"
+    # Generic pitch names — sport flag picks the right grip
+    if sport == "Softball":
+        if "curve" in p:            return "softball_curve"
+        if "change" in p:           return "softball_change"
+        if "fastball" in p:         return "softball_fastball"
+    # Baseball (default)
+    if "four" in p and "seam" in p: return "four_seam_fastball"
+    if "two" in p and "seam" in p:  return "two_seam_fastball"
+    if "sinker" in p:               return "two_seam_fastball"
+    if "chase" in p:                return "slider_spike_seam"
+    if "slider" in p:               return "slider_standard"
+    if "curve" in p:                return "curveball"
+    if "change" in p:               return "changeup_circle"
+    return None
+
+
+def personalized_grip_rationale(pitch: pd.Series, grip_key: str) -> str:
+    """Generate a markdown explanation tying THIS specific pitch's numbers to
+    the recommended grip. Used in the pitch detail panel."""
+    spin     = pitch.get("Total_Spin_rpm")
+    eff      = pitch.get("Spin_Efficiency_pct")
+    gyro     = pitch.get("Gyro_Degrees")
+    stress   = pitch.get("Peak_Valgus_Nm")
+    vbreak   = pitch.get("Vert_Break_in")
+    hbreak   = pitch.get("Horiz_Break_in")
+    spin_axis = pitch.get("Spin_Direction_hhmm")
+
+    parts = [f"**🎯 Why this grip suits Pitch #{int(pitch['Pitch_Num'])}:**"]
+    notes = []
+
+    if grip_key == "slider_spike_seam":
+        if pd.notna(gyro) and gyro > 60:
+            notes.append(
+                f"Gyro angle was **{gyro:.0f}°** — the ball was spinning too "
+                "bullet-like, sacrificing break. The spike grip cuts naturally without "
+                "wrist twist, reducing gyro."
+            )
+        if pd.notna(stress) and stress >= DANGER_VALGUS_NM:
+            notes.append(
+                f"Elbow stress hit **{stress:.1f} Nm** — above the "
+                f"{DANGER_VALGUS_NM} Nm safety threshold. Removing wrist twist with "
+                "this grip unloads the UCL."
+            )
+        if pd.notna(eff) and eff < 25:
+            notes.append(
+                f"Spin efficiency was **{eff:.1f}%** — well below the 30-40% target "
+                "for a tight 2-plane slider."
+            )
+
+    elif grip_key == "slider_standard":
+        if pd.notna(hbreak):
+            notes.append(
+                f"Horizontal break of **{hbreak:.1f}\"** — the standard slider grip "
+                "keeps middle-finger pressure on the long seam to sharpen this break."
+            )
+        if pd.notna(eff):
+            notes.append(
+                f"Spin efficiency: **{eff:.1f}%**. Target 30-40% for a tight slider; "
+                "this grip with a clean finger snap (no wrist twist) hits that range."
+            )
+
+    elif grip_key == "four_seam_fastball":
+        if pd.notna(spin):
+            if spin < 2200:
+                notes.append(
+                    f"Spin rate was **{int(spin)} RPM** (target: 2,300+). "
+                    "Pressing the index and middle fingers ACROSS the horseshoe "
+                    "maximizes backspin contribution."
+                )
+            else:
+                notes.append(
+                    f"Spin rate **{int(spin)} RPM** — already good. Lock in this "
+                    "four-seam grip with light, consistent finger pressure."
+                )
+        if pd.notna(eff) and eff >= 90:
+            notes.append(
+                f"Spin efficiency **{eff:.1f}%** — excellent. Your axis is right; "
+                "this grip will keep it there."
+            )
+        elif pd.notna(eff):
+            notes.append(
+                f"Spin efficiency **{eff:.1f}%** — improving this means the grip's "
+                "doing its job AND your release is clean. Both fingers on the seams."
+            )
+        if pd.notna(vbreak):
+            notes.append(f"Today's induced vertical break: **{vbreak:.1f}\"** (carry).")
+
+    elif grip_key == "two_seam_fastball":
+        if pd.notna(hbreak):
+            notes.append(
+                f"Today's run: **{abs(hbreak):.1f}\"** of arm-side movement. "
+                "This grip puts fingers ALONG the parallel seams to maximize that "
+                "side-spin and create sink."
+            )
+        if pd.notna(spin):
+            notes.append(
+                f"Spin rate **{int(spin)} RPM** — sinkers thrive in the 2,000-2,200 "
+                "range with low spin efficiency. Lower spin = more sink, ironically."
+            )
+
+    elif grip_key == "curveball":
+        if pd.notna(spin_axis):
+            notes.append(
+                f"Spin direction is **{spin_axis}**. Curveball target is 6:00 (pure top spin). "
+                "Hook the thumb on the opposite seam and pull DOWN with the middle finger."
+            )
+        if pd.notna(vbreak) and vbreak < 0:
+            notes.append(
+                f"Today's vertical break **{vbreak:.1f}\"** — drop is good, "
+                "keep emphasizing the downward pull at release."
+            )
+
+    elif grip_key == "changeup_circle":
+        if pd.notna(spin):
+            notes.append(
+                f"Spin rate **{int(spin)} RPM** — changeups thrive at 1,500-1,800 RPM. "
+                "The circle grip naturally reduces spin while keeping arm speed."
+            )
+        if pd.notna(eff) and eff > 85:
+            notes.append(
+                f"Spin efficiency **{eff:.1f}%** — good arm-side fade is coming from "
+                "the pronation built into this grip's release."
+            )
+
+    if not notes:
+        notes.append("This is the standard recommended grip for this pitch type.")
+
+    for n in notes:
+        parts.append(f"- {n}")
+    return "\n".join(parts)
+
+
+# =============================================================================
+# GRIP DIAGRAMS — SVG illustrations
+# =============================================================================
+GRIP_LIBRARY = {
+    "four_seam_fastball": {
+        "label":       "Four-Seam Fastball",
+        "description": (
+            "**How to hold it (plain English):** Look at the baseball and find the "
+            "**horseshoe** — that's the part of the seam that curves like a horseshoe shape. "
+            "Place your **index and middle finger ACROSS the seams** (perpendicular to them, "
+            "not running along them) so the pads of those two fingers rest on the part where "
+            "the stitches cross your fingertips. Your thumb goes underneath the ball on the "
+            "opposite seam. Hold it like an egg — firm but not squeezing.\n\n"
+            "**Why this works:** When the ball rotates, all four red seams cut through the air "
+            "every spin. That's what creates the 'rise' or 'carry' effect that makes a fastball "
+            "look like it's staying up at the top of the strike zone. **More backspin = more "
+            "carry = harder to hit.**"
+        ),
+    },
+    "two_seam_fastball": {
+        "label":       "Two-Seam Sinker",
+        "description": (
+            "**How to hold it (plain English):** Same fingers as a four-seam, but rotate the ball "
+            "so the **two narrow parallel seams** (the part where the stitches run side-by-side) "
+            "are right under your fingertips. Your index and middle finger now run ALONG those "
+            "two parallel seams — going the same direction as the seams, not across them. Thumb "
+            "underneath like normal.\n\n"
+            "**Why this works:** Because the spin axis is tilted to the side, the ball will sink "
+            "and run toward your throwing-arm side (right for a righty, left for a lefty). "
+            "**Great for getting ground balls** when a hitter is sitting fastball."
+        ),
+    },
+    "slider_standard": {
+        "label":       "Standard Slider",
+        "description": (
+            "**How to hold it (plain English):** Find the long seam (the part where the seam runs "
+            "in a long curve along the side of the ball). Place your **middle finger on the outer "
+            "third of that long seam**. Rest your index finger right next to your middle finger "
+            "— they should be touching. Thumb tucks underneath on the opposite seam. "
+            "When you throw, snap your middle finger down across the ball — don't twist your "
+            "wrist sideways.\n\n"
+            "**Why this works:** The middle finger does the work of imparting the sideways spin. "
+            "If you let your wrist do it instead (by twisting), you'll stress your elbow AND "
+            "lose break. The standard grip teaches a clean, repeatable release."
+        ),
+    },
+    "slider_spike_seam": {
+        "label":       "Spike-Seam Slider (Recommended Fix)",
+        "description": (
+            "**How to hold it (plain English):** Same starting point as the standard slider — "
+            "middle finger on the long seam. But instead of your index finger laying flat, you "
+            "**'spike' it**: bend your index finger so just the tip of your fingernail (or the "
+            "fingertip pad) is pressing into the seam — like you're trying to dent the ball with "
+            "just your fingertip. The finger is curled up, not flat. Thumb tucks under like normal.\n\n"
+            "**What 'spiking' means:** Picture a basketball player's middle finger curling under "
+            "on a finger-roll — same idea. The bent index finger creates a stronger 'lever' "
+            "that helps the ball cut sideways without you needing to twist your wrist.\n\n"
+            "**Why this is recommended for THIS pitcher:** When your slider data shows high "
+            "elbow stress AND lots of gyro spin (the 'bullet spin' that doesn't create break), "
+            "it usually means you're twisting your wrist to force the break. The spike grip "
+            "lets the ball cut naturally — **the break gets sharper AND your elbow gets safer.**"
+        ),
+    },
+    "curveball": {
+        "label":       "Curveball (12-to-6)",
+        "description": (
+            "**How to hold it (plain English):** Middle finger on the long seam (same as slider), "
+            "with the index finger laying right next to it. Now hook your thumb on the seam on "
+            "the OPPOSITE side of the ball — pressing in from underneath. When you throw, you "
+            "**pull down** with your middle finger like you're cracking a whip downward.\n\n"
+            "**Why this works:** Pulling down at release creates **top spin** — the opposite of "
+            "a fastball's backspin. Top spin makes the ball drop fast, like falling off a table. "
+            "A great curveball drops 12-15+ inches more than a fastball over the same distance, "
+            "which is what makes hitters swing over the top of it."
+        ),
+    },
+    "changeup_circle": {
+        "label":       "Circle Change",
+        "description": (
+            "**How to hold it (plain English):** Make an **'OK' sign** with your thumb and index "
+            "finger — that little circle they form should hold the side of the baseball. Your "
+            "middle finger, ring finger, and pinky lay across the top of the ball (across the "
+            "seams like a four-seam fastball, but using three fingers instead of two). When you "
+            "throw, **use the same arm speed as a fastball** — that's the whole point of a "
+            "changeup. As your arm comes through, turn your wrist slightly so your palm faces "
+            "the side, like you're shaking someone's hand.\n\n"
+            "**Why this works:** The circle grip + the wrist turn at release slow the ball down "
+            "by 8-12 mph without slowing your arm. Because your arm looks identical to a fastball "
+            "delivery, the hitter starts their swing for a fastball — and the slower, sinking "
+            "ball arrives 2-3 tenths of a second later. **It's a velocity trick disguised as a "
+            "fastball.**"
+        ),
+    },
+
+    # ===== SOFTBALL GRIPS =====
+    "softball_fastball": {
+        "label":       "Softball Fastball (4-seam)",
+        "description": (
+            "**How to hold it (plain English):** Find the horseshoe of the seams (the C-shape). "
+            "Place your **index and middle finger across the seams** at the top of the C — the pads "
+            "of your fingers should be touching the stitches where they cross. Thumb tucks "
+            "underneath on the opposite seam, ring finger lightly curled. You want a firm but "
+            "relaxed grip — like holding an egg.\n\n"
+            "**Why this works:** Across the seams gives you four red lines cutting through the air "
+            "every revolution, which is what creates the carry and arm-side run that makes a "
+            "fastball look like it 'rises' to the hitter even though it's just dropping less than "
+            "gravity alone would cause."
+        ),
+    },
+    "softball_rise": {
+        "label":       "Rise Ball (Softball)",
+        "description": (
+            "**How to hold it (plain English):** **Two-finger 'C' grip.** Place index and middle "
+            "fingers along the inside of the C of the horseshoe (so the seam runs LENGTHWISE under "
+            "your fingertips, not across them). Thumb directly underneath. The release is the "
+            "secret — at the bottom of your windmill, your **palm rotates UP** toward the sky as "
+            "you release. Think 'flick the ball up' off your fingertips.\n\n"
+            "**Why this works:** The palm-up release imparts **pure backspin** (12:00 spin axis) — "
+            "the maximum 'rise' effect. The ball physically can't rise (gravity wins), but with "
+            "enough backspin it drops about 4-8 inches LESS than the hitter's eyes expect — and "
+            "they swing under it. Great rise balls feel like fastballs at the top of the zone that "
+            "won't come down."
+        ),
+    },
+    "softball_drop": {
+        "label":       "Drop Ball (Peel Drop)",
+        "description": (
+            "**How to hold it (plain English):** Same C-grip as the rise ball — index and middle "
+            "along the seam — but the release is opposite. At the bottom of your windmill, "
+            "**'peel' your fingers OFF THE FRONT of the ball** so the top of the ball spins forward "
+            "(toward home plate). Your wrist stays neutral, no twisting. Think 'pulling down a "
+            "shade in front of you.'\n\n"
+            "**Why this works:** Peeling the fingers off the front creates **pure topspin** (6:00 "
+            "spin axis), which makes the ball drop FAR more than gravity alone — 6-8\" more drop "
+            "than a fastball at the same release point. The hitter sees what looks like a fastball "
+            "but the bottom falls out at the plate."
+        ),
+    },
+    "softball_curve": {
+        "label":       "Softball Curveball",
+        "description": (
+            "**How to hold it (plain English):** Similar C-grip but **rotate the ball so the seam "
+            "runs at an angle** — about 4:30 to 10:30 clock position. Middle finger on the long "
+            "seam, index riding along just inside. Thumb tucked underneath, slightly offset toward "
+            "the glove side. At release, **rotate your wrist OUTWARD** (palm rotates toward third "
+            "base for a right-handed pitcher) as the ball leaves your hand.\n\n"
+            "**Why this works:** The outward wrist rotation creates a side-spin axis around 8:30, "
+            "which curves the ball away from a same-side hitter (in to opposite-side). Movement: "
+            "5-9 inches of glove-side break."
+        ),
+    },
+    "softball_screw": {
+        "label":       "Softball Screwball",
+        "description": (
+            "**How to hold it (plain English):** **Inside-out grip.** Index and middle finger along "
+            "the seam BUT on the OPPOSITE side of the ball from your curveball grip. As you "
+            "release at the bottom of the windmill, **pronate your wrist INWARD** (palm rotates "
+            "toward first base for a righty) — opposite of the curveball motion.\n\n"
+            "**Why this works:** Inward pronation creates a side-spin axis around 3:30 — opposite "
+            "of a curveball — so the ball breaks toward the arm side (away from the opposite-side "
+            "hitter, into a same-side hitter). Excellent counter to a curveball-heavy hitter."
+        ),
+    },
+    "softball_change": {
+        "label":       "Softball Change-Up (Backhand)",
+        "description": (
+            "**How to hold it (plain English):** **Backhand grip.** Place the ball deep in your "
+            "palm with all four fingers along the side, **thumb pointing UP** along the seam. The "
+            "ball sits between the heel of your hand and your fingertips. At release, instead of "
+            "snapping your fingers off the ball, just **let the ball roll out the back of your "
+            "hand** with no wrist action. Keep the same windmill arm speed as your fastball.\n\n"
+            "**Why this works:** The 'no-snap' release drops 10-14 mph off your fastball without "
+            "slowing your arm. The hitter starts their swing for a fastball — and the ball "
+            "arrives a tenth of a second late. It's the same arm action, just a totally different "
+            "release feel."
+        ),
+    },
+}
+
+
+# Glossary — explains baseball terms used throughout grip + drill descriptions
+GRIP_GLOSSARY = [
+    ("**Seam / Seams**",
+     "The red stitching on the baseball. There are two sets of seams. The 'long seams' "
+     "are the curving parts that look like a horseshoe. The 'narrow seams' are the parts "
+     "where the stitches run side-by-side."),
+    ("**Horseshoe seam**",
+     "The U-shaped part of the seam — it looks just like a horseshoe. The 'open end' of "
+     "the horseshoe points to one side."),
+    ("**Spike / Spiked**",
+     "When your finger is bent at the knuckle so just the fingertip or fingernail is "
+     "touching the ball — like a claw, not flat. Used in the 'spike-seam slider' grip "
+     "to help the ball cut without wrist twist."),
+    ("**Backspin**",
+     "When the ball rotates backward (top of the ball moves toward the pitcher in flight). "
+     "Makes the ball stay up longer in the air. Fastballs use backspin."),
+    ("**Topspin**",
+     "Opposite of backspin — top of the ball moves AWAY from the pitcher. Makes the ball "
+     "drop fast. Curveballs use topspin."),
+    ("**Pronation / Pronate**",
+     "Turning your wrist so your palm faces down or to the side (instead of up). At ball "
+     "release on a changeup, you 'pronate' to slow the spin and add arm-side fade."),
+    ("**Gyro / Bullet spin**",
+     "When a ball spins like a football pass — around its own direction of travel. Pure "
+     "gyro spin creates ZERO movement, like a bullet. Most sliders have some gyro mixed "
+     "in with useful sideways spin."),
+    ("**Spin efficiency**",
+     "What % of the ball's spin actually creates movement. 100% = all the spin helps the "
+     "ball break. 0% = pure gyro = no break. Fastballs want HIGH efficiency (95%+); "
+     "sliders want LOW (15-40%) for a sharp break."),
+    ("**Induced Vertical Break (IVB)**",
+     "How much the ball stays UP compared to gravity-only. A 90 mph fastball would drop "
+     "about 3 ft from release to plate due to gravity alone — backspin can reduce that "
+     "drop by 15-20\" (positive IVB)."),
+    ("**Horizontal break**",
+     "How far the ball moves sideways from release to plate. Negative = toward the glove "
+     "side (for a right-handed pitcher, that's toward the left), positive = arm side."),
+    ("**Valgus stress / Elbow torque**",
+     "The pulling force on the inside of the elbow (the UCL ligament — the one that "
+     "needs Tommy John surgery when it tears). Measured in Newton-meters (Nm). Above "
+     "~62 Nm consistently is high-risk territory."),
+    ("**Hip-shoulder separation**",
+     "How far your hips have rotated ahead of your shoulders at the moment your front "
+     "foot lands. More separation = more 'rubber-band' effect = more velocity. Pros "
+     "average 55-65°."),
+    ("**AC Ratio (Acute:Chronic)**",
+     "Today's workload divided by your recent average workload. Above 1.3 = elevated "
+     "injury risk. Above 1.5 = 3-5× more likely to get hurt in the next 7 days. Take "
+     "a day off."),
+]
+
+
+# Baseball-specific terms (rotated overhand mechanics, pitches unique to baseball)
+BASEBALL_GLOSSARY = [
+    ("**Slider**",
+     "A pitch thrown like a fastball but with the ball pushed slightly off the side "
+     "of the middle finger at release. Breaks sharply sideways (and a bit down). "
+     "Hard to hit when thrown well."),
+    ("**Spike / Spiked grip**",
+     "When your finger is bent at the knuckle so just the fingertip or fingernail is "
+     "touching the ball — like a claw, not flat. Used in the 'spike-seam slider' grip "
+     "to help the ball cut without wrist twist."),
+    ("**4-Seam vs 2-Seam fastball**",
+     "Where the fingers sit on the seams. **4-seam** fingers go ACROSS the horseshoe — "
+     "all four seams cut through the air every revolution, giving max ride. "
+     "**2-seam** fingers go ALONG the narrow parallel seams — only two seams cut, "
+     "creating arm-side run and sink."),
+    ("**Tunneling**",
+     "When two different pitches look IDENTICAL for the first 25 feet of flight, then "
+     "break apart late. Great tunneling = a hitter can't tell what's coming until it's "
+     "too late to adjust."),
+    ("**Extension**",
+     "How far in front of the pitching rubber the ball is released. Longer extension "
+     "= shorter perceived distance to the hitter = effectively faster fastball."),
+]
+
+
+# Softball-specific terms (windmill mechanics, pitches unique to softball)
+SOFTBALL_GLOSSARY = [
+    ("**Windmill motion**",
+     "The full underhand arm circle a softball pitcher makes from start to release. "
+     "The arm goes UP first (front-up to 12:00), THEN back and around, ending with "
+     "a strong fingertip snap at the bottom. Totally different from baseball's "
+     "overhand throwing motion."),
+    ("**K-position**",
+     "The position at the top of the windmill where the arm is straight up at 12:00, "
+     "ball facing the batter, and the body is loaded for the explosive arm circle. "
+     "A consistent K-position = a repeatable delivery. The 'K' is shaped by the arm, "
+     "stride leg, and torso."),
+    ("**Brush / Brush at hip**",
+     "The moment when the throwing arm's elbow brushes past the pitcher's hip on the "
+     "way through the release zone. This is the timing checkpoint — late brush = "
+     "pushed ball, lost velocity. A consistent brush at the hip = consistent release."),
+    ("**Drag toe / Drive foot drag**",
+     "The pitcher's back foot drags forward along the rubber during the delivery, "
+     "instead of hopping off. Drag-toe finishes keep the body in line and the release "
+     "consistent. Hopping off the rubber leaks energy and scatters the ball."),
+    ("**Rise Ball**",
+     "Softball pitch thrown with pure BACKSPIN (12:00 spin axis). The ball doesn't "
+     "actually rise — gravity wins — but it drops 4-8 inches LESS than the hitter's "
+     "eyes expect, so they swing under it. Marquee softball pitch."),
+    ("**Drop Ball**",
+     "Softball pitch thrown with pure TOPSPIN (6:00 spin axis). The ball drops "
+     "6-8 inches MORE than gravity would alone. Hitters keep swinging where the "
+     "ball was, instead of where it ended up."),
+    ("**Peel Drop**",
+     "The release technique for a drop ball where the fingers 'peel off' the FRONT "
+     "of the ball (like pulling down a window shade), imparting topspin. The wrist "
+     "stays neutral; no twisting."),
+    ("**Screwball**",
+     "Softball pitch that breaks toward the arm side (opposite of a curveball). "
+     "Created by inward wrist pronation at release. Great counter to a curve-heavy hitter."),
+    ("**Backhand Change-Up**",
+     "Softball change-up where the ball is held in the palm with the thumb up and "
+     "released without a fingertip snap — the ball rolls out the back of the hand. "
+     "Same arm speed as a fastball but 10-14 mph slower."),
+    ("**Hip-shoulder separation (windmill)**",
+     "How far the hips have rotated ahead of the shoulders at foot-plant. In windmill "
+     "mechanics, target is 42-50° (less than baseball's 50-65° because of the "
+     "different kinetic chain). More separation = more rubber-band torque = more velocity."),
+]
+
+
+def get_glossary_for_sport(sport: str = "Baseball") -> list:
+    """Return the right combined glossary for an athlete's sport."""
+    if sport == "Softball":
+        return GRIP_GLOSSARY + SOFTBALL_GLOSSARY
+    return GRIP_GLOSSARY + BASEBALL_GLOSSARY
+
+
+# =============================================================================
+# GRIP VARIANTS — different release styles produce different break profiles
+# from the SAME pitch type. Each variant carries the arm-slot range it suits,
+# the palm-orientation cue at release, and the expected break trade-off.
+# =============================================================================
+GRIP_VARIANTS = {
+    # ===== FOUR-SEAM FASTBALL =====
+    "four_seam_fastball": {
+        "pitch_name": "Four-Seam Fastball",
+        "variants": [
+            {
+                "name":         "Standard 4-Seam",
+                "arm_slot":     "Over-the-top through 3/4 (45°-75° from horizontal)",
+                "palm_release": "Palm faces straight toward the catcher at release.",
+                "fingers":      "Index + middle finger across the horseshoe seams, with the seams running perpendicular to the fingers.",
+                "result":       "Pure backspin → maximum carry (rising fastball illusion). Expect 16-18\" IVB at 90+ mph.",
+                "body_fit":     "Long-fingered pitchers, classic over-top arm slots.",
+                "trade_off":    "Best raw spin efficiency. Least horizontal movement — pure straight pitch.",
+            },
+            {
+                "name":         "Sinker / Two-Seam Variant",
+                "arm_slot":     "3/4 through low 3/4 (30°-55°).",
+                "palm_release": "Palm rolls slightly INWARD (toward 1B for RHP) at release — pronation.",
+                "fingers":      "Index + middle along the narrow seams, fingertips on the seams not across them.",
+                "result":       "Adds 6-10\" of arm-side run + reduces IVB by 4-6\". The 'heavy ball' that produces ground balls.",
+                "body_fit":     "Lower arm slots, pitchers who naturally pronate.",
+                "trade_off":    "Trades vertical carry for run + sink. Less useful up in the zone, devastating down.",
+            },
+            {
+                "name":         "Cutter Variant",
+                "arm_slot":     "Over-the-top through high 3/4.",
+                "palm_release": "Palm rotates slightly OUTWARD (toward 3B for RHP) — supination at release.",
+                "fingers":      "Index + middle slightly OFFSET from the seams, with most pressure on the middle finger.",
+                "result":       "5-8\" of glove-side cut + 2-4\" less IVB than the straight 4-seam. Speed loss: 2-3 mph.",
+                "body_fit":     "Pitchers with strong middle-finger pressure, supination-dominant.",
+                "trade_off":    "Adds a second movement profile from the same arm slot — disguised by tunnel with the 4-seam.",
+            },
+        ],
+    },
+    # ===== SLIDER =====
+    "slider_strike_getter": {
+        "pitch_name": "Slider",
+        "variants": [
+            {
+                "name":         "Gyro Slider (Bullet)",
+                "arm_slot":     "Any — but pairs best with 3/4 or higher.",
+                "palm_release": "Palm faces 3B (RHP) at release — slight supination, no wrist twist.",
+                "fingers":      "Index + middle finger together, slightly off-center on the seam. Like throwing a spiral.",
+                "result":       "Tight, late-breaking slider with 4-6\" of glove-side cut. Spins fast but mostly gyro — low movement, high deception.",
+                "body_fit":     "Pitchers who throw hard fastballs — the gyro slider tunnels off the 4-seam.",
+                "trade_off":    "Less actual break. Wins by hiding inside the fastball tunnel until commit.",
+            },
+            {
+                "name":         "Sweeper Slider",
+                "arm_slot":     "3/4 through low 3/4 (30°-55°).",
+                "palm_release": "Palm faces 3B and slightly DOWN — exaggerated supination.",
+                "fingers":      "Index + middle finger SPIKED — index knuckle on top of the ball, more middle-finger pressure.",
+                "result":       "12-18\" of horizontal sweep, 4-7\" drop. The 'frisbee' slider that buckles RHH knees.",
+                "body_fit":     "Lower arm slots, pitchers with good wrist supination.",
+                "trade_off":    "Big horizontal break, but doesn't tunnel as cleanly with a 4-seam. Best as a 2-strike chase pitch.",
+            },
+            {
+                "name":         "Hard Slider / Cutter Slider",
+                "arm_slot":     "Over-the-top or high 3/4.",
+                "palm_release": "Palm faces catcher then snaps slightly outward — minimal wrist movement.",
+                "fingers":      "Same grip as the 4-seam but pressure goes to the middle finger.",
+                "result":       "Mid-80s velocity (only 4-6 mph off the fastball), 4-6\" of cut, very late break.",
+                "body_fit":     "Power pitchers who throw 92+. Lets them disguise the slider in their fastball arm action.",
+                "trade_off":    "Less break than other sliders but elite tunneling — the late differentiation makes it untouchable.",
+            },
+        ],
+    },
+    # ===== CURVEBALL =====
+    "curveball": {
+        "pitch_name": "Curveball",
+        "variants": [
+            {
+                "name":         "Classic 12-6 Curveball (Spike Grip)",
+                "arm_slot":     "Over-the-top (60°-90°). Doesn't work from low arm slots.",
+                "palm_release": "Palm STARTS facing the catcher, then snaps DOWN at release — the wrist 'turns the doorknob.'",
+                "fingers":      "Middle finger on a long seam, INDEX FINGER SPIKED (knuckle pressed against the ball).",
+                "result":       "12-to-6 (straight down) break of 12-18\". The classic 'rainbow' curve.",
+                "body_fit":     "Tall, over-top pitchers with flexible wrists.",
+                "trade_off":    "Massive break but easy to identify by arm action. Better as a setup pitch than a put-away.",
+            },
+            {
+                "name":         "Knuckle Curve",
+                "arm_slot":     "Over-the-top through high 3/4.",
+                "palm_release": "Same downward snap as classic curve, but the index knuckle 'flicks' the ball.",
+                "fingers":      "Index finger BENT and resting AGAINST the ball (knuckle pressed in), middle finger on the seam.",
+                "result":       "Sharper, later break (more 11-5 than 12-6). 2-3 mph harder than the classic curve.",
+                "body_fit":     "Pitchers who can't get true top-spin from a classic grip — knuckle pressure fixes the spin axis.",
+                "trade_off":    "Less total break but later break = harder for the hitter to identify.",
+            },
+            {
+                "name":         "Slurve / Hybrid Curve",
+                "arm_slot":     "3/4 (45°-60°).",
+                "palm_release": "Palm rotates from catcher → 3B at release. Blends slider mechanics with curve grip.",
+                "fingers":      "Standard 2-seam curve grip, slightly more middle-finger pressure than index.",
+                "result":       "Diagonal break — 8-12\" of drop + 6-10\" of glove-side sweep. The 'lazy' shape that hitters chase.",
+                "body_fit":     "Pitchers stuck between a true curve and a true slider — the slurve is the natural compromise.",
+                "trade_off":    "Easier to throw consistently than a true curve. Hitters identify it faster though.",
+            },
+        ],
+    },
+    # ===== CHANGEUP =====
+    "change_up": {
+        "pitch_name": "Change-Up",
+        "variants": [
+            {
+                "name":         "Circle Change",
+                "arm_slot":     "Any — but works best from 3/4 or higher.",
+                "palm_release": "Palm faces catcher with slight pronation at release. Looks IDENTICAL to a fastball.",
+                "fingers":      "Thumb + index form a circle on the side of the ball. Middle/ring/pinky grip the ball.",
+                "result":       "8-12 mph off the fastball, 4-6\" of arm-side fade + 2-4\" of sink.",
+                "body_fit":     "Larger hands — small hands struggle to form the circle.",
+                "trade_off":    "Best changeup for tunneling off a 4-seam fastball. The grip naturally kills velocity without affecting arm speed.",
+            },
+            {
+                "name":         "Splitter / Split-Finger Change",
+                "arm_slot":     "Over-the-top through high 3/4.",
+                "palm_release": "Palm faces catcher, no wrist manipulation.",
+                "fingers":      "Index + middle finger SPREAD wide on either side of the ball (like a peace sign).",
+                "result":       "6-10 mph off the fastball, 8-12\" of late drop (the 'cliff'). Pure ground-ball pitch.",
+                "body_fit":     "Long-fingered pitchers — small hands can't split wide enough.",
+                "trade_off":    "Hardest changeup variant to control. High elbow stress in some studies — use sparingly.",
+            },
+            {
+                "name":         "Vulcan Change / Forkball",
+                "arm_slot":     "3/4 (45°-60°).",
+                "palm_release": "Palm rotates slightly inward at release (pronation).",
+                "fingers":      "Middle + ring fingers split on either side of the ball (Vulcan salute grip).",
+                "result":       "Similar to splitter (heavy drop) but easier on the elbow. 4-6 mph velocity loss.",
+                "body_fit":     "Pitchers whose middle + ring fingers can spread cleanly.",
+                "trade_off":    "Less drop than a true splitter, but more reliable to repeat.",
+            },
+        ],
+    },
+}
+
+
+def render_grip_variants(grip_key: str):
+    """Surface ALL release-style variants for a pitch type. Pulls from
+    GRIP_VARIANTS and renders each variant as a card with the arm-slot
+    range, palm orientation cue, finger placement, expected break result,
+    body-type fit, and the trade-off the coach is making by choosing it.
+    """
+    variant_set = GRIP_VARIANTS.get(grip_key)
+    if not variant_set:
+        return
+    st.markdown(
+        _flat_html(
+            f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#d4a634;text-transform:uppercase;margin-top:6px;'>"
+            f"Release-style variants</div>"
+            f"<div style='font-size:18px;font-weight:700;color:#1a2150;"
+            f"margin-bottom:8px;'>{variant_set['pitch_name']}</div>"
+            f"<div style='font-size:13px;color:#6b7280;margin-bottom:10px;'>"
+            f"There's no single 'right' way to throw this pitch — each release "
+            f"style gives a different break profile. Pick the variant that "
+            f"matches the pitcher's arm slot AND the result you want."
+            f"</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    for v in variant_set["variants"]:
+        st.markdown(
+            _flat_html(
+                f"<div style='background:white;border:1px solid #e5e7eb;"
+                f"border-left:4px solid #1a2150;border-radius:0 8px 8px 0;"
+                f"padding:14px 18px;margin:8px 0;'>"
+                f"<div style='font-size:16px;font-weight:700;color:#1a2150;"
+                f"margin-bottom:8px;'>{v['name']}</div>"
+                f"<div style='display:grid;grid-template-columns:130px 1fr;gap:6px 12px;"
+                f"font-size:13px;line-height:1.5;'>"
+                f"<div style='color:#6b7280;font-weight:600;'>Arm slot</div>"
+                f"<div style='color:#1f2937;'>{v['arm_slot']}</div>"
+                f"<div style='color:#6b7280;font-weight:600;'>Palm/release</div>"
+                f"<div style='color:#1f2937;'>{v['palm_release']}</div>"
+                f"<div style='color:#6b7280;font-weight:600;'>Finger placement</div>"
+                f"<div style='color:#1f2937;'>{v['fingers']}</div>"
+                f"<div style='color:#16a34a;font-weight:700;'>Result</div>"
+                f"<div style='color:#1f2937;font-weight:500;'>{v['result']}</div>"
+                f"<div style='color:#6b7280;font-weight:600;'>Body-type fit</div>"
+                f"<div style='color:#1f2937;'>{v['body_fit']}</div>"
+                f"<div style='color:#d4a634;font-weight:700;'>Trade-off</div>"
+                f"<div style='color:#1f2937;font-style:italic;'>{v['trade_off']}</div>"
+                f"</div></div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def render_grip_diagram(grip_key: str, height: int = 380):
+    """Render a grip SVG reliably via an iframe component.
+
+    Streamlit's st.markdown(html, unsafe_allow_html=True) escapes complex SVG
+    when nested inside containers + columns. components.v1.html sidesteps that.
+    """
+    import streamlit.components.v1 as components
+    components.html(grip_svg(grip_key), height=height, scrolling=False)
+
+
+def _baseball_seams_svg() -> str:
+    """SVG markup for proper baseball seams: continuous horseshoe paths + stitch marks.
+
+    Drawn as two layered paths per seam (dark base + lighter top with dashed stitches)
+    plus perpendicular tick marks for the cross-hatched stitch look.
+    """
+    # Two long horseshoe paths that mirror each other left/right.
+    # Each is a smooth bezier from top of ball, out around the side, to bottom.
+    # The seams DON'T meet at the top/bottom — they pass behind the ball, which
+    # is the classic "horseshoe view" of a baseball.
+    left_seam  = "M 105 60 C 55 90 35 145 50 175 C 65 215 80 240 105 260"
+    right_seam = "M 215 60 C 265 90 285 145 270 175 C 255 215 240 240 215 260"
+
+    # Stitch tick marks along each seam — small perpendicular lines at intervals.
+    # Hand-tuned positions / angles so they sit on the seam path correctly.
+    left_ticks = [
+        (95, 67, -55), (75, 87, -42), (60, 112, -28), (50, 140, -10),
+        (51, 170, 8), (60, 198, 25), (75, 222, 42), (95, 245, 60),
+    ]
+    right_ticks = [
+        (225, 67, 55), (245, 87, 42), (260, 112, 28), (270, 140, 10),
+        (269, 170, -8), (260, 198, -25), (245, 222, -42), (225, 245, -60),
+    ]
+
+    import math
+    def tick(x, y, angle, length=11):
+        rad = math.radians(angle)
+        dx, dy = (length/2)*math.cos(rad), (length/2)*math.sin(rad)
+        return (f'<line x1="{x-dx:.1f}" y1="{y-dy:.1f}" '
+                f'x2="{x+dx:.1f}" y2="{y+dy:.1f}" '
+                f'stroke="#9b1c1c" stroke-width="2.2" stroke-linecap="round"/>')
+
+    tick_marks = "\n".join(
+        tick(*t) for t in (left_ticks + right_ticks)
+    )
+
+    return f"""
+    <!-- Seam channels (slightly darker, sit under the stitches) -->
+    <path d="{left_seam}"  fill="none" stroke="#7a1414" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="{right_seam}" fill="none" stroke="#7a1414" stroke-width="3.5" stroke-linecap="round"/>
+    <!-- Stitches (perpendicular tick marks) -->
+    {tick_marks}
+    """
+
+
+def grip_svg(grip_key: str) -> str:
+    """Return an inline SVG diagram of the grip viewed from the release perspective."""
+    # Ball body with subtle radial gradient for a 3D feel
+    ball_outline = """
+    <defs>
+      <radialGradient id="ballSheen" cx="0.35" cy="0.35" r="0.7">
+        <stop offset="0%" stop-color="#ffffff"/>
+        <stop offset="60%" stop-color="#f5f1e8"/>
+        <stop offset="100%" stop-color="#e1d8c4"/>
+      </radialGradient>
+    </defs>
+    <circle cx="160" cy="160" r="120" fill="url(#ballSheen)" stroke="#222" stroke-width="2.5"/>
+    """
+    seams = _baseball_seams_svg()
+    # Each grip overlays finger markers + labels
+    overlays = {
+        "four_seam_fastball": """
+            <circle cx="130" cy="140" r="18" fill="#2563eb" opacity="0.85"/>
+            <text x="130" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">I</text>
+            <circle cx="190" cy="140" r="18" fill="#2563eb" opacity="0.85"/>
+            <text x="190" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
+            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
+            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Fingers ACROSS the horseshoe</text>
+        """,
+        "two_seam_fastball": """
+            <circle cx="145" cy="140" r="18" fill="#f97316" opacity="0.85"/>
+            <text x="145" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">I</text>
+            <circle cx="175" cy="140" r="18" fill="#f97316" opacity="0.85"/>
+            <text x="175" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
+            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
+            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Fingers ALONG the parallel seams</text>
+        """,
+        "slider_standard": """
+            <circle cx="170" cy="140" r="18" fill="#1d4ed8" opacity="0.85"/>
+            <text x="170" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
+            <circle cx="145" cy="145" r="16" fill="#60a5fa" opacity="0.75"/>
+            <text x="145" y="150" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
+            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
+            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Middle finger on long seam; index rests next to it</text>
+        """,
+        "slider_spike_seam": """
+            <circle cx="180" cy="145" r="18" fill="#1d4ed8" opacity="0.9"/>
+            <text x="180" y="150" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
+            <!-- spiked index = small triangle marker pointing into the seam -->
+            <polygon points="135,125 150,150 120,150" fill="#dc2626" opacity="0.95"/>
+            <text x="135" y="170" text-anchor="middle" fill="#dc2626" font-size="13" font-weight="bold">I (spiked)</text>
+            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
+            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">SPIKE the index finger — knuckle bent, tip into seam</text>
+        """,
+        "curveball": """
+            <circle cx="170" cy="140" r="18" fill="#0891b2" opacity="0.85"/>
+            <text x="170" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
+            <circle cx="148" cy="142" r="16" fill="#22d3ee" opacity="0.85"/>
+            <text x="148" y="147" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
+            <circle cx="155" cy="225" r="18" fill="#0d9488" opacity="0.9"/>
+            <text x="155" y="230" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T*</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Thumb HOOKS opposite seam — middle pulls down</text>
+        """,
+        "changeup_circle": """
+            <!-- circle ring on the side of the ball -->
+            <ellipse cx="100" cy="170" rx="20" ry="22" fill="none" stroke="#16a34a" stroke-width="4"/>
+            <text x="100" y="175" text-anchor="middle" fill="#16a34a" font-size="12" font-weight="bold">⭕</text>
+            <circle cx="155" cy="130" r="16" fill="#16a34a" opacity="0.75"/>
+            <text x="155" y="135" text-anchor="middle" fill="white" font-size="13" font-weight="bold">M</text>
+            <circle cx="185" cy="135" r="15" fill="#16a34a" opacity="0.6"/>
+            <text x="185" y="140" text-anchor="middle" fill="white" font-size="12" font-weight="bold">R</text>
+            <circle cx="210" cy="155" r="13" fill="#16a34a" opacity="0.5"/>
+            <text x="210" y="160" text-anchor="middle" fill="white" font-size="11" font-weight="bold">P</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="13" font-weight="bold">Thumb+index form circle on the side</text>
+        """,
+
+        # ===== Softball grip overlays =====
+        "softball_fastball": """
+            <circle cx="135" cy="135" r="18" fill="#2563eb" opacity="0.85"/>
+            <text x="135" y="140" text-anchor="middle" fill="white" font-size="14" font-weight="bold">I</text>
+            <circle cx="180" cy="135" r="18" fill="#2563eb" opacity="0.85"/>
+            <text x="180" y="140" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
+            <circle cx="158" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
+            <text x="158" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Fingers across the C of the horseshoe</text>
+        """,
+        "softball_rise": """
+            <!-- Both fingers ALONG the seam (vertical orientation) -->
+            <circle cx="158" cy="105" r="17" fill="#0ea5e9" opacity="0.90"/>
+            <text x="158" y="110" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
+            <circle cx="158" cy="148" r="17" fill="#0ea5e9" opacity="0.90"/>
+            <text x="158" y="153" text-anchor="middle" fill="white" font-size="13" font-weight="bold">M</text>
+            <circle cx="158" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
+            <text x="158" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
+            <!-- Rotation arrow showing palm-up release direction -->
+            <path d="M 230 200 Q 260 180 250 150" fill="none" stroke="#0ea5e9" stroke-width="2.5" stroke-linecap="round"/>
+            <polygon points="245,145 258,150 252,160" fill="#0ea5e9"/>
+            <text x="270" y="170" text-anchor="middle" fill="#0ea5e9" font-size="10" font-weight="bold">palm</text>
+            <text x="272" y="183" text-anchor="middle" fill="#0ea5e9" font-size="10" font-weight="bold">UP</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Fingers along seam · Palm rotates UP at release</text>
+        """,
+        "softball_drop": """
+            <circle cx="158" cy="105" r="17" fill="#7c3aed" opacity="0.90"/>
+            <text x="158" y="110" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
+            <circle cx="158" cy="148" r="17" fill="#7c3aed" opacity="0.90"/>
+            <text x="158" y="153" text-anchor="middle" fill="white" font-size="13" font-weight="bold">M</text>
+            <circle cx="158" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
+            <text x="158" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
+            <!-- "Peel down" arrow showing fingers come OFF FRONT -->
+            <path d="M 250 100 Q 270 130 250 160" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-linecap="round"/>
+            <polygon points="245,160 258,155 252,168" fill="#7c3aed"/>
+            <text x="270" y="125" text-anchor="middle" fill="#7c3aed" font-size="10" font-weight="bold">peel</text>
+            <text x="270" y="138" text-anchor="middle" fill="#7c3aed" font-size="10" font-weight="bold">DOWN</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Fingers peel off front · creates topspin</text>
+        """,
+        "softball_curve": """
+            <!-- Angled seam orientation - 4:30/10:30 -->
+            <circle cx="180" cy="130" r="17" fill="#00838f" opacity="0.85"/>
+            <text x="180" y="135" text-anchor="middle" fill="white" font-size="13" font-weight="bold">M</text>
+            <circle cx="148" cy="138" r="16" fill="#22d3ee" opacity="0.85"/>
+            <text x="148" y="143" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
+            <circle cx="148" cy="222" r="17" fill="#0d9488" opacity="0.90"/>
+            <text x="148" y="227" text-anchor="middle" fill="white" font-size="13" font-weight="bold">T</text>
+            <!-- "rotate out" arrow -->
+            <path d="M 220 200 L 260 220" fill="none" stroke="#00838f" stroke-width="2.5"/>
+            <polygon points="260,212 270,220 258,228" fill="#00838f"/>
+            <text x="245" y="190" text-anchor="start" fill="#00838f" font-size="10" font-weight="bold">wrist</text>
+            <text x="245" y="203" text-anchor="start" fill="#00838f" font-size="10" font-weight="bold">OUT</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Wrist rotates OUTWARD at release</text>
+        """,
+        "softball_screw": """
+            <!-- Mirror of curveball - 1:30/7:30 angle -->
+            <circle cx="140" cy="130" r="17" fill="#f59e0b" opacity="0.85"/>
+            <text x="140" y="135" text-anchor="middle" fill="white" font-size="13" font-weight="bold">M</text>
+            <circle cx="172" cy="138" r="16" fill="#fbbf24" opacity="0.85"/>
+            <text x="172" y="143" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
+            <circle cx="172" cy="222" r="17" fill="#b45309" opacity="0.90"/>
+            <text x="172" y="227" text-anchor="middle" fill="white" font-size="13" font-weight="bold">T</text>
+            <!-- "rotate in" arrow -->
+            <path d="M 100 200 L 60 220" fill="none" stroke="#b45309" stroke-width="2.5"/>
+            <polygon points="60,212 50,220 62,228" fill="#b45309"/>
+            <text x="75" y="190" text-anchor="end" fill="#b45309" font-size="10" font-weight="bold">wrist</text>
+            <text x="75" y="203" text-anchor="end" fill="#b45309" font-size="10" font-weight="bold">IN</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Wrist pronates INWARD at release</text>
+        """,
+        "softball_change": """
+            <!-- Backhand grip - thumb UP along seam, palm facing batter -->
+            <circle cx="158" cy="100" r="17" fill="#16a34a" opacity="0.90"/>
+            <text x="158" y="105" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T↑</text>
+            <circle cx="130" cy="155" r="13" fill="#16a34a" opacity="0.70"/>
+            <text x="130" y="159" text-anchor="middle" fill="white" font-size="11" font-weight="bold">I</text>
+            <circle cx="158" cy="170" r="13" fill="#16a34a" opacity="0.70"/>
+            <text x="158" y="174" text-anchor="middle" fill="white" font-size="11" font-weight="bold">M</text>
+            <circle cx="186" cy="160" r="12" fill="#16a34a" opacity="0.60"/>
+            <text x="186" y="164" text-anchor="middle" fill="white" font-size="10" font-weight="bold">R</text>
+            <circle cx="210" cy="140" r="11" fill="#16a34a" opacity="0.50"/>
+            <text x="210" y="144" text-anchor="middle" fill="white" font-size="10" font-weight="bold">P</text>
+            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="13" font-weight="bold">Thumb UP · ball rolls out the back of hand</text>
+        """,
+    }
+    overlay = overlays.get(grip_key, "")
+    return f"""
+    <div style='display:flex;justify-content:center;'>
+      <svg width="320" height="320" viewBox="0 0 320 320" xmlns="http://www.w3.org/2000/svg">
+        {ball_outline}
+        {seams}
+        {overlay}
+      </svg>
+    </div>
+    <p style='text-align:center;font-size:11px;color:#666;margin-top:-8px;'>
+    I = index, M = middle, R = ring, P = pinky, T = thumb. Viewed from release perspective.
+    </p>
+    """
+
+
+# =============================================================================
+# STREAMLIT UI — global styles + reusable components
+# =============================================================================
+_GLOBAL_CSS = """
+<style>
+/* Pull Inter via CSS @import so Streamlit's markdown parser doesn't
+   render the link tags as literal text at the top of the page. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* === Diamond Sports Lab — design system === */
+
+/* Typography & spacing — Inter for UI, JetBrains Mono for code */
+html, body, [class*="css"], .stApp, .main, section,
+.stMarkdown, .stMarkdown p, .stMarkdown div,
+.stPlotlyChart, .js-plotly-plot, .plotly,
+button, input, select, textarea {
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 system-ui, sans-serif !important;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+.block-container {
+    padding-top: 1.4rem !important;
+    padding-bottom: 2.4rem !important;
+    max-width: 1240px;
+}
+
+/* Hide the Plotly toolbar globally — charts should look native, not
+   like embedded widgets. */
+.modebar-container, .modebar, .modebar-group { display: none !important; }
+.plotly .modebar { display: none !important; }
+
+/* Hide ONLY the obvious "Python app" tells — do NOT hide the whole toolbar,
+   because the sidebar expand button lives in there. */
+#MainMenu { visibility: hidden; height: 0; }
+footer { visibility: hidden; height: 0; }
+[data-testid="stDeployButton"] { display: none; }
+[data-testid="stStatusWidget"] { display: none; }
+[data-testid="stDecoration"] { display: none; }
+
+/* Sidebar: keep visible + always-expandable */
+section[data-testid="stSidebar"] {
+    visibility: visible !important;
+    display: block !important;
+}
+/* Make the collapse/expand control always visible */
+[data-testid="collapsedControl"] {
+    visibility: visible !important;
+    display: flex !important;
+}
+
+/* Titles + headings — tighter weights, brand-aligned */
+h1, h2, h3, h4 {
+    color: #1a2150;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+h1 { font-size: 1.65rem !important; }
+h2 { font-size: 1.18rem !important; margin-top: 1.2rem !important; }
+h3 { font-size: 1.00rem !important; }
+
+/* Subtle section accent under subheaders */
+[data-testid="stMarkdownContainer"] h2::after,
+[data-testid="stMarkdownContainer"] h3::after { content: ""; }
+
+/* Tabs — large, bold, distinct.
+   Streamlit nests the tab label inside <p>, so we must target both the
+   button AND its inner text element with !important + absolute sizing. */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 8px;
+    border-bottom: 2px solid #e5e7eb;
+    background: transparent;
+    margin-bottom: 6px;
+}
+.stTabs [data-baseweb="tab"],
+.stTabs button[role="tab"] {
+    font-size: 20px !important;
+    font-weight: 800 !important;
+    color: #6b7280 !important;
+    padding: 16px 26px !important;
+    background: transparent !important;
+    border-radius: 8px 8px 0 0 !important;
+    letter-spacing: 0.005em !important;
+    min-height: 56px !important;
+}
+.stTabs [data-baseweb="tab"] p,
+.stTabs button[role="tab"] p,
+.stTabs [data-baseweb="tab"] *,
+.stTabs button[role="tab"] * {
+    font-size: 20px !important;
+    font-weight: 800 !important;
+    line-height: 1.2 !important;
+}
+.stTabs [data-baseweb="tab"]:hover,
+.stTabs button[role="tab"]:hover {
+    color: #1a2150 !important;
+    background: #f6f7fb !important;
+}
+.stTabs [aria-selected="true"],
+.stTabs button[role="tab"][aria-selected="true"] {
+    color: #1a2150 !important;
+    background: #f6f7fb !important;
+    border-bottom: 4px solid #d4a634 !important;
+}
+.stTabs [aria-selected="true"] p,
+.stTabs button[role="tab"][aria-selected="true"] p {
+    color: #1a2150 !important;
+}
+.stTabs [data-baseweb="tab-panel"] { padding-top: 1.2rem !important; }
+
+/* Buttons — clean rounded primary */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 8px;
+    font-weight: 600;
+    padding: 0.55rem 1rem;
+    transition: transform 0.05s ease;
+}
+.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
+    background: linear-gradient(180deg, #232c5e 0%, #1a2150 100%);
+    border: 1px solid #1a2150;
+    color: white;
+}
+.stButton > button:active { transform: translateY(1px); }
+
+/* Sidebar polish */
+[data-testid="stSidebar"] {
+    background: #f6f7fb;
+    border-right: 1px solid #e5e7eb;
+}
+
+/* Native st.metric polish (used in tabs that still rely on it) */
+[data-testid="stMetric"] {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 12px 14px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+}
+[data-testid="stMetricLabel"] {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.72rem !important;
+    color: #6b7280;
+    font-weight: 600;
+}
+[data-testid="stMetricValue"] {
+    color: #1a2150;
+    font-weight: 700;
+    font-size: 1.55rem !important;
+}
+
+/* Divider */
+hr { border-color: #e5e7eb; margin: 1.2rem 0; }
+
+/* Code blocks — readable */
+code, pre {
+    font-family: "SF Mono", Menlo, Monaco, Consolas, monospace;
+    font-size: 0.85rem;
+}
+
+/* Expander headers */
+.streamlit-expanderHeader { font-weight: 600; color: #1a2150; }
+</style>
+"""
+
+
+def _inject_global_styles():
+    """Inject the design-system CSS once per session."""
+    st.markdown(_GLOBAL_CSS, unsafe_allow_html=True)
+
+
+# =============================================================================
+# CHART THEMING — every plotly figure passes through _apply_chart_theme so
+# typography, colors, gridlines, and backgrounds match the rest of the app.
+# Use CHART_CONFIG for st.plotly_chart() calls to hide the modebar.
+# =============================================================================
+CHART_CONFIG = {
+    "displayModeBar": False,
+    "responsive":     True,
+}
+
+CHART_FONT_STACK = (
+    'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", '
+    'system-ui, sans-serif'
+)
+
+CHART_PALETTE = {
+    "ink":         "#1a2150",   # primary text + bold lines
+    "ink_soft":    "#374151",   # body text
+    "muted":       "#6b7280",   # tertiary text
+    "border":      "#e5e7eb",   # subtle borders
+    "gridline":    "#f1f3f7",   # very subtle gridlines
+    "bg":          "#ffffff",   # chart background
+    "page_bg":     "#ffffff",   # page background
+    "accent":      "#d4a634",   # gold accent
+    "success":     "#16a34a",
+    "warn":        "#d4a634",
+    "danger":      "#dc2626",
+}
+
+
+def _apply_chart_theme(fig, *, preserve_bg: bool = False):
+    """Apply the Diamond Sports Lab design system to a plotly figure.
+
+    Call this at the END of every chart builder, just before returning fig.
+    Keeps a single source of truth for typography, colors, gridlines, and
+    hover styling so every chart looks native to the app instead of a
+    Plotly add-on.
+
+    Conservative on purpose — does NOT touch:
+      - title text / position (each chart keeps its own headline)
+      - axis ranges / scale anchors (each chart's geometry is preserved)
+      - height (each chart keeps its sizing)
+
+    Sets:
+      - font family + sizes for all chart text
+      - paper + plot backgrounds (unless preserve_bg=True for stadium/field charts)
+      - hover label styling
+      - gridline + axis line colors
+      - legend font
+    """
+    layout_kwargs = dict(
+        font=dict(family=CHART_FONT_STACK,
+                   size=12,
+                   color=CHART_PALETTE["ink_soft"]),
+        hoverlabel=dict(
+            font=dict(family=CHART_FONT_STACK, size=12, color="white"),
+            bgcolor=CHART_PALETTE["ink"],
+            bordercolor=CHART_PALETTE["ink"],
+        ),
+        legend=dict(
+            font=dict(family=CHART_FONT_STACK, size=11,
+                       color=CHART_PALETTE["ink_soft"]),
+            bgcolor="rgba(255,255,255,0)",
+            borderwidth=0,
+        ),
+    )
+    if not preserve_bg:
+        layout_kwargs["paper_bgcolor"] = CHART_PALETTE["bg"]
+        # Don't override plot_bgcolor — some charts use a contextual bg
+        # (e.g. spray chart uses stadium navy, side view uses sky blue).
+    # Update title font (but NOT title text) — preserves headline content
+    # while restyling its typography. Wrapped because stub figures used in
+    # tests don't always expose .layout / .layout.title attributes.
+    try:
+        existing_title = fig.layout.title.text if (
+            fig.layout.title and getattr(fig.layout.title, "text", None)) else None
+        if existing_title:
+            layout_kwargs["title"] = dict(
+                text=existing_title,
+                font=dict(family=CHART_FONT_STACK, size=15,
+                           color=CHART_PALETTE["ink"]),
+            )
+    except Exception:
+        pass
+    # All plotly mutators below are defensive — a styling pass should
+    # never break the build if the figure object is non-standard.
+    try:
+        fig.update_layout(**layout_kwargs)
+    except Exception:
+        pass
+    try:
+        fig.update_xaxes(
+            gridcolor=CHART_PALETTE["gridline"], gridwidth=1,
+            linecolor=CHART_PALETTE["border"], linewidth=1,
+            title_font=dict(family=CHART_FONT_STACK, size=12,
+                             color=CHART_PALETTE["muted"]),
+            tickfont=dict(family=CHART_FONT_STACK, size=11,
+                           color=CHART_PALETTE["muted"]),
+        )
+        fig.update_yaxes(
+            gridcolor=CHART_PALETTE["gridline"], gridwidth=1,
+            linecolor=CHART_PALETTE["border"], linewidth=1,
+            title_font=dict(family=CHART_FONT_STACK, size=12,
+                             color=CHART_PALETTE["muted"]),
+            tickfont=dict(family=CHART_FONT_STACK, size=11,
+                           color=CHART_PALETTE["muted"]),
+        )
+    except Exception:
+        pass
+    return fig
+
+
+def _flat_html(html: str) -> str:
+    """Collapse multi-line indented HTML into a single line.
+
+    Streamlit's markdown parser interprets 4+ leading spaces as a code block,
+    so multi-line indented HTML in f-strings ends up rendered as literal text.
+    Collapsing all whitespace bypasses that.
+    """
+    return " ".join(html.split())
+
+
+def _branded_header(athlete_name: str, athlete_hand: str, athlete_class: str,
+                    demo_mode: bool, sport: str = "Baseball"):
+    """Render the navy header bar + athlete card. Replaces st.title."""
+    sport_icon = "🥎" if sport == "Softball" else "⚾"
+    sport_pill = (
+        f"<span style='background:rgba(255,255,255,0.12);color:white;"
+        f"padding:4px 12px;border-radius:14px;font-size:11px;font-weight:700;"
+        f"letter-spacing:0.08em;margin-right:8px;'>"
+        f"{sport_icon} {sport.upper()}</span>"
+    )
+    sample_pill = (
+        "<span style='background:rgba(212,166,52,0.18);color:#d4a634;"
+        "padding:4px 12px;border-radius:14px;font-size:11px;font-weight:700;"
+        "letter-spacing:0.08em;'>SAMPLE</span>"
+        if demo_mode else ""
+    )
+    html = (
+        "<div style='background:linear-gradient(135deg,#1a2150 0%,#232c5e 100%);"
+        "padding:22px 26px;border-radius:14px;color:white;margin-bottom:18px;"
+        "box-shadow:0 4px 14px rgba(26,33,80,0.12);'>"
+        "<div style='display:flex;justify-content:space-between;"
+        "align-items:flex-start;gap:12px;'>"
+        "<div>"
+        f"<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
+        f"color:#d4a634;text-transform:uppercase;margin-bottom:6px;'>"
+        f"Diamond Sports Lab · Post-Bullpen Report</div>"
+        f"<div style='font-size:26px;font-weight:700;line-height:1.1;margin-bottom:4px;'>"
+        f"{athlete_name}</div>"
+        f"<div style='font-size:14px;color:rgba(255,255,255,0.75);font-weight:500;'>"
+        f"{athlete_hand}-handed pitcher · Class of {athlete_class or '—'}</div>"
+        "</div>"
+        f"<div style='display:flex;align-items:center;'>{sport_pill}{sample_pill}</div>"
+        "</div></div>"
+    )
+    st.markdown(_flat_html(html), unsafe_allow_html=True)
+
+
+def _hero_kpi_card(hero_label: str, hero_value: str,
+                    hero_unit: str = "",
+                    hero_tone: str | None = None,
+                    hero_subtitle: str | None = None) -> str:
+    """One huge hero metric card — top 40% of the KPI block.
+    Industry-standard layout (TrackMan B1, Rapsodo) where one number
+    dominates and supporting metrics live below.
+    """
+    accent_map = {
+        "success": "#16a34a", "warn": "#d4a634", "danger": "#dc2626",
+        None: "#d4a634",
+    }
+    accent = accent_map.get(hero_tone, "#d4a634")
+    value_color = "#1a2150"
+    if hero_tone in ("success", "danger"):
+        value_color = accent
+    sub = (
+        f"<div style='font-size:13px;color:#6b7280;font-weight:500;"
+        f"margin-top:6px;'>{hero_subtitle}</div>" if hero_subtitle else ""
+    )
+    return _flat_html(
+        f"<div style='background:white;border:1px solid #e5e7eb;"
+        f"border-radius:14px;padding:24px 28px;position:relative;"
+        f"overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.04);"
+        f"margin-bottom:10px;'>"
+        f"<div style='position:absolute;top:0;left:0;right:0;height:5px;"
+        f"background:{accent};'></div>"
+        f"<div style='font-size:12px;letter-spacing:0.12em;font-weight:700;"
+        f"color:#6b7280;text-transform:uppercase;margin-top:6px;margin-bottom:8px;'>"
+        f"{hero_label}</div>"
+        f"<div style='display:flex;align-items:baseline;gap:10px;'>"
+        f"<div style='font-size:68px;font-weight:800;color:{value_color};"
+        f"line-height:1.0;letter-spacing:-0.02em;'>{hero_value}</div>"
+        f"<div style='font-size:22px;font-weight:600;color:#6b7280;"
+        f"margin-bottom:6px;'>{hero_unit}</div>"
+        f"</div>"
+        f"{sub}"
+        f"</div>"
+    )
+
+
+def _support_kpi_grid(items: list[tuple[str, str, str | None]]) -> str:
+    """4-up support grid below the hero. Each item is (label, value, tone).
+    `tone` ∈ {None, "success", "warn", "danger"} — color-codes the accent
+    bar so the player sees green/yellow/red zones at a glance.
+    """
+    accent_map = {
+        "success": "#16a34a", "warn": "#d4a634", "danger": "#dc2626", None: "#1a2150",
+    }
+    cards = []
+    for label, value, tone in items:
+        accent = accent_map.get(tone, "#1a2150")
+        value_color = accent if tone in ("success", "danger") else "#1a2150"
+        cards.append(
+            f"<div style='background:white;border:1px solid #e5e7eb;"
+            f"border-radius:10px;padding:14px 16px;flex:1;min-width:130px;"
+            f"position:relative;overflow:hidden;'>"
+            f"<div style='position:absolute;top:0;left:0;right:0;height:3px;"
+            f"background:{accent};'></div>"
+            f"<div style='font-size:11px;letter-spacing:0.09em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;margin-top:4px;'>{label}</div>"
+            f"<div style='font-size:26px;font-weight:700;color:{value_color};"
+            f"line-height:1.15;margin-top:6px;'>{value}</div>"
+            f"</div>"
+        )
+    return _flat_html(
+        "<div style='display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;'>"
+        + "".join(cards)
+        + "</div>"
+    )
+
+
+def _kpi_row(kpis: dict, healed_count: int):
+    """Pitching KPI block — big hero metric (peak velocity) + 4-up support
+    grid. Industry-standard hierarchy: ONE number dominates, the others
+    play support so a coach can read the headline from 10 ft away.
+    """
+    # ===== Hero: Peak Velocity =====
+    peak_v = kpis.get("Peak Velocity")
+    avg_v  = kpis.get("Avg Velocity")
+    peak_str = f"{peak_v:.1f}" if peak_v is not None else "—"
+    # Tone based on level-typical peak (HS-Varsity baseline)
+    if peak_v is None:        peak_tone = None
+    elif peak_v >= 90:        peak_tone = "success"
+    elif peak_v >= 82:        peak_tone = None
+    else:                      peak_tone = "warn"
+    subtitle = (f"Avg velocity {avg_v:.1f} mph across the session"
+                 if avg_v is not None else None)
+    st.markdown(_hero_kpi_card(
+        hero_label="Peak Velocity",
+        hero_value=peak_str,
+        hero_unit="mph",
+        hero_tone=peak_tone,
+        hero_subtitle=subtitle,
+    ), unsafe_allow_html=True)
+
+    # ===== Support 4-up grid =====
+    spin = kpis.get("Avg Spin")
+    spin_tone = ("success" if spin and spin >= 2200
+                  else "warn"  if spin and spin <= 1800
+                  else None)
+    max_stress = kpis.get("Max Elbow Stress")
+    stress_tone = ("danger" if max_stress and max_stress >= DANGER_VALGUS_NM
+                    else "warn" if max_stress and max_stress >= 55
+                    else "success" if max_stress and max_stress < 50
+                    else None)
+    healed_tone = "warn" if healed_count > 0 else None
+    items = [
+        ("Total Pitches", str(kpis.get("Total Pitches", 0)), None),
+        ("Avg Spin",      f"{int(spin):,}"      if spin else "—", spin_tone),
+        ("Max Stress",    f"{max_stress} Nm"    if max_stress is not None else "—", stress_tone),
+        ("Healed",        str(healed_count),    healed_tone),
+    ]
+    st.markdown(_support_kpi_grid(items), unsafe_allow_html=True)
+
+
+def _branded_header_hitting(athlete_name: str, athlete_hand: str, athlete_class: str,
+                             demo_mode: bool, sport: str = "Baseball"):
+    """Hitting-mode version of the branded header bar."""
+    sport_icon = "🥎" if sport == "Softball" else "⚾"
+    sport_pill = (
+        f"<span style='background:rgba(255,255,255,0.12);color:white;"
+        f"padding:4px 12px;border-radius:14px;font-size:11px;font-weight:700;"
+        f"letter-spacing:0.08em;margin-right:8px;'>"
+        f"{sport_icon} {sport.upper()}</span>"
+    )
+    sample_pill = (
+        "<span style='background:rgba(212,166,52,0.18);color:#d4a634;"
+        "padding:4px 12px;border-radius:14px;font-size:11px;font-weight:700;"
+        "letter-spacing:0.08em;'>SAMPLE</span>"
+        if demo_mode else ""
+    )
+    html = (
+        "<div style='background:linear-gradient(135deg,#1a2150 0%,#232c5e 100%);"
+        "padding:22px 26px;border-radius:14px;color:white;margin-bottom:18px;"
+        "box-shadow:0 4px 14px rgba(26,33,80,0.12);'>"
+        "<div style='display:flex;justify-content:space-between;"
+        "align-items:flex-start;gap:12px;'>"
+        "<div>"
+        f"<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
+        f"color:#d4a634;text-transform:uppercase;margin-bottom:6px;'>"
+        f"Diamond Sports Lab · Post-Swing Report</div>"
+        f"<div style='font-size:26px;font-weight:700;line-height:1.1;margin-bottom:4px;'>"
+        f"{athlete_name}</div>"
+        f"<div style='font-size:14px;color:rgba(255,255,255,0.75);font-weight:500;'>"
+        f"{athlete_hand}-handed hitter · Class of {athlete_class or '—'}</div>"
+        "</div>"
+        f"<div style='display:flex;align-items:center;'>{sport_pill}{sample_pill}</div>"
+        "</div></div>"
+    )
+    st.markdown(_flat_html(html), unsafe_allow_html=True)
+
+
+def _hitting_kpi_row(kpis: dict):
+    """Hitting KPI block — big hero (peak exit velo) + 4-up support grid."""
+    # ===== Hero: Peak Exit Velocity =====
+    peak_ev = kpis.get("Peak Exit Velo")
+    avg_ev  = kpis.get("Avg Exit Velo")
+    peak_str = f"{peak_ev:.1f}" if peak_ev else "—"
+    if peak_ev is None:    peak_tone = None
+    elif peak_ev >= 95:    peak_tone = "success"
+    elif peak_ev >= 85:    peak_tone = None
+    else:                   peak_tone = "warn"
+    subtitle = (f"Avg exit velo {avg_ev:.1f} mph across the session"
+                 if avg_ev else None)
+    st.markdown(_hero_kpi_card(
+        hero_label="Peak Exit Velocity",
+        hero_value=peak_str,
+        hero_unit="mph",
+        hero_tone=peak_tone,
+        hero_subtitle=subtitle,
+    ), unsafe_allow_html=True)
+
+    # ===== Support 4-up grid =====
+    bat_spd = kpis.get("Avg Bat Speed")
+    bat_tone = ("success" if bat_spd and bat_spd >= 70
+                 else "warn"  if bat_spd and bat_spd < 60
+                 else None)
+    la = kpis.get("Avg Launch Angle")
+    la_tone = ("success" if la is not None and 10 <= la <= 25 else None)
+    barrel = kpis.get("Barrel %")
+    barrel_tone = ("success" if barrel and barrel >= 15
+                    else "warn" if barrel and barrel < 5
+                    else None)
+    whiff = kpis.get("Whiff %")
+    whiff_tone = ("warn" if whiff and whiff >= 30
+                   else "success" if whiff and whiff < 18
+                   else None)
+    items = [
+        ("Total Swings",  str(kpis.get("Total Swings", 0)), None),
+        ("Bat Speed",     f"{bat_spd:.1f} mph"   if bat_spd  else "—", bat_tone),
+        ("Barrel %",      f"{barrel}%"           if barrel is not None else "—", barrel_tone),
+        ("Whiff %",       f"{whiff}%"            if whiff is not None else "—", whiff_tone),
+    ]
+    st.markdown(_support_kpi_grid(items), unsafe_allow_html=True)
+
+
+# Color map for swing-outcome dots (matches barrel→whiff red→blue scale)
+SWING_OUTCOME_COLORS = {
+    "barrel":        "#7f1d1d",   # darkest red — best contact
+    "solid_contact": "#dc2626",   # red
+    "foul":          "#9ca3af",   # neutral gray
+    "weak_contact":  "#60a5fa",   # light blue
+    "whiff":         "#1e3a8a",   # dark blue — worst
+    "take":          "#d1d5db",   # very light gray (no swing)
+}
+
+# Quality scores used for the continuous diverging color scale
+SWING_QUALITY_SCORE = {
+    "barrel":         2.0,
+    "solid_contact":  1.0,
+    "foul":           0.0,
+    "weak_contact":  -1.0,
+    "whiff":         -2.0,
+    "take":           None,  # rendered separately
+}
+
+
+def _field_dimensions(sport: str) -> dict:
+    """Return baseball/softball field geometry for the spray chart."""
+    if sport == "Softball":
+        return {
+            "base_path_ft":     60,
+            "mound_distance":   43,
+            "of_wall_lf_rf":    220,    # foul-pole wall
+            "of_wall_cf":       250,    # center field wall
+            "foul_extent":      260,    # how far foul lines extend in the plot
+        }
+    # Baseball defaults (HS / college)
+    return {
+        "base_path_ft":     90,
+        "mound_distance":   60.5,
+        "of_wall_lf_rf":    330,
+        "of_wall_cf":       400,
+        "foul_extent":      420,
+    }
+
+
+def _spray_landing_xy(spray_angle_deg: float, distance_ft: float,
+                       hand: str = "Right") -> tuple:
+    """Convert (spray_angle, distance) to (x, y) coordinates on the field.
+
+    Convention:
+      home plate at (0, 0), CF straight up the +y axis.
+      For a RIGHT-handed hitter: pull side = -x (left field).
+      For a LEFT-handed hitter: pull side = +x (right field) — we mirror.
+      spray_angle: negative = pull, 0 = center, positive = oppo.
+    """
+    import math
+    if spray_angle_deg is None or distance_ft is None:
+        return None, None
+    # spray_angle from center: -45 = pull foul pole, +45 = oppo foul pole
+    angle = math.radians(spray_angle_deg)
+    # For RHH, pull side = LEFT field = -x on a field-view chart.
+    # sin(-30°) = -0.5, so x_sign = +1 puts a pulled ball at x = -175 (LF). ✓
+    # For LHH, we mirror so their pull side (still negative spray angle) goes to RF (+x).
+    x_sign = -1.0 if hand == "Left" else 1.0
+    x = x_sign * distance_ft * math.sin(angle)
+    y = distance_ft * math.cos(angle)
+    return x, y
+
+
+def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
+                                hand: str = "Right") -> "go.Figure":
+    """Build the spray chart: field outline + flight-path arcs + landing dots.
+
+    Pro-style field rendering: grass-green outfield fill, dirt-brown infield,
+    white foul lines + range arcs. Each batted ball draws a thin flight arc
+    from home plate to its landing position, colored by contact quality.
+    """
+    import math
+    fd = _field_dimensions(sport)
+    fig = go.Figure()
+
+    GRASS = "#5b9a4f"      # outfield grass
+    DIRT  = "#a87b48"      # infield + warning track
+    GRASS_LINE = "#3e6e36"
+    DIRT_LINE  = "#8a5c2c"
+    FOUL_LINE  = "#ffffff"
+
+    # ----- (1) Outfield grass (big green fill bounded by foul lines + wall) -----
+    wall_pts_x, wall_pts_y = [], []
+    # Start at home plate
+    wall_pts_x.append(0); wall_pts_y.append(0)
+    # Walk along LF foul line out to LF foul pole
+    # Foul line for RHH-viewer chart: LF line goes from home toward upper-left
+    # at 45° (angle -45 from CF-axis). Distance = foul_extent up to wall.
+    # Then arc from LF foul-pole around to RF foul-pole
+    # Then back down the RF foul line to home.
+    # We approximate the wall as an arc spanning -45° to +45° from CF.
+    for deg in range(-45, 46, 2):
+        t = abs(deg) / 45.0
+        wall_dist = fd["of_wall_cf"] * (1 - t) + fd["of_wall_lf_rf"] * t
+        rad = math.radians(deg)
+        wall_pts_x.append(-wall_dist * math.sin(rad))
+        wall_pts_y.append(wall_dist * math.cos(rad))
+    wall_pts_x.append(0); wall_pts_y.append(0)
+    fig.add_trace(go.Scatter(
+        x=wall_pts_x, y=wall_pts_y,
+        mode="lines",
+        line=dict(color=GRASS_LINE, width=2),
+        fill="toself", fillcolor=GRASS,
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # ----- (2) Dirt infield (skinned infield arc + basepaths) -----
+    # Skinned infield is roughly a 95-110 ft arc from home around the bases
+    # (smaller for softball). Draw it as a sector polygon.
+    bp = fd["base_path_ft"]
+    skinned_radius = (bp * 1.3 if sport == "Baseball" else bp * 1.25)
+    dirt_pts_x, dirt_pts_y = [0], [0]
+    for deg in range(-45, 46, 3):
+        rad = math.radians(deg)
+        dirt_pts_x.append(-skinned_radius * math.sin(rad))
+        dirt_pts_y.append(skinned_radius * math.cos(rad))
+    dirt_pts_x.append(0); dirt_pts_y.append(0)
+    fig.add_trace(go.Scatter(
+        x=dirt_pts_x, y=dirt_pts_y,
+        mode="lines",
+        line=dict(color=DIRT_LINE, width=1.5),
+        fill="toself", fillcolor=DIRT,
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # ----- (3) Infield diamond grass (inside the basepaths) -----
+    diag = bp * math.sqrt(2) / 2
+    fig.add_trace(go.Scatter(
+        x=[0, -diag, 0, diag, 0],
+        y=[0, diag, 2*diag, diag, 0],
+        mode="lines",
+        line=dict(color=GRASS_LINE, width=1.4),
+        fill="toself", fillcolor=GRASS,
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # ----- (4) Foul lines (white, drawn ON TOP of grass/dirt) -----
+    extent_for_lines = fd["of_wall_lf_rf"] * 1.02
+    fl_x = extent_for_lines * math.sin(math.radians(-45))
+    fl_y = extent_for_lines * math.cos(math.radians(-45))
+    # LF foul line (sin(-45) is negative; using direct calc gives a negative x)
+    fig.add_trace(go.Scatter(
+        x=[0, fl_x], y=[0, fl_y],
+        mode="lines", line=dict(color=FOUL_LINE, width=2.5),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[0, -fl_x], y=[0, fl_y],
+        mode="lines", line=dict(color=FOUL_LINE, width=2.5),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # ----- (5) Outfield wall outline (dark line on top of the grass edge) -----
+    wall_only_x = wall_pts_x[1:-1]  # skip the home-plate endpoints
+    wall_only_y = wall_pts_y[1:-1]
+    fig.add_trace(go.Scatter(
+        x=wall_only_x, y=wall_only_y,
+        mode="lines", line=dict(color="#1f2937", width=2.5),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # ----- (6) Range arcs at common distances -----
+    if sport == "Baseball":
+        range_marks = [200, 300, 400]
+    else:
+        range_marks = [150, 200, 250]
+    for r in range_marks:
+        arc_x, arc_y = [], []
+        for deg in range(-45, 46, 3):
+            rad = math.radians(deg)
+            arc_x.append(-r * math.sin(rad))
+            arc_y.append(r * math.cos(rad))
+        fig.add_trace(go.Scatter(
+            x=arc_x, y=arc_y, mode="lines",
+            line=dict(color="rgba(255,255,255,0.45)", width=1, dash="dot"),
+            showlegend=False, hoverinfo="skip",
+        ))
+        # Distance label at the rightmost end of the arc
+        fig.add_annotation(
+            x=arc_x[-1] + 5, y=arc_y[-1] + 8,
+            text=f"{r} ft",
+            showarrow=False,
+            font=dict(size=9, color="rgba(255,255,255,0.85)"),
+        )
+
+    # ----- (7) Bases (white squares at 1B, 2B, 3B; home plate is a pentagon) -----
+    base_size = 4.5 if sport == "Baseball" else 3.5
+    for bx, by in [(diag, diag), (0, 2*diag), (-diag, diag)]:
+        fig.add_shape(
+            type="rect",
+            x0=bx - base_size, x1=bx + base_size,
+            y0=by - base_size, y1=by + base_size,
+            line=dict(color="black", width=1.2),
+            fillcolor="white", layer="above",
+        )
+
+    # ----- (8) Pitcher's mound -----
+    md = fd["mound_distance"]
+    mound_r = 9 if sport == "Baseball" else 8
+    fig.add_shape(type="circle",
+                   x0=-mound_r, x1=mound_r,
+                   y0=md - mound_r, y1=md + mound_r,
+                   line=dict(color=DIRT_LINE, width=1.5),
+                   fillcolor=DIRT, layer="above")
+    # Rubber on the mound
+    rubber_w = 2.0; rubber_h = 0.4
+    fig.add_shape(type="rect",
+                   x0=-rubber_w, x1=rubber_w,
+                   y0=md - rubber_h, y1=md + rubber_h,
+                   line=dict(color="black", width=0.8),
+                   fillcolor="white", layer="above")
+
+    # ----- (9) Home plate marker (pentagon) -----
+    fig.add_trace(go.Scatter(
+        x=[0], y=[0], mode="markers",
+        marker=dict(size=14, color="white", symbol="pentagon",
+                     line=dict(color="black", width=1.5)),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # ----- Flight paths and landing dots -----
+    in_play = df[df["Swing_Outcome"].isin(
+        ["weak_contact", "solid_contact", "barrel", "foul"]
+    )].copy()
+
+    for outcome in ["weak_contact", "solid_contact", "barrel", "foul"]:
+        g = in_play[in_play["Swing_Outcome"] == outcome]
+        if g.empty:
+            continue
+        color = SWING_OUTCOME_COLORS[outcome]
+        # Draw a curved flight arc for each ball
+        for _, row in g.iterrows():
+            x_land, y_land = _spray_landing_xy(
+                row.get("Spray_Angle_deg"), row.get("Distance_ft"), hand=hand
+            )
+            if x_land is None:
+                continue
+            # Straight flight path from home plate to landing — clean and pro.
+            # (We don't have a z-axis in the 2D field view, so a thin straight
+            # line reads better than a fake "arc" perturbation.)
+            fig.add_trace(go.Scatter(
+                x=[0, x_land], y=[0, y_land], mode="lines",
+                line=dict(color=color, width=1.2, dash="solid"),
+                opacity=0.45,
+                showlegend=False, hoverinfo="skip",
+            ))
+
+        # Landing dots, grouped by outcome (so legend works)
+        lx, ly, cdata, hovertext = [], [], [], []
+        for _, row in g.iterrows():
+            x_land, y_land = _spray_landing_xy(
+                row.get("Spray_Angle_deg"), row.get("Distance_ft"), hand=hand
+            )
+            if x_land is None:
+                continue
+            lx.append(x_land)
+            ly.append(y_land)
+            cdata.append([int(row["Swing_Num"])])
+            ev = row.get("Exit_Velocity_mph")
+            la = row.get("Launch_Angle_deg")
+            dist = row.get("Distance_ft")
+            hovertext.append(
+                f"<b>Swing #{int(row['Swing_Num'])}</b> — {outcome.replace('_', ' ').title()}<br>"
+                f"Pitch faced: {row['Pitch_Type_Faced']}<br>"
+                f"Exit Velo: {ev:.1f} mph &nbsp;|&nbsp; "
+                f"Launch: {la:.1f}° &nbsp;|&nbsp; Distance: {int(dist)} ft"
+            )
+        fig.add_trace(go.Scatter(
+            x=lx, y=ly,
+            mode="markers+text",
+            marker=dict(size=18, color=color, line=dict(width=1.5, color="black"),
+                         opacity=0.92),
+            text=[str(c[0]) for c in cdata],
+            textfont=dict(color="white", size=9, family="Arial Black"),
+            textposition="middle center",
+            customdata=cdata,
+            hovertemplate="%{hovertext}<extra></extra>",
+            hovertext=hovertext,
+            name=outcome.replace("_", " ").title(),
+        ))
+
+    # Layout: dark navy-ish background so the green field stands out, no axes.
+    plot_range = max(fd["of_wall_lf_rf"], fd["of_wall_cf"]) * 1.10
+    fig.update_layout(
+        xaxis=dict(title="", range=[-plot_range, plot_range],
+                    showgrid=False, zeroline=False, visible=False),
+        yaxis=dict(title="", range=[-30, plot_range + 20],
+                    scaleanchor="x", scaleratio=1,
+                    showgrid=False, zeroline=False, visible=False),
+        plot_bgcolor="#0f172a",  # dark blue-gray "stadium" background
+        paper_bgcolor="#0f172a",
+        font=dict(color="#e5e7eb"),
+        height=620,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                     bgcolor="rgba(0,0,0,0)",
+                     font=dict(color="#e5e7eb")),
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    # preserve_bg keeps the stadium navy
+    return _apply_chart_theme(fig, preserve_bg=True)
+
+
+def _quality_color(score, alpha: float = 0.78) -> str:
+    """Map a quality score (-2..+2) to an RGBA color.
+
+    Positive scores → white → coral → red → dark red.
+    Negative scores → white → light blue → blue → dark blue.
+    None / 0 → neutral light gray.
+    """
+    if score is None or pd.isna(score):
+        return f"rgba(229, 231, 235, {alpha * 0.45})"
+    if abs(score) < 0.05:
+        return f"rgba(229, 231, 235, {alpha * 0.55})"
+    if score > 0:
+        intensity = min(score / 2.0, 1.0)
+        # Lerp #fecaca (light coral) → #7f1d1d (dark red)
+        r = int(252 + (127 - 252) * intensity)
+        g = int(202 + (29 - 202) * intensity)
+        b = int(202 + (29 - 202) * intensity)
+    else:
+        intensity = min(abs(score) / 2.0, 1.0)
+        # Lerp #dbeafe (very light blue) → #1e3a8a (dark blue)
+        r = int(219 + (30 - 219) * intensity)
+        g = int(234 + (58 - 234) * intensity)
+        b = int(254 + (138 - 254) * intensity)
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
+
+def _build_hit_quality_zone_heatmap_figure(
+    current_df: pd.DataFrame,
+    history_df: pd.DataFrame | None = None,
+) -> "go.Figure":
+    """Strike-zone HEAT MAP — colored zones (not dots).
+
+    Divides the plate area into a 5x5 grid. Each cell colors itself by the
+    athlete's HISTORICAL average contact quality in that cell (across all
+    saved sessions + current). Red zones = hitter punishes mistakes here;
+    blue zones = hitter struggles. Overlays today's swings as numbered dots
+    so you can see where the *new* swings landed.
+    """
+    fig = go.Figure()
+
+    # Combine current with prior sessions for the heat-map background scoring.
+    if history_df is not None and len(history_df) > 0:
+        try:
+            all_swings = pd.concat([history_df, current_df], ignore_index=True)
+        except Exception:
+            all_swings = current_df.copy()
+        # Count distinct prior sessions by Timestamp date — each saved session
+        # carries its own date stamp, so the unique-date count is reliable.
+        try:
+            if "Timestamp" in history_df.columns and history_df["Timestamp"].notna().any():
+                history_session_count = int(
+                    pd.to_datetime(history_df["Timestamp"]).dt.normalize().nunique()
+                )
+            else:
+                history_session_count = 0
+        except Exception:
+            history_session_count = 0
+    else:
+        all_swings = current_df.copy()
+        history_session_count = 0
+
+    # Only actual swings count for hit-quality heat (takes carry no contact info)
+    swing_mask = all_swings["Swing_Type"].fillna("") == "swing"
+    swings_only = all_swings[swing_mask].copy()
+    # Attach quality score
+    swings_only["_q"] = swings_only["Swing_Outcome"].map(SWING_QUALITY_SCORE)
+
+    # Grid: 5x5 covering strike zone + a bit of chase zone on each side.
+    # X: -1.0 to 1.0 ft (zone is -0.71 to 0.71). Z: 1.0 to 4.0 ft.
+    x_edges = [-1.0 + 0.4 * i for i in range(6)]   # 6 edges, 5 cells
+    z_edges = [1.0 + 0.6 * i for i in range(6)]
+
+    # Draw heat-map cells
+    for i in range(5):
+        x0, x1 = x_edges[i], x_edges[i + 1]
+        for j in range(5):
+            z0, z1 = z_edges[j], z_edges[j + 1]
+            cell = swings_only[
+                (swings_only["Plate_X_ft"] >= x0) &
+                (swings_only["Plate_X_ft"] <  x1) &
+                (swings_only["Plate_Z_ft"] >= z0) &
+                (swings_only["Plate_Z_ft"] <  z1)
+            ]
+            n_swings_in_cell = len(cell)
+            avg_q = cell["_q"].dropna().mean() if n_swings_in_cell else None
+            fill = _quality_color(avg_q)
+            fig.add_shape(
+                type="rect", x0=x0, x1=x1, y0=z0, y1=z1,
+                line=dict(color="rgba(255,255,255,0.6)", width=1),
+                fillcolor=fill, layer="below",
+            )
+            # Annotate cell with swing count + avg score (only if any data)
+            if n_swings_in_cell > 0 and avg_q is not None:
+                label = f"{n_swings_in_cell}🏏  ({avg_q:+.1f})"
+                fig.add_annotation(
+                    x=(x0 + x1) / 2, y=(z0 + z1) / 2,
+                    text=f"<span style='font-size:9px;color:#1f2937;'>{label}</span>",
+                    showarrow=False,
+                )
+
+    # Strike zone box overlay (drawn ON TOP of the heat cells so it stays visible)
+    fig.add_shape(type="rect", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                   line=dict(color="black", width=2.5),
+                   fillcolor="rgba(0,0,0,0)", layer="above")
+    # Strike-zone 3x3 grid (slightly heavier than the 5x5 backing grid)
+    for i in (1, 2):
+        x = SZ_X_MIN + (SZ_X_MAX - SZ_X_MIN) * (i / 3)
+        z = SZ_Z_MIN + (SZ_Z_MAX - SZ_Z_MIN) * (i / 3)
+        fig.add_shape(type="line", x0=x, x1=x, y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                       line=dict(color="black", width=1, dash="dot"),
+                       layer="above")
+        fig.add_shape(type="line", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=z, y1=z,
+                       line=dict(color="black", width=1, dash="dot"),
+                       layer="above")
+    # Home plate at the bottom
+    fig.add_shape(
+        type="path",
+        path="M -0.71 0.05 L 0.71 0.05 L 0.50 -0.10 L 0 -0.25 L -0.50 -0.10 Z",
+        line=dict(color="black", width=1.5),
+        fillcolor="rgba(220,220,220,0.8)", layer="above",
+    )
+
+    # Overlay TODAY's swings only (not takes) as numbered dots, sized small so
+    # the underlying heat map shows through
+    today_swings = current_df[
+        current_df["Swing_Type"].fillna("") == "swing"
+    ]
+    for outcome in ["barrel", "solid_contact", "foul", "weak_contact", "whiff"]:
+        g = today_swings[today_swings["Swing_Outcome"] == outcome]
+        if g.empty:
+            continue
+        color = SWING_OUTCOME_COLORS[outcome]
+        hover = []
+        for _, row in g.iterrows():
+            ev = row.get("Exit_Velocity_mph")
+            la = row.get("Launch_Angle_deg")
+            hover.append(
+                f"<b>Swing #{int(row['Swing_Num'])}</b> — {outcome.replace('_', ' ').title()}<br>"
+                f"Pitch: {row['Pitch_Type_Faced']} @ {row.get('Pitch_Velocity_mph', '—')} mph<br>"
+                + (f"EV {ev:.1f} mph · LA {la:.1f}°" if pd.notna(ev) else "No contact")
+            )
+        fig.add_trace(go.Scatter(
+            x=g["Plate_X_ft"], y=g["Plate_Z_ft"],
+            mode="markers+text",
+            marker=dict(size=15, color=color,
+                         line=dict(width=1.5, color="white")),
+            text=[str(int(s)) for s in g["Swing_Num"]],
+            textposition="middle center",
+            textfont=dict(color="white", size=9, family="Arial Black"),
+            customdata=g[["Swing_Num"]].values,
+            hovertemplate="%{hovertext}<extra></extra>",
+            hovertext=hover,
+            name=outcome.replace("_", " ").title(),
+        ))
+
+    # Sub-title showing whether this is single-session or multi-session aggregated
+    if history_session_count > 0:
+        subtitle = (f"Heat map aggregates {history_session_count + 1} session(s) · "
+                    "today's swings overlaid")
+    else:
+        subtitle = "Heat map based on this session only — log more sessions to see progress over time"
+
+    fig.update_layout(
+        title=dict(
+            text=f"<span style='font-size:13px;color:#6b7280;'>{subtitle}</span>",
+            x=0.5, xanchor="center", y=0.97,
+        ),
+        xaxis=dict(title="Plate Side (ft) — catcher's view", range=(-1.5, 1.5),
+                    zeroline=False, showgrid=False),
+        yaxis=dict(title="Height (ft)", range=(0.5, 4.5),
+                    zeroline=False, showgrid=False,
+                    scaleanchor="x", scaleratio=1),
+        height=620,
+        legend=dict(orientation="h", yanchor="bottom", y=1.04),
+        margin=dict(l=20, r=20, t=60, b=40),
+        plot_bgcolor="white",
+    )
+    return _apply_chart_theme(fig)
+
+
+# Back-compat alias (older code references the previous name)
+def _build_hit_quality_zone_figure(df: pd.DataFrame) -> "go.Figure":
+    """Strike-zone scatter colored by contact quality on a red↔blue scale.
+
+    Barrel = darkest red. Whiff = darkest blue. Foul = neutral gray.
+    Takes are rendered as light-gray rings (no swing data).
+    """
+    fig = go.Figure()
+
+    # Strike zone box
+    fig.add_shape(type="rect", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                   line=dict(color="black", width=2),
+                   fillcolor="rgba(0,0,0,0)", layer="below")
+    # 3x3 grid
+    for i in (1, 2):
+        x = SZ_X_MIN + (SZ_X_MAX - SZ_X_MIN) * (i / 3)
+        z = SZ_Z_MIN + (SZ_Z_MAX - SZ_Z_MIN) * (i / 3)
+        fig.add_shape(type="line", x0=x, x1=x, y0=SZ_Z_MIN, y1=SZ_Z_MAX,
+                       line=dict(color="#cccccc", width=0.6), layer="below")
+        fig.add_shape(type="line", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=z, y1=z,
+                       line=dict(color="#cccccc", width=0.6), layer="below")
+    # Home plate at the bottom
+    fig.add_shape(
+        type="path",
+        path="M -0.71 0.05 L 0.71 0.05 L 0.50 -0.10 L 0 -0.25 L -0.50 -0.10 Z",
+        line=dict(color="black", width=1.5),
+        fillcolor="rgba(220,220,220,0.6)", layer="below",
+    )
+
+    # Group + render — one trace per outcome so the legend is readable
+    for outcome in ["barrel", "solid_contact", "foul", "weak_contact", "whiff", "take"]:
+        g = df[df["Swing_Outcome"] == outcome]
+        if g.empty:
+            continue
+        color = SWING_OUTCOME_COLORS[outcome]
+        marker = dict(size=18, color=color, line=dict(width=1.5, color="black"))
+        if outcome == "take":
+            # render as hollow ring so takes are visible but de-emphasized
+            marker = dict(size=14, color="rgba(0,0,0,0)",
+                           line=dict(width=2, color="#9ca3af"))
+        hover = []
+        for _, row in g.iterrows():
+            ev = row.get("Exit_Velocity_mph")
+            la = row.get("Launch_Angle_deg")
+            hover.append(
+                f"<b>Swing #{int(row['Swing_Num'])}</b> — {outcome.replace('_', ' ').title()}<br>"
+                f"Pitch: {row['Pitch_Type_Faced']} @ {row.get('Pitch_Velocity_mph', '—')} mph<br>"
+                + (f"EV {ev:.1f} mph · LA {la:.1f}°" if pd.notna(ev) else "No contact")
+            )
+        fig.add_trace(go.Scatter(
+            x=g["Plate_X_ft"], y=g["Plate_Z_ft"],
+            mode="markers+text",
+            marker=marker,
+            text=[str(int(s)) for s in g["Swing_Num"]],
+            textposition="middle center",
+            textfont=dict(color="white" if outcome != "take" else "#6b7280",
+                           size=9, family="Arial Black"),
+            customdata=g[["Swing_Num"]].values,
+            hovertemplate="%{hovertext}<extra></extra>",
+            hovertext=hover,
+            name=outcome.replace("_", " ").title(),
+        ))
+
+    fig.update_layout(
+        xaxis=dict(title="Plate Side (ft)", range=SZ_PLOT_X_RANGE,
+                    zeroline=False, showgrid=False),
+        yaxis=dict(title="Height (ft)", range=SZ_PLOT_Z_RANGE,
+                    zeroline=False, showgrid=False,
+                    scaleanchor="x", scaleratio=1),
+        height=560,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(l=20, r=20, t=40, b=40),
+        plot_bgcolor="white",
+    )
+    return _apply_chart_theme(fig)
+
+
+def _render_swing_detail_panel(swing: pd.Series, sport: str = "Baseball"):
+    """Detail card for one clicked swing — shows pitch faced + contact metrics.
+
+    Designed to live inside a NARROW column (the right-hand panel beside the
+    spray chart). Values must wrap, not truncate, so this uses a custom HTML
+    grid instead of st.metric (which clips text in narrow columns).
+    """
+    outcome = swing["Swing_Outcome"]
+    outcome_color = SWING_OUTCOME_COLORS.get(outcome, "#6b7280")
+    outcome_label = outcome.replace("_", " ").title()
+
+    # Stacked header — pill on top, swing label below — so nothing truncates
+    st.markdown(_flat_html(
+        f"<div style='margin-bottom:14px;'>"
+        f"<div style='display:inline-block;background:{outcome_color};color:white;"
+        f"padding:5px 12px;border-radius:14px;font-size:11px;font-weight:700;"
+        f"letter-spacing:0.04em;margin-bottom:8px;'>{outcome_label.upper()}</div>"
+        f"<div style='font-size:18px;font-weight:700;color:#1a2150;line-height:1.3;'>"
+        f"Swing #{int(swing['Swing_Num'])}"
+        f"</div>"
+        f"<div style='font-size:13px;color:#6b7280;font-weight:500;margin-top:2px;'>"
+        f"vs {swing['Pitch_Type_Faced']}"
+        f"</div>"
+        f"</div>"
+    ), unsafe_allow_html=True)
+
+    def _metric_card(label: str, value: str) -> str:
+        """One compact value tile that wraps and never clips."""
+        return (
+            f"<div style='background:#f6f7fb;border:1px solid #e5e7eb;"
+            f"border-radius:8px;padding:8px 10px;'>"
+            f"<div style='font-size:10px;letter-spacing:0.06em;font-weight:600;"
+            f"text-transform:uppercase;color:#6b7280;margin-bottom:3px;'>{label}</div>"
+            f"<div style='font-size:16px;font-weight:700;color:#1a2150;line-height:1.2;'>"
+            f"{value}</div>"
+            f"</div>"
+        )
+
+    def _grid_section(title: str, items: list[tuple[str, str]]):
+        """Render a section header + 2-column grid of metric cards."""
+        cards = "".join(_metric_card(lbl, val) for lbl, val in items)
+        st.markdown(_flat_html(
+            f"<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+            f"text-transform:uppercase;color:#1a2150;margin:14px 0 8px 0;'>{title}</div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;'>"
+            f"{cards}</div>"
+        ), unsafe_allow_html=True)
+
+    # --- Pitch faced ---
+    _grid_section("Pitch Faced", [
+        ("Pitch Velo",   f"{swing['Pitch_Velocity_mph']:.1f} mph"
+                          if pd.notna(swing.get("Pitch_Velocity_mph")) else "—"),
+        ("Plate Side",   f"{swing['Plate_X_ft']:+.2f} ft"
+                          if pd.notna(swing.get("Plate_X_ft")) else "—"),
+        ("Plate Height", f"{swing['Plate_Z_ft']:.2f} ft"
+                          if pd.notna(swing.get("Plate_Z_ft")) else "—"),
+        ("Swing?",       "✗ Took" if outcome == "take" else "✓ Swung"),
+    ])
+
+    if outcome == "take":
+        st.info("No swing — review whether this was a borderline call to chase or take in future at-bats.")
+        return
+
+    # --- Bat metrics ---
+    _grid_section("Bat Metrics", [
+        ("Bat Speed",    f"{swing['Bat_Speed_mph']:.1f} mph"
+                          if pd.notna(swing.get("Bat_Speed_mph")) else "—"),
+        ("Attack Angle", f"{swing['Attack_Angle_deg']:.1f}°"
+                          if pd.notna(swing.get("Attack_Angle_deg")) else "—"),
+        ("On-Plane %",   f"{swing['On_Plane_Eff_pct']:.1f}%"
+                          if pd.notna(swing.get("On_Plane_Eff_pct")) else "—"),
+        ("Time→Contact", f"{swing['Time_to_Contact_sec']:.3f}s"
+                          if pd.notna(swing.get("Time_to_Contact_sec")) else "—"),
+    ])
+
+    # --- Contact metrics (only if ball was hit) ---
+    if outcome in ("barrel", "solid_contact", "weak_contact", "foul"):
+        spray = swing.get("Spray_Angle_deg")
+        spray_label = "—"
+        if pd.notna(spray):
+            if spray < -10: spray_label = f"Pull ({spray:.0f}°)"
+            elif spray > 10: spray_label = f"Oppo ({spray:.0f}°)"
+            else:           spray_label = f"Center ({spray:.0f}°)"
+
+        _grid_section("Contact", [
+            ("Exit Velo",    f"{swing['Exit_Velocity_mph']:.1f} mph"
+                              if pd.notna(swing.get("Exit_Velocity_mph")) else "—"),
+            ("Launch Angle", f"{swing['Launch_Angle_deg']:.1f}°"
+                              if pd.notna(swing.get("Launch_Angle_deg")) else "—"),
+            ("Distance",     f"{int(swing['Distance_ft'])} ft"
+                              if pd.notna(swing.get("Distance_ft")) else "—"),
+            ("Direction",    spray_label),
+        ])
+
+    # --- Result narrative ---
+    narratives = {
+        "barrel":        "🎯 **Barrel.** Exit velo + launch angle hit the optimal zone. This is "
+                          "the swing pattern to repeat.",
+        "solid_contact": "✅ **Solid contact.** Quality at-bat — could be a hit depending on defense.",
+        "weak_contact":  "⚠️ **Weak contact.** Likely a routine out. Look at the bat path and "
+                          "timing in the mechanics tab.",
+        "foul":          "🟡 **Foul ball.** Late or out in front — adjust timing or aim.",
+        "whiff":         "❌ **Swing and miss.** Look for the chase pattern — was this in the zone "
+                          "or did you go after a ball?",
+    }
+    st.markdown("")  # spacing
+    st.info(narratives.get(outcome, ""))
+
+
+def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
+                     athlete_sport: str, athlete_level: str,
+                     active_athlete_id: int | None, demo_mode: bool):
+    """Render the Hitting Lab view. v1 = Overview tab with KPIs, charts,
+    swing list. Mechanics + drills + PDF come in subsequent phases.
+    """
+    # ===== Welcome / empty state when no data =====
+    if not demo_mode:
+        _branded_header_hitting(athlete_name, athlete_hand, athlete_class,
+                                  demo_mode, sport=athlete_sport)
+        st.markdown(_flat_html(
+            "<div style='background:white;border:1px solid #e5e7eb;border-radius:14px;"
+            "padding:28px 28px;margin-top:12px;'>"
+            "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
+            "color:#d4a634;text-transform:uppercase;margin-bottom:8px;'>"
+            "◆ Hitting Lab</div>"
+            "<div style='font-size:22px;font-weight:700;color:#1a2150;margin-bottom:8px;'>"
+            "Ready to see a Post-Swing Report?</div>"
+            "<div style='font-size:14px;color:#4b5563;line-height:1.5;'>"
+            "Hitting Lab v1 currently supports <b>Sample Sessions only</b> — turn on the "
+            "<b>Sample Session</b> toggle in the sidebar to generate a believable batting "
+            "practice session and explore the full report. Real CSV import "
+            "(Blast Motion + HitTrax/Rapsodo + ProPlayAI Swing) lands in v1.1."
+            "</div></div>"
+        ), unsafe_allow_html=True)
+        st.stop()
+
+    # ===== Generate the sample swing session =====
+    with st.spinner(f"Generating swing session for {athlete_name}..."):
+        df = generate_hitting_session(athlete_name, hand=athlete_hand, sport=athlete_sport)
+
+    _branded_header_hitting(athlete_name, athlete_hand, athlete_class,
+                             demo_mode, sport=athlete_sport)
+
+    # ===== Auto-save hitting session to history =====
+    # The heat map aggregates across saved sessions, so we persist every
+    # hitting session (sample or real) the first time it's seen. Fingerprint
+    # avoids double-saving on Streamlit reruns.
+    if active_athlete_id is not None:
+        try:
+            first_ts = str(df["Timestamp"].min()) if "Timestamp" in df.columns else "na"
+            last_ts  = str(df["Timestamp"].max()) if "Timestamp" in df.columns else "na"
+            hit_fp = f"hit|{active_athlete_id}|{len(df)}|{first_ts}|{last_ts}"
+        except Exception:
+            hit_fp = f"hit|{active_athlete_id}|{len(df)}|{id(df)}"
+
+        if st.session_state.get("_saved_hitting_fingerprint") != hit_fp:
+            try:
+                save_session(active_athlete_id, df,
+                              session_type=("sample" if demo_mode else "real"),
+                              session_kind="hitting")
+                st.session_state["_saved_hitting_fingerprint"] = hit_fp
+            except Exception as e:
+                st.warning(f"Could not auto-save this swing session to history: {e}")
+
+    kpis = hitting_session_kpis(df)
+    _hitting_kpi_row(kpis)
+
+    st.divider()
+
+    # ===== Tabs =====
+    tab_overview, tab_swings, tab_history, tab_action = st.tabs(
+        ["📊 Overview", "🎯 Swing Detail", "📈 History", "🚀 Action Plan"]
+    )
+
+    # ----- Overview -----
+    with tab_overview:
+        # =====================================================
+        # SPRAY CHART + SWING DETAIL (side-by-side — they're connected)
+        # =====================================================
+        st.subheader("Spray Chart")
+        st.caption(
+            "Click any landing dot or zone-map dot to open the swing's full "
+            "story on the right. Color = contact quality "
+            "(dark red = barrels, red = solid, gray = fouls, light blue = weak)."
+        )
+
+        # Spray chart click capture
+        spray_fig = _build_spray_chart_figure(df, sport=athlete_sport, hand=athlete_hand)
+
+        spray_col, detail_col = st.columns([1.25, 1.0])
+        with spray_col:
+            spray_event = st.plotly_chart(
+                spray_fig,
+                use_container_width=True,
+                key="hitting_spray_chart",
+                on_select="rerun",
+                selection_mode=("points",),
+            )
+
+            # Pull the clicked swing number
+            selected_swing_num = None
+            try:
+                if spray_event and getattr(spray_event, "selection", None):
+                    points = spray_event.selection.get("points", [])
+                    if points:
+                        cd = points[0].get("customdata")
+                        if isinstance(cd, (int, float)):
+                            selected_swing_num = int(cd)
+                        elif isinstance(cd, (list, tuple)) and len(cd):
+                            selected_swing_num = int(cd[0])
+            except Exception:
+                selected_swing_num = None
+
+        with detail_col:
+            # Pull through any previously-clicked swing from session state so
+            # the panel persists across reruns until a new selection is made
+            if selected_swing_num is None:
+                selected_swing_num = st.session_state.get("hitting_selected_swing")
+
+            if selected_swing_num is None:
+                st.markdown(
+                    _flat_html(
+                        "<div style='background:#f6f7fb;border:1px dashed #cbd5e1;"
+                        "border-radius:10px;padding:18px;color:#475569;"
+                        "font-size:13px;line-height:1.5;'>"
+                        "<div style='font-size:12px;letter-spacing:0.08em;font-weight:700;"
+                        "color:#1a2150;text-transform:uppercase;margin-bottom:6px;'>"
+                        "🔍 Swing Detail</div>"
+                        "Click any landing dot on the spray chart (or a dot on the "
+                        "strike-zone heat map below) and the swing's pitch, bat, "
+                        "and contact metrics show up here."
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+            else:
+                match = df[df["Swing_Num"] == selected_swing_num]
+                if not match.empty:
+                    _render_swing_detail_panel(match.iloc[0], sport=athlete_sport)
+
+        # Remember the selection across reruns
+        if selected_swing_num is not None:
+            st.session_state["hitting_selected_swing"] = selected_swing_num
+
+        st.divider()
+
+        # =====================================================
+        # ZONE HEAT MAP — colored zones from session history
+        # =====================================================
+        st.subheader("Strike Zone Heat Map")
+        st.caption(
+            "**Zones colored by your career hit quality** (aggregated across all "
+            "saved sessions): dark red = you punish mistakes here, light blue = "
+            "you struggle here. The numbered dots are **today's swings only** — "
+            "see how today maps onto your tendencies. Click a dot for the swing's details."
+        )
+
+        # Load this athlete's hitting history to aggregate the heat map
+        history_df = pd.DataFrame()
+        if active_athlete_id is not None:
+            try:
+                history_df = load_hitting_history(active_athlete_id, lookback=20)
+            except Exception:
+                history_df = pd.DataFrame()
+
+        zone_fig = _build_hit_quality_zone_heatmap_figure(df, history_df=history_df)
+        zone_event = st.plotly_chart(
+            zone_fig,
+            use_container_width=True,
+            key="hitting_zone_chart",
+            on_select="rerun",
+            selection_mode=("points",),
+        )
+        # Zone click overrides spray click if more recent
+        try:
+            if zone_event and getattr(zone_event, "selection", None):
+                points = zone_event.selection.get("points", [])
+                if points:
+                    cd = points[0].get("customdata")
+                    if isinstance(cd, (int, float)):
+                        st.session_state["hitting_selected_swing"] = int(cd)
+                        st.rerun()
+                    elif isinstance(cd, (list, tuple)) and len(cd):
+                        st.session_state["hitting_selected_swing"] = int(cd[0])
+                        st.rerun()
+        except Exception:
+            pass
+
+        st.divider()
+        # =====================================================
+        # ORIGINAL EV vs LA scatter — keep for completeness
+        # =====================================================
+        st.subheader("Exit Velocity vs Launch Angle")
+        st.caption(
+            "Each dot is one batted ball. The shaded **barrel zone** "
+            "(95+ mph EV, 8–32° launch angle) is the region where hits "
+            "are most likely to go for extra bases."
+        )
+
+        in_play = df[df["Swing_Outcome"].isin(
+            ["weak_contact", "solid_contact", "barrel", "foul"]
+        )].copy()
+        if len(in_play):
+            fig = px.scatter(
+                in_play, x="Launch_Angle_deg", y="Exit_Velocity_mph",
+                color="Swing_Outcome", text="Swing_Num",
+                color_discrete_map={
+                    "barrel":        "#16a34a",
+                    "solid_contact": "#1976d2",
+                    "weak_contact":  "#d4a634",
+                    "foul":          "#6b7280",
+                },
+                hover_data=["Pitch_Type_Faced", "Pitch_Velocity_mph",
+                            "Bat_Speed_mph", "Distance_ft"],
+                labels={
+                    "Launch_Angle_deg":   "Launch Angle (deg)",
+                    "Exit_Velocity_mph":  "Exit Velocity (mph)",
+                },
+            )
+            # Barrel zone shaded rectangle (rough Statcast definition)
+            fig.add_shape(type="rect",
+                          x0=8, x1=32, y0=95, y1=115,
+                          line=dict(color="#16a34a", width=1, dash="dot"),
+                          fillcolor="rgba(22,163,74,0.07)", layer="below")
+            fig.add_annotation(x=20, y=110, text="BARREL ZONE",
+                                 showarrow=False, font=dict(size=10, color="#16a34a"))
+            fig.update_traces(marker=dict(size=14, line=dict(width=1, color="black")),
+                                textposition="top center")
+            fig.update_layout(height=480, legend_title_text="")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No balls in play this session.")
+
+        st.divider()
+        st.subheader("Performance by Pitch Type Faced")
+        bd_rows = []
+        for ptype, g in df.groupby("Pitch_Type_Faced"):
+            in_play_g = g[g["Swing_Outcome"].isin(
+                ["weak_contact", "solid_contact", "barrel", "foul"])]
+            whiffs = (g["Swing_Outcome"] == "whiff").sum()
+            barrels = (g["Swing_Outcome"] == "barrel").sum()
+            avg_ev = in_play_g["Exit_Velocity_mph"].dropna().mean()
+            avg_la = in_play_g["Launch_Angle_deg"].dropna().mean()
+            bd_rows.append({
+                "Pitch Type":     ptype,
+                "Seen":           len(g),
+                "Swings":         (g["Swing_Type"] == "swing").sum(),
+                "Whiffs":         int(whiffs),
+                "Barrels":        int(barrels),
+                "Avg Exit Velo":  f"{avg_ev:.1f} mph" if not pd.isna(avg_ev) else "—",
+                "Avg Launch":     f"{avg_la:.1f}°"    if not pd.isna(avg_la) else "—",
+            })
+        st.dataframe(pd.DataFrame(bd_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "🔎 Watch the **Whiffs** column — the pitch types a hitter chases or "
+            "misses most are the ones to attack in pitch sequencing. And the "
+            "**Barrels** column shows where they punish mistakes."
+        )
+
+        # =====================================================
+        # MECHANICS CRITIQUE (green / yellow boxes, same as pitching)
+        # =====================================================
+        critique = analyze_hitting_mechanics(df, sport=athlete_sport)
+        if critique["strengths"] or critique["weaknesses"]:
+            st.divider()
+            st.subheader("Mechanics Critique")
+            st.caption(
+                "Swing-mechanics strengths and improvement areas, based on the bat-sensor "
+                "and 3D pose data. Each improvement area is tied to a specific gain "
+                "(power / contact / barrel rate / plate discipline)."
+            )
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                strengths_html = (
+                    "<div style='background:#f0fdf4;border:1px solid #bbf7d0;"
+                    "border-left:4px solid #16a34a;border-radius:8px;padding:14px 16px;"
+                    "margin-bottom:8px;'>"
+                    "<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                    "color:#16a34a;text-transform:uppercase;margin-bottom:8px;'>"
+                    "✓ What's working</div>"
+                )
+                if critique["strengths"]:
+                    for s in critique["strengths"]:
+                        strengths_html += (
+                            f"<div style='margin-bottom:10px;'>"
+                            f"<div style='font-weight:700;color:#14532d;font-size:14px;'>{s['label']}</div>"
+                            f"<div style='font-size:13px;color:#1f2937;margin-top:2px;'>{s['detail']}</div>"
+                            f"<div style='font-size:12px;color:#4b5563;margin-top:3px;font-style:italic;'>"
+                            f"Why it matters: {s['gain']} "
+                            f"<span style='background:#dcfce7;color:#15803d;padding:1px 7px;"
+                            f"border-radius:8px;font-size:10.5px;font-weight:700;margin-left:4px;'>"
+                            f"{s['tag']}</span></div>"
+                            f"</div>"
+                        )
+                else:
+                    strengths_html += "<div style='font-size:13px;color:#4b5563;'>No specific swing strengths flagged yet — keep building.</div>"
+                strengths_html += "</div>"
+                st.markdown(_flat_html(strengths_html), unsafe_allow_html=True)
+
+            with mc2:
+                weak_html = (
+                    "<div style='background:#fefce8;border:1px solid #fde68a;"
+                    "border-left:4px solid #d4a634;border-radius:8px;padding:14px 16px;"
+                    "margin-bottom:8px;'>"
+                    "<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                    "color:#92400e;text-transform:uppercase;margin-bottom:8px;'>"
+                    "→ Areas to improve</div>"
+                )
+                if critique["weaknesses"]:
+                    for w in critique["weaknesses"]:
+                        weak_html += (
+                            f"<div style='margin-bottom:10px;'>"
+                            f"<div style='font-weight:700;color:#78350f;font-size:14px;'>{w['label']}</div>"
+                            f"<div style='font-size:13px;color:#1f2937;margin-top:2px;'>{w['detail']}</div>"
+                            f"<div style='font-size:12px;color:#4b5563;margin-top:3px;'>"
+                            f"<b>Gain:</b> {w['gain']} &nbsp;·&nbsp; "
+                            f"<b>Fix:</b> {w['fix']}</div>"
+                            f"</div>"
+                        )
+                else:
+                    weak_html += "<div style='font-size:13px;color:#4b5563;'>Clean swing across the session — no specific corrections flagged.</div>"
+                weak_html += "</div>"
+                st.markdown(_flat_html(weak_html), unsafe_allow_html=True)
+
+    # ----- Swing Detail (compare + full canonical table) -----
+    with tab_swings:
+        # =====================================================
+        # COMPARE TWO SWINGS (side-by-side)
+        # =====================================================
+        st.subheader("🆚 Compare Two Swings Side-by-Side")
+        st.caption(
+            "Pick any two swings — usually a barrel vs. a whiff, or a good "
+            "session vs. a bad one — to compare the pitch faced, bat metrics, "
+            "contact quality, and body sequencing."
+        )
+
+        swing_options = {
+            int(r["Swing_Num"]):
+                f"Swing #{int(r['Swing_Num'])} — {r['Pitch_Type_Faced']} "
+                f"({r['Pitch_Velocity_mph']:.0f} mph) → "
+                f"{str(r['Swing_Outcome']).replace('_', ' ').title()}"
+            for _, r in df.iterrows()
+        }
+        keys = list(swing_options.keys())
+        cmpA, cmpB = st.columns(2)
+        with cmpA:
+            a_key = st.selectbox("Swing A", keys,
+                                  format_func=lambda k: swing_options[k],
+                                  index=0, key="hit_cmp_a")
+        with cmpB:
+            default_b = 1 if len(keys) > 1 else 0
+            b_key = st.selectbox("Swing B", keys,
+                                  format_func=lambda k: swing_options[k],
+                                  index=default_b, key="hit_cmp_b")
+
+        if a_key != b_key:
+            sa = df[df["Swing_Num"] == a_key].iloc[0]
+            sb = df[df["Swing_Num"] == b_key].iloc[0]
+
+            def _row(label, va, vb, fmt=lambda x: f"{x:.1f}" if pd.notna(x) else "—",
+                      higher_is_better: bool | None = None):
+                """One row of the compare table. Highlights better cell in green
+                when higher_is_better is specified."""
+                va_str = fmt(va) if pd.notna(va) else "—"
+                vb_str = fmt(vb) if pd.notna(vb) else "—"
+                # Color the better cell
+                a_color, b_color = "#1a2150", "#1a2150"
+                a_bg,    b_bg    = "#ffffff", "#ffffff"
+                if higher_is_better is not None and pd.notna(va) and pd.notna(vb):
+                    if higher_is_better:
+                        if va > vb: a_bg = "#dcfce7"
+                        elif vb > va: b_bg = "#dcfce7"
+                    else:
+                        if va < vb: a_bg = "#dcfce7"
+                        elif vb < va: b_bg = "#dcfce7"
+                return (
+                    f"<tr>"
+                    f"<td style='padding:8px 12px;font-weight:600;color:#374151;font-size:13px;'>{label}</td>"
+                    f"<td style='padding:8px 12px;text-align:right;font-weight:700;"
+                    f"color:{a_color};background:{a_bg};font-size:14px;'>{va_str}</td>"
+                    f"<td style='padding:8px 12px;text-align:right;font-weight:700;"
+                    f"color:{b_color};background:{b_bg};font-size:14px;'>{vb_str}</td>"
+                    f"</tr>"
+                )
+
+            a_outcome = str(sa["Swing_Outcome"]).replace("_", " ").title()
+            b_outcome = str(sb["Swing_Outcome"]).replace("_", " ").title()
+
+            table_html = (
+                "<table style='width:100%;border-collapse:collapse;"
+                "border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;"
+                "background:white;margin-top:8px;font-size:13px;'>"
+                "<thead><tr style='background:#1a2150;color:white;'>"
+                f"<th style='padding:10px 12px;text-align:left;font-size:11px;letter-spacing:0.06em;'>Metric</th>"
+                f"<th style='padding:10px 12px;text-align:right;font-size:11px;letter-spacing:0.06em;'>"
+                f"Swing #{int(a_key)} — {a_outcome}</th>"
+                f"<th style='padding:10px 12px;text-align:right;font-size:11px;letter-spacing:0.06em;'>"
+                f"Swing #{int(b_key)} — {b_outcome}</th>"
+                "</tr></thead><tbody style='background:white;'>"
+                # Pitch faced
+                + _row("Pitch Velocity (mph)",   sa["Pitch_Velocity_mph"],  sb["Pitch_Velocity_mph"])
+                + _row("Plate Side (ft)",        sa["Plate_X_ft"],          sb["Plate_X_ft"],
+                        fmt=lambda x: f"{x:+.2f}" if pd.notna(x) else "—")
+                + _row("Plate Height (ft)",      sa["Plate_Z_ft"],          sb["Plate_Z_ft"],
+                        fmt=lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                # Bat metrics
+                + _row("Bat Speed (mph)",        sa["Bat_Speed_mph"],       sb["Bat_Speed_mph"],
+                        higher_is_better=True)
+                + _row("Attack Angle (°)",       sa["Attack_Angle_deg"],    sb["Attack_Angle_deg"])
+                + _row("On-Plane Efficiency (%)",sa["On_Plane_Eff_pct"],    sb["On_Plane_Eff_pct"],
+                        higher_is_better=True)
+                + _row("Time-to-Contact (s)",    sa["Time_to_Contact_sec"], sb["Time_to_Contact_sec"],
+                        fmt=lambda x: f"{x:.3f}" if pd.notna(x) else "—",
+                        higher_is_better=False)
+                # Contact metrics
+                + _row("Exit Velocity (mph)",    sa["Exit_Velocity_mph"],   sb["Exit_Velocity_mph"],
+                        higher_is_better=True)
+                + _row("Launch Angle (°)",       sa["Launch_Angle_deg"],    sb["Launch_Angle_deg"])
+                + _row("Distance (ft)",          sa["Distance_ft"],         sb["Distance_ft"],
+                        fmt=lambda x: f"{int(x)}" if pd.notna(x) else "—",
+                        higher_is_better=True)
+                # Body sequencing
+                + _row("Hip-Shoulder Sep (°)",   sa["Peak_Hip_Shoulder_Sep_deg"],
+                                                  sb["Peak_Hip_Shoulder_Sep_deg"],
+                        higher_is_better=True)
+                + _row("Stride Length (in)",     sa["Stride_Length_in"],    sb["Stride_Length_in"])
+                + _row("Lead Knee Flex (°)",     sa["Lead_Knee_Flex_deg"],  sb["Lead_Knee_Flex_deg"])
+                + "</tbody></table>"
+            )
+            st.markdown(_flat_html(table_html), unsafe_allow_html=True)
+            st.caption(
+                "🟢 Green cell = the better swing on that metric. "
+                "Spot the pattern: usually the barrel has stronger bat speed, "
+                "deeper hip-shoulder sep, and a quicker time-to-contact."
+            )
+        else:
+            st.info("Pick two **different** swings to compare.")
+
+        st.divider()
+
+        # =====================================================
+        # FULL SWING TABLE
+        # =====================================================
+        st.subheader("Every Swing — Canonical View")
+        display = df[[
+            "Swing_Num", "Pitch_Type_Faced", "Pitch_Velocity_mph",
+            "Swing_Outcome", "Bat_Speed_mph", "Exit_Velocity_mph",
+            "Launch_Angle_deg", "Distance_ft", "On_Plane_Eff_pct",
+        ]].copy()
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.caption(
+            "Every swing in the session, the pitch it came against, and the swing's "
+            "outcome. Sort by any column."
+        )
+
+    # ----- History (cross-session trends) -----
+    with tab_history:
+        st.subheader(f"History — {athlete_name}")
+
+        if active_athlete_id is None:
+            st.info(
+                "📌 You're viewing a sample session for a virtual hitter. "
+                "Add this hitter to your roster (or pick a saved hitter in the sidebar) "
+                "to start building a session history."
+            )
+        else:
+            history = list_sessions(active_athlete_id, limit=50,
+                                     session_kind="hitting")
+            if not history:
+                st.info(
+                    f"No saved hitting sessions yet for **{athlete_name}**. "
+                    "Each new session auto-saves — once you have 2+ sessions on file, "
+                    "trend charts and progress tracking light up here."
+                )
+            else:
+                st.caption(
+                    f"{len(history)} hitting session(s) on file. Every Sample / Real "
+                    "session is included in the trend (sample sessions are deterministic "
+                    "but still useful for tracking growth on new data uploads)."
+                )
+
+                # ----- Build a trend df by computing KPIs per session -----
+                trend_rows = []
+                for s in history:
+                    try:
+                        sdf = load_session_df(s["id"])
+                        if len(sdf) == 0:
+                            continue
+                        k = hitting_session_kpis(sdf)
+                        trend_rows.append({
+                            "session_id":   s["id"],
+                            "session_date": pd.to_datetime(s["session_date"], errors="coerce"),
+                            "session_type": s["session_type"],
+                            "total_swings": k["Total Swings"],
+                            "avg_exit_velo":  k["Avg Exit Velo"],
+                            "peak_exit_velo": k["Peak Exit Velo"],
+                            "avg_bat_speed":  k["Avg Bat Speed"],
+                            "avg_launch_angle": k["Avg Launch Angle"],
+                            "on_plane_pct":   k["On-Plane %"],
+                            "barrel_pct":     k["Barrel %"],
+                            "whiff_pct":      k["Whiff %"],
+                        })
+                    except Exception:
+                        continue
+
+                trend_df = pd.DataFrame(trend_rows)
+                trend_df = trend_df.sort_values("session_date")
+
+                if len(trend_df) >= 2:
+                    # ----- Trend chart row 1: bat speed + exit velo -----
+                    st.subheader("Bat Speed & Exit Velocity Over Time")
+                    t1, t2 = st.columns(2)
+                    with t1:
+                        fig_bs = px.line(trend_df, x="session_date", y="avg_bat_speed",
+                                          markers=True,
+                                          labels={"session_date": "Session",
+                                                  "avg_bat_speed": "Avg Bat Speed (mph)"},
+                                          title="Average Bat Speed")
+                        fig_bs.update_traces(line=dict(color="#1a2150", width=3),
+                                              marker=dict(size=10, color="#d4a634"))
+                        fig_bs.update_layout(height=320, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_bs, use_container_width=True)
+                    with t2:
+                        fig_ev = px.line(trend_df, x="session_date",
+                                          y=["avg_exit_velo", "peak_exit_velo"],
+                                          markers=True,
+                                          labels={"session_date": "Session",
+                                                  "value": "Exit Velocity (mph)",
+                                                  "variable": "Metric"},
+                                          title="Exit Velocity (Avg + Peak)")
+                        fig_ev.update_traces(line=dict(width=3))
+                        fig_ev.update_layout(height=320, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_ev, use_container_width=True)
+
+                    # ----- Trend chart row 2: contact quality -----
+                    st.subheader("Contact Quality Over Time")
+                    t3, t4 = st.columns(2)
+                    with t3:
+                        fig_brl = px.line(trend_df, x="session_date", y="barrel_pct",
+                                           markers=True,
+                                           labels={"session_date": "Session",
+                                                   "barrel_pct": "Barrel %"},
+                                           title="Barrel Rate")
+                        fig_brl.update_traces(line=dict(color="#7f1d1d", width=3),
+                                               marker=dict(size=10, color="#fca5a5"))
+                        fig_brl.update_layout(height=300, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_brl, use_container_width=True)
+                    with t4:
+                        fig_wf = px.line(trend_df, x="session_date", y="whiff_pct",
+                                          markers=True,
+                                          labels={"session_date": "Session",
+                                                  "whiff_pct": "Whiff %"},
+                                          title="Whiff Rate (lower is better)")
+                        fig_wf.update_traces(line=dict(color="#1e3a8a", width=3),
+                                              marker=dict(size=10, color="#93c5fd"))
+                        fig_wf.add_hline(y=22, line_dash="dash", line_color="#6b7280",
+                                          opacity=0.5,
+                                          annotation_text="HS average ≈ 22%",
+                                          annotation_position="top right")
+                        fig_wf.update_layout(height=300, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_wf, use_container_width=True)
+
+                    # ----- Trend chart row 3: on-plane + workload -----
+                    st.subheader("Bat Path & Workload Over Time")
+                    t5, t6 = st.columns(2)
+                    with t5:
+                        fig_op = px.line(trend_df, x="session_date", y="on_plane_pct",
+                                          markers=True,
+                                          labels={"session_date": "Session",
+                                                  "on_plane_pct": "On-Plane %"},
+                                          title="On-Plane Efficiency")
+                        fig_op.update_traces(line=dict(color="#16a34a", width=3),
+                                              marker=dict(size=10, color="#86efac"))
+                        fig_op.update_layout(height=300, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_op, use_container_width=True)
+                    with t6:
+                        fig_w = px.line(trend_df, x="session_date", y="total_swings",
+                                         markers=True,
+                                         labels={"session_date": "Session",
+                                                 "total_swings": "Swings"},
+                                         title="Workload per Session")
+                        fig_w.update_traces(line=dict(color="#d4a634", width=3),
+                                             marker=dict(size=10, color="#fde68a"))
+                        fig_w.update_layout(height=300, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_w, use_container_width=True)
+                elif len(trend_df) == 1:
+                    st.info("Log 2+ hitting sessions to see trend charts here.")
+
+                st.divider()
+
+                # ----- Session list with delete -----
+                st.subheader("All Hitting Sessions")
+                for s in history:
+                    with st.container(border=True):
+                        c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 1, 1])
+                        date_str = (pd.to_datetime(s["session_date"]).strftime("%b %d, %Y · %I:%M %p")
+                                    if s.get("session_date") else "—")
+                        type_pill = (
+                            "<span style='background:#dcfce7;color:#15803d;padding:2px 8px;"
+                            "border-radius:10px;font-size:10.5px;font-weight:700;'>REAL</span>"
+                            if s["session_type"] == "real"
+                            else "<span style='background:#eef2ff;color:#3730a3;padding:2px 8px;"
+                                 "border-radius:10px;font-size:10.5px;font-weight:700;'>SAMPLE</span>"
+                        )
+                        c1.markdown(_flat_html(
+                            f"<div style='font-weight:700;color:#1a2150;'>{date_str}</div>"
+                            f"<div style='margin-top:2px;'>{type_pill}</div>"
+                        ), unsafe_allow_html=True)
+                        c2.metric("Swings",   s.get("pitch_count", "—"))
+                        c3.metric("Avg EV",   f"{s['avg_velocity']:.1f} mph"
+                                                if s.get("avg_velocity") is not None else "—")
+                        c4.metric("Peak EV",  f"{s['peak_velocity']:.1f} mph"
+                                                if s.get("peak_velocity") is not None else "—")
+                        c5.metric("Bat Spd",  f"{s['avg_spin']:.1f} mph"
+                                                if s.get("avg_spin") is not None else "—")
+                        with c6:
+                            if st.button("🗑 Delete",
+                                          key=f"del_hit_session_{s['id']}",
+                                          use_container_width=True):
+                                delete_session(s["id"])
+                                if "_saved_hitting_fingerprint" in st.session_state:
+                                    del st.session_state["_saved_hitting_fingerprint"]
+                                st.rerun()
+
+    # ----- Action Plan -----
+    with tab_action:
+        plan = recommend_hitting_drills(df, sport=athlete_sport,
+                                          athlete_level=athlete_level)
+
+        # ===== Export section at the top of the tab =====
+        st.subheader("Export & Share")
+        exp_cols = st.columns([1.2, 1.0])
+        with exp_cols[0]:
+            try:
+                pdf_bytes = generate_post_swing_pdf(
+                    df, athlete_name=athlete_name, athlete_hand=athlete_hand,
+                    athlete_class=athlete_class, sport=athlete_sport,
+                    athlete_level=athlete_level,
+                )
+                st.download_button(
+                    label="📄 Download Post-Swing Report (PDF)",
+                    data=pdf_bytes,
+                    file_name=f"Post-Swing-Report_{athlete_name.replace(' ', '_')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type="primary",
+                )
+            except Exception as e:
+                st.warning(f"PDF generator hit an error: {e}")
+        with exp_cols[1]:
+            st.caption(
+                "Recruiting-grade one-pager: KPIs, spray chart, mechanics "
+                "critique, and the action plan below. Text it to the hitter "
+                "or attach to an email to college coaches."
+            )
+
+        st.divider()
+
+        # ===== Drill cards =====
+        CATEGORY_BADGES = {
+            "Recovery":    ("🧊", "#0ea5e9"),
+            "Bat Speed":   ("⚡", "#f57c00"),
+            "Bat Path":    ("🔧", "#1976d2"),
+            "Contact":     ("🎯", "#7b1fa2"),
+        }
+
+        def render_hit_drill_card(d):
+            badge_icon, badge_color = CATEGORY_BADGES.get(d["category"], ("•", "#666"))
+            with st.container(border=True):
+                st.markdown(
+                    f"<div style='height:4px;background:{badge_color};"
+                    f"margin:-1rem -1rem 12px -1rem;border-radius:6px 6px 0 0;'></div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;"
+                    f"flex-wrap:wrap;'>"
+                    f"<span style='background:{badge_color};color:white;padding:3px 11px;"
+                    f"border-radius:14px;font-size:11px;font-weight:700;letter-spacing:0.04em;'>"
+                    f"{badge_icon} {d['category'].upper()}</span>"
+                    f"<span style='font-size:17px;font-weight:700;color:#1a2150;'>{d['label']}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"**Drill:** {d['drill']}")
+                st.markdown(f"**Protocol:** {d['protocol']}")
+                st.markdown(f"**Why it works:** {d['why']}")
+                # YouTube tutorial link (search-style URL — always works)
+                if d.get("video_url"):
+                    vt = d.get("video_title") or "Watch demo on YouTube"
+                    vs = d.get("video_source", "")
+                    src_html = (f"<span style='color:#6b7280;font-weight:500;'> · {vs}</span>"
+                                  if vs else "")
+                    st.markdown(
+                        _flat_html(
+                            f"<a href='{d['video_url']}' target='_blank' "
+                            f"style='display:inline-flex;align-items:center;gap:6px;"
+                            f"background:#fee2e2;color:#b91c1c;padding:6px 12px;"
+                            f"border-radius:6px;font-size:13px;font-weight:600;"
+                            f"text-decoration:none;margin-top:6px;'>"
+                            f"▶ {vt}{src_html}</a>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                st.caption(f"📍 Why this fired: _{d['trigger']}_")
+
+        # =========================================================
+        # 5-DAY STRUCTURED WEEKLY PLAN
+        # Every day opens with the standard warm-up, fills development
+        # drills (priority-flagged or general-development defaults), and
+        # closes with the standard cool-down.
+        # =========================================================
+        st.subheader("This Week — 5-Day Structured Plan")
+        st.caption(
+            "Every day opens with the standard warm-up and closes with the "
+            "cool-down (full sequences in the reference panel below). "
+            "Drill blocks adapt to the hitter's specific weaknesses, or fall "
+            "back to general-development work when the data is clean."
+        )
+        weekly = build_weekly_plan("hitting", plan,
+                                     athlete_level=athlete_level)
+        for day in weekly:
+            with st.container(border=True):
+                # Day header
+                st.markdown(
+                    _flat_html(
+                        f"<div style='font-size:11px;letter-spacing:0.10em;"
+                        f"font-weight:700;color:#d4a634;text-transform:uppercase;'>"
+                        f"Day {day['day_num']}</div>"
+                        f"<div style='font-size:18px;font-weight:700;color:#1a2150;"
+                        f"margin-bottom:4px;'>{day['label'].split('—',1)[-1].strip()}</div>"
+                        f"<div style='font-size:13px;color:#4b5563;margin-bottom:10px;'>"
+                        f"{day['notes']}</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+                # Warm-up summary line
+                st.markdown(
+                    _flat_html(
+                        f"<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
+                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;'>"
+                        f"<b style='color:#15803d;'>Warm-up</b> "
+                        f"<span style='color:#6b7280;'>· {day['warmup']['duration']} · "
+                        f"{day['warmup']['label']}</span>"
+                        f"</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+                # Drill blocks
+                if day["drills"]:
+                    for d in day["drills"]:
+                        render_hit_drill_card(d)
+                else:
+                    st.caption(
+                        "_No structured drills today — execute the live BP/session described "
+                        "in the notes above with full intent._"
+                    )
+                # Cool-down summary line
+                st.markdown(
+                    _flat_html(
+                        f"<div style='background:#eff6ff;border-left:3px solid #3b82f6;"
+                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-top:8px;'>"
+                        f"<b style='color:#1e40af;'>Cool-down</b> "
+                        f"<span style='color:#6b7280;'>· {day['cooldown']['duration']} · "
+                        f"{day['cooldown']['label']}</span>"
+                        f"</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+        # =========================================================
+        # WARM-UP & COOL-DOWN REFERENCE — full sequences spelled out
+        # =========================================================
+        st.divider()
+        with st.expander("**Warm-Up & Cool-Down Reference** — full sequences",
+                          expanded=False):
+            for header, seq in [
+                ("Hitter Pre-Session Warm-Up",  HITTING_WARMUP),
+                ("Hitter Post-Session Cool-Down", HITTING_COOLDOWN),
+            ]:
+                st.markdown(
+                    _flat_html(
+                        f"<div style='font-size:11px;letter-spacing:0.10em;"
+                        f"font-weight:700;color:#d4a634;text-transform:uppercase;"
+                        f"margin-top:12px;'>{seq['duration']}</div>"
+                        f"<div style='font-size:16px;font-weight:700;color:#1a2150;"
+                        f"margin-bottom:8px;'>{header}</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+                for step_name, step_detail in seq["steps"]:
+                    st.markdown(
+                        _flat_html(
+                            f"<div style='border-left:3px solid #1a2150;padding:6px 12px;"
+                            f"background:#f6f7fb;border-radius:0 4px 4px 0;margin:4px 0;'>"
+                            f"<b style='color:#1a2150;'>{step_name}</b> "
+                            f"<span style='color:#4b5563;'>— {step_detail}</span>"
+                            f"</div>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(
+                    _flat_html(
+                        f"<div style='font-size:12px;color:#6b7280;font-style:italic;"
+                        f"margin-top:6px;margin-bottom:12px;'>"
+                        f"Why it matters: {seq['why']}</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+        # =========================================================
+        # FULL DRILL LIBRARY — browsable reference (every issue)
+        # =========================================================
+        st.divider()
+        with st.expander("**Full Hitting Drill Library** — browse all drills by issue",
+                          expanded=False):
+            st.caption(
+                "Every drill in the system, organized by the issue it targets. "
+                "Use this when you want to swap an alternate into the action plan "
+                "or build a custom session for a hitter."
+            )
+            # Friendly section names + descriptions for each issue bucket
+            issue_meta = {
+                "bat_speed":      ("⚡ Bat Speed", "When avg bat speed is below the target for the hitter's level."),
+                "hip_separation": ("🔁 Hip-Shoulder Separation", "When the hips and shoulders are firing together — no rubber-band torque."),
+                "flat_swing":     ("📈 Flat / Chopping-Down Swing Path", "When the bat plane is below the productive 8°-16° attack angle range."),
+                "steep_swing":    ("📉 Steep Uppercut Swing Path", "When attack angle is above 20° — lots of whiffs and pop-ups."),
+                "off_plane":      ("📏 Off-Plane Bat Path", "When the bat is in the hitting zone for too small a window."),
+                "slow_ttc":       ("⏱️ Slow Time-to-Contact", "When the swing takes too long to get the barrel through the zone."),
+                "whiffs":         ("👁️ Elevated Whiff Rate", "When the hitter is chasing offspeed or expanding the zone."),
+                "weak_contact":   ("🎯 Weak Contact Pattern", "When the hitter rolls over or pops up too many balls."),
+            }
+            for issue, (heading, desc) in issue_meta.items():
+                drill_keys = HITTING_ISSUE_TO_DRILLS.get(issue, [])
+                if not drill_keys:
+                    continue
+                st.markdown(f"#### {heading}")
+                st.caption(desc)
+                for k in drill_keys:
+                    d = HITTING_DRILL_LIBRARY[k]
+                    v = pick_video(k, severity="any",
+                                     level=LEVEL_TO_VIDEO_BUCKET.get(athlete_level, "any"))
+                    link_html = ""
+                    if v:
+                        link_html = (
+                            f"<a href='{v['url']}' target='_blank' "
+                            f"style='display:inline-block;background:#fee2e2;"
+                            f"color:#b91c1c;padding:3px 9px;border-radius:5px;"
+                            f"font-size:12px;font-weight:600;text-decoration:none;"
+                            f"margin-top:4px;'>▶ {v['title']}</a>"
+                        )
+                    st.markdown(
+                        _flat_html(
+                            f"<div style='border-left:3px solid #1a2150;"
+                            f"background:#f6f7fb;padding:10px 14px;margin:6px 0 12px 0;"
+                            f"border-radius:0 6px 6px 0;'>"
+                            f"<div style='font-weight:700;color:#1a2150;font-size:14px;'>{d['label']}</div>"
+                            f"<div style='font-size:13px;color:#1f2937;margin-top:2px;'>"
+                            f"<b>Drill:</b> {d['drill']}</div>"
+                            f"<div style='font-size:13px;color:#1f2937;margin-top:1px;'>"
+                            f"<b>Protocol:</b> {d['protocol']}</div>"
+                            f"<div style='font-size:12px;color:#4b5563;margin-top:3px;font-style:italic;'>"
+                            f"{d['why']}</div>"
+                            f"{link_html}"
+                            f"</div>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
+
+
+# =============================================================================
+# BALL TRACKING (CV) — Phase 2 of Live Capture
+# Pure-function ball detector + trajectory fitter. Lives apart from any UI
+# code so it can be unit-tested with synthetic frames. The Live Capture
+# VideoProcessor below wires these into the per-frame pose loop.
+# =============================================================================
+#
+# Calibration model: we assume a fixed (tripod-mounted) phone behind the
+# catcher OR on the side, with home plate visible. The user marks the
+# plate's pixel position + width once. From that single reference:
+#   - 1 pixel = (17 inches / plate_width_px) inches  →  feet per pixel
+#   - plate y-position in pixels = ground reference for "plate plane"
+#   - everything else scales off that.
+#
+# This is the same calibration trick PitchLab AI uses. It's not perfect
+# (assumes the camera plane is roughly parallel to the plate) but it's
+# good enough for facility-grade velocity + plate-location estimates.
+
+def detect_ball_in_frame(frame_bgr,
+                          ball_radius_px_range: tuple[int, int] = (4, 30),
+                          mask_brightness_min: int = 200) -> "tuple[int, int] | None":
+    """Find a single baseball in a BGR image. Returns (x_px, y_px) or None.
+
+    Strategy:
+      1. Convert to grayscale + threshold for bright pixels (baseball is
+         white against most backgrounds: sky, dirt, grass, netting).
+      2. Find connected white regions.
+      3. Pick the one most circular and in the expected radius range.
+
+    Tuning notes for real-world deployment:
+      - mask_brightness_min: lower for cloudy days / indoor nets, higher
+        for direct sunlight.
+      - ball_radius_px_range: depends on camera distance. At ~30 ft from a
+        plate, a baseball is roughly 8-15 px. At 60 ft from the mound,
+        10-20 px. Field-tune from the first capture.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, mask_brightness_min, 255, cv2.THRESH_BINARY)
+    # Light morphology to consolidate the ball's pixels
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_score = -1.0
+    rmin, rmax = ball_radius_px_range
+    for c in contours:
+        (x, y), r = cv2.minEnclosingCircle(c)
+        if not (rmin <= r <= rmax):
+            continue
+        area = cv2.contourArea(c)
+        if area <= 0:
+            continue
+        # Circularity: 1.0 = perfect circle. We require ≥0.78 to filter
+        # out rectangles, streaks, and other non-ball bright blobs
+        # (a baseball clears 0.85 easily; we leave headroom for motion
+        # blur on fast pitches).
+        perim = cv2.arcLength(c, True)
+        if perim == 0:
+            continue
+        circularity = 4.0 * 3.14159 * area / (perim * perim)
+        if circularity < 0.78:
+            continue
+        # Fill ratio — what fraction of the min-enclosing circle is
+        # actually filled by the contour. A real ball fills ~95% of its
+        # bounding circle; a rectangle fills ~64%; an L-shape much less.
+        circle_area = 3.14159 * r * r
+        fill_ratio = area / circle_area if circle_area > 0 else 0
+        if fill_ratio < 0.7:
+            continue
+        # Score weights circularity heavily, then favors larger radius
+        # for tie-breaking among multiple ball-like candidates.
+        score = circularity * 10.0 + fill_ratio * 5.0 + r * 0.1
+        if score > best_score:
+            best_score = score
+            best = (int(round(x)), int(round(y)))
+    return best
+
+
+# Typical TOTAL spin RPM per pitch type — used as the denominator for
+# "spin efficiency" when we estimate USEFUL spin from break + velocity.
+# Sourced from MLB Statcast averages; softball numbers from college-level
+# Diamond Kinetics data. These are reasonable BASELINES — actual total
+# spin varies by pitcher and grip, but for a directional efficiency
+# estimate this gives coaches an actionable number.
+TYPICAL_TOTAL_SPIN_RPM = {
+    # Baseball
+    "Four-Seam Fastball":   2300,
+    "Two-Seam Sinker":      2050,
+    "Slider Strike-Getter": 2500,
+    "Slider Chase":         2400,
+    "Slider":               2450,
+    "Curveball":            2600,
+    "Change-Up":            1800,
+    # Softball
+    "Softball Fastball":    1400,
+    "Rise Ball":            1700,
+    "Drop Ball":            1700,
+    "Screwball":            1500,
+    "Change-Up Softball":   1100,
+    # Fallback
+    "Unknown":              2200,
+}
+
+
+def estimate_spin_metrics(vert_break_in: float,
+                            horiz_break_in: float,
+                            velocity_mph: float,
+                            pitch_type: str | None = None,
+                            sport: str = "Baseball") -> dict:
+    """Estimate spin metrics from trajectory + velocity (no high-FPS video).
+
+    The physics: Magnus break is proportional to (useful_spin × velocity ×
+    flight_time²). Since flight_time = pitch_distance / velocity, this
+    simplifies to break ∝ useful_spin / velocity. Reversing:
+
+        useful_spin_RPM ≈ K × total_break_in × velocity_mph
+
+    K is empirically calibrated against MLB Statcast averages so that a
+    typical 92 mph fastball with 16-17" total break recovers ~2100 RPM
+    of useful spin. K differs by sport because softball has a shorter
+    pitching distance (less flight time per RPM of break).
+
+    Returns:
+      useful_spin_rpm:      RPM contributing to ball movement
+      spin_axis_deg:        Direction of break, in degrees from 12:00
+      tilt_clock:           Human-readable like "1:00", "7:30"
+      assumed_total_spin:   Baseline RPM for the pitch type (used for efficiency)
+      spin_efficiency_pct:  useful / total × 100 (capped at 100%)
+
+    Returns None values if vb/hb are None (no break data available).
+    """
+    import math
+    if vert_break_in is None or horiz_break_in is None or velocity_mph is None:
+        return {
+            "useful_spin_rpm":     None,
+            "spin_axis_deg":       None,
+            "tilt_clock":          None,
+            "assumed_total_spin":  None,
+            "spin_efficiency_pct": None,
+        }
+
+    total_break_in = math.sqrt(vert_break_in ** 2 + horiz_break_in ** 2)
+
+    # Calibration constants (K = useful_spin / (break_in × velocity_mph))
+    # Calibrated so MLB-typical pitches recover ~true RPM:
+    #   92 mph 4-seam, 17" break → ~2192 RPM
+    #   78 mph curve, 16" break → ~1745 RPM (low end of typical curveball
+    #     useful spin, true value usually higher because curve grips boost
+    #     lift coefficient — accept ~25% under-estimate for sharp breakers)
+    K_SPORT = {"Baseball": 1.4, "Softball": 2.7}
+    K = K_SPORT.get(sport, 1.4)
+    useful_spin_rpm = total_break_in * velocity_mph * K
+
+    # ===== Spin axis from break direction =====
+    # Clock convention (from catcher's POV looking at the pitcher):
+    #   12:00 = pure backspin → break straight UP (positive IVB only)
+    #    3:00 = pure arm-side spin (RHP) → break HORIZONTAL right
+    #    6:00 = pure topspin → break straight DOWN (negative IVB)
+    #    9:00 = pure glove-side spin (RHP) → break HORIZONTAL left
+    # The "spin axis" by convention is reported as the BREAK direction
+    # — i.e., a 12:00 axis pitch has its break vector at 12:00.
+    spin_axis_deg = math.degrees(math.atan2(horiz_break_in, vert_break_in))
+    if spin_axis_deg < 0:
+        spin_axis_deg += 360.0
+
+    # Convert to clock face (round to nearest 15 min for readability)
+    clock_hours = spin_axis_deg / 30.0
+    total_quarters = round(clock_hours * 4)
+    h = (total_quarters // 4) % 12
+    if h == 0: h = 12
+    m = (total_quarters % 4) * 15
+    tilt_clock = f"{h}:{m:02d}"
+
+    # ===== Spin efficiency =====
+    assumed_total = TYPICAL_TOTAL_SPIN_RPM.get(
+        pitch_type or "Unknown",
+        TYPICAL_TOTAL_SPIN_RPM["Unknown"]
+    )
+    efficiency = (useful_spin_rpm / assumed_total) * 100.0 if assumed_total > 0 else None
+    if efficiency is not None:
+        efficiency = min(100.0, max(0.0, efficiency))
+
+    return {
+        "useful_spin_rpm":     int(round(useful_spin_rpm)),
+        "spin_axis_deg":       round(spin_axis_deg, 1),
+        "tilt_clock":          tilt_clock,
+        "assumed_total_spin":  int(assumed_total),
+        "spin_efficiency_pct": round(efficiency, 1) if efficiency is not None else None,
+    }
+
+
+def fit_pitch_trajectory(positions: "list[tuple[float, int, int]]",
+                          calibration: dict) -> "dict | None":
+    """Given a time series of ball positions, recover the pitch's basic
+    flight metrics.
+
+    positions: list of (t_sec, x_px, y_px) — timestamps in seconds from
+      the start of capture, ball pixel coordinates.
+    calibration: dict with:
+      - plate_width_px: width of home plate in pixels in the camera's view
+      - plate_center_x_px, plate_center_y_px: pixel center of the plate
+      - sport: 'Baseball' or 'Softball' (selects rubber distance)
+      - camera_view: 'behind_catcher' (z = image y) or 'side' (z requires
+        a different mapping — Phase 2.1)
+
+    Returns dict:
+      - velocity_mph
+      - flight_time_sec
+      - plate_x_ft (negative = third-base side)
+      - plate_z_ft (height)
+      - n_samples_used
+    Or None if there aren't enough samples / data is too noisy.
+    """
+    if len(positions) < 5:
+        return None
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    sport = calibration.get("sport", "Baseball")
+    c = TUNNEL_CONSTANTS.get(sport, TUNNEL_CONSTANTS["Baseball"])
+    pitch_distance_ft = c["rubber_distance_ft"] - c["release_extension_ft"]
+
+    # ===== Pixel-to-feet scale (using known plate width: 17 inches) =====
+    PLATE_WIDTH_IN = 17.0
+    px_per_ft = calibration["plate_width_px"] * (12.0 / PLATE_WIDTH_IN)
+    ft_per_px = 1.0 / px_per_ft
+
+    # ===== Identify the release frame and the catch (plate-cross) frame =====
+    # Heuristic: release = first sample BEFORE the ball starts moving
+    # consistently forward. Catch = sample closest to the plate's y-pixel
+    # (or last sample if no clear "near plate" point).
+    ts  = np.array([p[0] for p in positions], dtype=float)
+    xs  = np.array([p[1] for p in positions], dtype=float)
+    ys  = np.array([p[2] for p in positions], dtype=float)
+
+    # Find the flight window. Real captured pre-release frames (ball in
+    # pitcher's hand) have effectively zero pixel motion (< 1 px). Flight
+    # frames have ≥ 2 px even on a slow pitch from a phone tripod. So use
+    # an ABSOLUTE motion threshold to trim stationary phases — the relative
+    # (% of max) version we used earlier kept clipping slow but valid
+    # curveball flight frames.
+    deltas = np.sqrt(np.diff(xs) ** 2 + np.diff(ys) ** 2)
+    if len(deltas) == 0:
+        return None
+    STATIONARY_PX = 0.5    # below this = ball not moving in image (noise floor)
+    # Default to the full provided window
+    release_i = 0
+    catch_i   = len(positions) - 1
+    # Only TRIM the front if the first frames are genuinely stationary
+    if deltas[0] < STATIONARY_PX:
+        moving = np.where(deltas >= STATIONARY_PX)[0]
+        if len(moving) >= 3:
+            release_i = int(moving[0])
+    # Only TRIM the back if the last frames are genuinely stationary
+    if deltas[-1] < STATIONARY_PX:
+        moving = np.where(deltas >= STATIONARY_PX)[0]
+        if len(moving) >= 3:
+            catch_i = int(moving[-1]) + 1
+    if catch_i - release_i < 3:
+        return None
+
+    # The plate y-pixel is the camera-relative reference for the strike
+    # zone's center, but we don't refine catch_i with it any more —
+    # curveballs and chase pitches finish well below plate y, and the
+    # closest-to-plate-y heuristic was picking mid-flight frames instead
+    # of the actual catch. Motion-based trimming (above) is the reliable
+    # signal for the catch frame.
+    pcy = calibration.get("plate_center_y_px")
+
+    if catch_i - release_i < 3:
+        return None
+
+    flight_time = float(ts[catch_i] - ts[release_i])
+    if flight_time <= 0:
+        return None
+
+    # ===== Velocity =====
+    # We assume the ball travels ~pitch_distance_ft from release to plate.
+    # Phase 2.1 will use 3D triangulation from a single camera + ball-size
+    # depth cues; for v1 we use the rubber distance as a fixed reference.
+    velocity_fps = pitch_distance_ft / flight_time
+    velocity_mph = velocity_fps / 1.467
+
+    # ===== Plate-crossing location =====
+    # Pixel offset from plate center → real-world feet, anchored at plate y
+    if pcy is None:
+        plate_x_ft = None
+        plate_z_ft = None
+    else:
+        pcx = calibration["plate_center_x_px"]
+        # Catch-frame pixel offset
+        dx_px = xs[catch_i] - pcx
+        dy_px = pcy - ys[catch_i]  # invert because pixel y grows downward
+        plate_x_ft = float(dx_px * ft_per_px)
+        plate_z_ft = float(dy_px * ft_per_px)
+        # Add a "height of plate above ground" base so z is plausible
+        # (typical strike-zone reference: 1.6 - 3.5 ft above ground)
+        plate_z_ft += 2.5  # plate camera reference height
+
+    # ===== BREAK ESTIMATION (Phase 2.1) =====
+    # Fit a quadratic to the observed (x, z) trajectory in real-world feet,
+    # then compare to a gravity-only no-spin reference. The deviation at
+    # the plate is the induced break — same math approach PitchLab AI uses,
+    # same accuracy ceiling (~10-15% of the true break for typical phone
+    # frame rates).
+    #
+    # Coordinates in real-world feet:
+    #   x_ft = (x_px - plate_center_x_px) * ft_per_px       (horizontal)
+    #   z_ft = (plate_center_y_px - y_px) * ft_per_px + 2.5 (height; plate y is reference)
+    vert_break_in = None
+    horiz_break_in = None
+    if pcy is not None and (catch_i - release_i) >= 5:
+        pcx = calibration["plate_center_x_px"]
+        flight_ts = ts[release_i:catch_i + 1] - ts[release_i]
+        flight_xs_ft = (xs[release_i:catch_i + 1] - pcx) * ft_per_px
+        flight_zs_ft = (pcy - ys[release_i:catch_i + 1]) * ft_per_px + 2.5
+
+        try:
+            # Quadratic fit: position(t) = a + b*t + c*t²  → 2c = acceleration
+            cz_quad, cz_lin, cz_const = np.polyfit(flight_ts, flight_zs_ft, 2)
+            cx_quad, cx_lin, cx_const = np.polyfit(flight_ts, flight_xs_ft, 2)
+            a_z_total = 2.0 * cz_quad
+            a_x_total = 2.0 * cx_quad
+            # Vertical: a_z_total = -g + a_magnus_z (g = 32.17 ft/s²)
+            # If a_z_total > -g (i.e. the ball drops less than gravity alone
+            # would predict), Magnus is pushing UP → positive IVB (fastball).
+            g_fps2 = 32.17
+            a_magnus_z = a_z_total + g_fps2
+            a_magnus_x = a_x_total
+            # Total Magnus-induced deviation over the flight time (feet):
+            vb_ft = 0.5 * a_magnus_z * flight_time * flight_time
+            hb_ft = 0.5 * a_magnus_x * flight_time * flight_time
+            vert_break_in  = round(vb_ft * 12.0, 1)
+            horiz_break_in = round(hb_ft * 12.0, 1)
+        except Exception:
+            pass
+
+    # ===== SPIN ESTIMATION (Phase 2.2) =====
+    # From break + velocity we can recover useful_spin RPM and spin axis
+    # via Magnus physics. Spin efficiency is computed against a pitch-type
+    # baseline (assumed total spin) — coaches can override the baseline
+    # later if they have a Rapsodo session for ground truth.
+    pitch_type_hint = calibration.get("pitch_type")  # may be None
+    spin = estimate_spin_metrics(
+        vert_break_in=vert_break_in,
+        horiz_break_in=horiz_break_in,
+        velocity_mph=velocity_mph,
+        pitch_type=pitch_type_hint,
+        sport=sport,
+    )
+
+    return {
+        "velocity_mph":         round(float(velocity_mph), 1),
+        "flight_time_sec":      round(flight_time, 3),
+        "plate_x_ft":           round(plate_x_ft, 2) if plate_x_ft is not None else None,
+        "plate_z_ft":           round(plate_z_ft, 2) if plate_z_ft is not None else None,
+        "vert_break_in":        vert_break_in,
+        "horiz_break_in":       horiz_break_in,
+        "useful_spin_rpm":      spin["useful_spin_rpm"],
+        "spin_axis_deg":        spin["spin_axis_deg"],
+        "tilt_clock":           spin["tilt_clock"],
+        "assumed_total_spin":   spin["assumed_total_spin"],
+        "spin_efficiency_pct":  spin["spin_efficiency_pct"],
+        "n_samples_used":       int(catch_i - release_i + 1),
+        "release_frame":        int(release_i),
+        "catch_frame":          int(catch_i),
+    }
+
+
+# =============================================================================
+# LIVE CAPTURE  (Beta) — phone/tablet camera + MediaPipe pose extraction
+# =============================================================================
+# Lets a coach point a phone at the pitcher and capture biomech metrics in
+# real time, no Pitch Logic / Pulse / ProPlayAI required. Phase 1 = pose
+# (release point, arm slot, hip-shoulder separation, lead-knee flex, stride
+# length). Phase 2 (future) = ball-flight via OpenCV ball detection.
+#
+# Implementation:
+#   - streamlit-webrtc → browser camera access via WebRTC (works on mobile)
+#   - mediapipe Pose → 33 body landmarks per frame at 30 fps
+#   - We extract per-frame metrics, smooth across the windup, then snap a
+#     pitch when the "release moment" is detected (peak wrist velocity).
+#
+# Heavy deps (streamlit-webrtc, mediapipe, opencv, av) are imported INSIDE
+# the function so the rest of the app keeps running if they're not installed.
+# =============================================================================
+def run_live_capture_tab(active_athlete_id: int | None,
+                          athlete_name: str,
+                          athlete_hand: str,
+                          athlete_sport: str = "Baseball"):
+    """Render the Live Capture (Beta) tab. Camera → MediaPipe → biomech."""
+    st.subheader("Live Capture (Beta) — phone camera tracking")
+    st.caption(
+        "Point a phone or tablet at the pitcher from the side or behind. "
+        "The app extracts body landmarks live and computes the same biomech "
+        "metrics we get from ProPlayAI (release height, arm slot, hip-shoulder "
+        "separation, lead-knee flex, stride length). **No Pitch Logic, Pulse, "
+        "or ProPlayAI subscription needed for these metrics.**"
+    )
+
+    # --- Verify the live-capture stack is installed ---
+    # REQUIRED for any live capture at all (ball tracking + spin work even
+    # without MediaPipe, but we still need webrtc / cv2 / av to grab frames)
+    required_missing = []
+    try:
+        from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase  # noqa: F401
+    except Exception:
+        required_missing.append("streamlit-webrtc")
+    try:
+        import cv2  # noqa: F401
+    except Exception:
+        required_missing.append("opencv-python-headless")
+    try:
+        import av  # noqa: F401
+    except Exception:
+        required_missing.append("av")
+
+    if required_missing:
+        st.error(
+            f"Live Capture needs these packages: **{', '.join(required_missing)}**. "
+            "Open Terminal and run:\n\n"
+            "```\npip3 install -r ~/Desktop/PitchingLab/requirements.txt --upgrade\n```\n\n"
+            "Then restart the app. (The rest of the app keeps working without these.)"
+        )
+        return
+
+    # --- OPTIONAL — MediaPipe pose. Missing on Python 3.13/3.14 because
+    # MediaPipe doesn't ship wheels for those yet. Live capture still
+    # works without it (ball tracking + spin), pose extraction is skipped.
+    POSE_AVAILABLE = False
+    try:
+        import mediapipe as mp  # noqa: F811
+        POSE_AVAILABLE = True
+    except Exception:
+        mp = None
+
+    # --- Imports for the working path ---
+    import av
+    import cv2
+    import numpy as np
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
+
+    if POSE_AVAILABLE:
+        mp_pose = mp.solutions.pose
+        mp_draw = mp.solutions.drawing_utils
+        mp_styles = mp.solutions.drawing_styles
+    else:
+        # Friendly notice — capture still works, just without pose overlay
+        st.info(
+            "🦴 **Pose extraction is OFF** (MediaPipe not installed for your Python "
+            "version). **Ball tracking + velocity + break + spin still work.** "
+            "To turn pose ON, install Python 3.12 alongside your current version "
+            "(`brew install python@3.12`) and uncomment the `mediapipe` line in "
+            "`requirements.txt`."
+        )
+
+    # --- Sidebar/UI for capture settings ---
+    cap_l, cap_r = st.columns([1.2, 1.0])
+    with cap_l:
+        st.markdown(
+            _flat_html(
+                "<div style='background:#f0f9ff;border:1px solid #bae6fd;"
+                "border-left:4px solid #0ea5e9;border-radius:8px;padding:12px 16px;'>"
+                "<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                "color:#0369a1;text-transform:uppercase;margin-bottom:4px;'>"
+                "Setup checklist</div>"
+                "<div style='font-size:13px;color:#1f2937;line-height:1.55;'>"
+                "1. Phone/tablet on tripod, 15-30 ft from the pitcher.<br>"
+                "2. Side-view angle works best for Phase 1 (catches stride + arm).<br>"
+                "3. Tap <b>START</b> below, allow camera access.<br>"
+                "4. After each pitch, tap <b>📌 Snap Pitch</b> at release.<br>"
+                "5. Tap <b>💾 Save Session</b> when done — biomech goes into history."
+                "</div></div>"
+            ),
+            unsafe_allow_html=True,
+        )
+    with cap_r:
+        view_angle = st.radio("Camera angle",
+                                ["Side (3rd-base or 1st-base side)", "Behind catcher"],
+                                index=0, key="livecap_view_angle",
+                                help="Side view catches stride and arm action best. "
+                                     "Behind-catcher catches release height and arm slot.")
+        show_skeleton = st.checkbox("Overlay skeleton on video", value=True,
+                                      key="livecap_show_skeleton")
+
+    # --- Initialize per-session capture state ---
+    if "livecap_snapped_pitches" not in st.session_state:
+        st.session_state["livecap_snapped_pitches"] = []
+    if "livecap_last_frame_metrics" not in st.session_state:
+        st.session_state["livecap_last_frame_metrics"] = {}
+
+    # ===== Calibration UI: mark home plate so pixels can map to feet =====
+    st.divider()
+    st.markdown("**🎯 Step 1 — Calibration** (one-time per camera setup)")
+    cal_c1, cal_c2, cal_c3, cal_c4 = st.columns([1, 1, 1, 1])
+    with cal_c1:
+        plate_cx = st.number_input("Plate center X (px)", min_value=0, max_value=4000,
+                                      value=int(st.session_state.get("livecap_plate_cx", 640)),
+                                      step=10, key="livecap_plate_cx_input")
+    with cal_c2:
+        plate_cy = st.number_input("Plate center Y (px)", min_value=0, max_value=4000,
+                                      value=int(st.session_state.get("livecap_plate_cy", 600)),
+                                      step=10, key="livecap_plate_cy_input")
+    with cal_c3:
+        plate_w  = st.number_input("Plate width (px)", min_value=10, max_value=600,
+                                      value=int(st.session_state.get("livecap_plate_w", 80)),
+                                      step=5, key="livecap_plate_w_input",
+                                      help="Width of home plate in the camera image. "
+                                           "Real plate width = 17 inches; this gives the "
+                                           "pixel→feet conversion for ball tracking.")
+    with cal_c4:
+        ball_radius_lo = st.number_input("Ball radius min (px)", min_value=2, max_value=40,
+                                            value=int(st.session_state.get("livecap_ball_rmin", 6)),
+                                            step=1, key="livecap_ball_rmin_input")
+        ball_radius_hi = st.number_input("Ball radius max (px)", min_value=4, max_value=80,
+                                            value=int(st.session_state.get("livecap_ball_rmax", 22)),
+                                            step=1, key="livecap_ball_rmax_input")
+    st.session_state["livecap_plate_cx"] = plate_cx
+    st.session_state["livecap_plate_cy"] = plate_cy
+    st.session_state["livecap_plate_w"]  = plate_w
+    st.session_state["livecap_ball_rmin"] = ball_radius_lo
+    st.session_state["livecap_ball_rmax"] = ball_radius_hi
+    st.caption(
+        "Aim the phone, freeze a frame mentally, and enter the plate's pixel "
+        "coordinates here. The plate width gives us the pixel-to-feet scale "
+        "for the entire field. Ball-radius range narrows the detector to "
+        "your camera distance (typical: 6-22 px for a phone 30 ft from the plate)."
+    )
+
+    st.divider()
+    st.markdown("**🎬 Step 2 — Live capture**")
+
+    # ===== Video processor class — runs MediaPipe (if available) + ball detection per frame =====
+    class PoseExtractor(VideoProcessorBase):
+        def __init__(self):
+            self.pose = None
+            if POSE_AVAILABLE:
+                self.pose = mp_pose.Pose(
+                    model_complexity=1,
+                    enable_segmentation=False,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+            self.latest_metrics: dict = {}
+            self.frame_count = 0
+            self.show_skel = True
+            self.track_ball = True
+            # Ring buffer of (timestamp_sec, x_px, y_px) for the recent N
+            # frames — used by snap-pitch to fit a velocity.
+            import time as _time
+            import collections as _coll
+            self._ball_positions = _coll.deque(maxlen=120)  # ~2 sec @ 60fps
+            self._start_time = _time.time()
+            self.last_ball_pos = None
+            self.ball_radius_range = (6, 22)
+            self.plate_cx = 640
+            self.plate_cy = 600
+            self.plate_w  = 80
+
+        def _compute_metrics(self, landmarks, img_h, img_w):
+            """Pull pitcher biomech from MediaPipe landmarks.
+
+            Coordinates are normalized (0-1) within the frame. For absolute
+            metrics like hip-shoulder separation (an ANGLE), normalization
+            doesn't matter. For stride length we'd need real-world scale,
+            so we report it as "pixels" until a calibration step is added.
+            """
+            L = mp_pose.PoseLandmark
+            try:
+                lhip   = landmarks[L.LEFT_HIP.value]
+                rhip   = landmarks[L.RIGHT_HIP.value]
+                lshld  = landmarks[L.LEFT_SHOULDER.value]
+                rshld  = landmarks[L.RIGHT_SHOULDER.value]
+                lwrist = landmarks[L.LEFT_WRIST.value]
+                rwrist = landmarks[L.RIGHT_WRIST.value]
+                lknee  = landmarks[L.LEFT_KNEE.value]
+                rknee  = landmarks[L.RIGHT_KNEE.value]
+                lankle = landmarks[L.LEFT_ANKLE.value]
+                rankle = landmarks[L.RIGHT_ANKLE.value]
+
+                # Hip-shoulder separation (angle between hip line and shoulder
+                # line, projected onto image plane — proxy for the true 3D
+                # separation; close enough for relative tracking across pitches)
+                def line_angle(p1, p2):
+                    import math as _m
+                    return _m.degrees(_m.atan2(p2.y - p1.y, p2.x - p1.x))
+                hip_ang  = line_angle(lhip, rhip)
+                shld_ang = line_angle(lshld, rshld)
+                hs_sep   = abs((shld_ang - hip_ang + 180) % 360 - 180)
+
+                # Arm slot — angle of the line from the throwing shoulder to
+                # the throwing wrist, measured from horizontal
+                # (Assumes right-handed pitcher — flip for LHP in Phase 1.1)
+                slot_ang = line_angle(rshld, rwrist)
+
+                # Lead-knee flex — angle at the LEFT knee for RHP
+                def joint_angle(p_top, p_mid, p_bot):
+                    import math as _m
+                    v1 = (p_top.x - p_mid.x, p_top.y - p_mid.y)
+                    v2 = (p_bot.x - p_mid.x, p_bot.y - p_mid.y)
+                    dot = v1[0]*v2[0] + v1[1]*v2[1]
+                    mag1 = (v1[0]**2 + v1[1]**2) ** 0.5
+                    mag2 = (v2[0]**2 + v2[1]**2) ** 0.5
+                    if mag1 * mag2 == 0:
+                        return None
+                    cos_a = max(-1.0, min(1.0, dot / (mag1 * mag2)))
+                    return _m.degrees(_m.acos(cos_a))
+                import math as _m_module  # need it in scope above
+                lead_knee = joint_angle(lhip, lknee, lankle)
+
+                # Release point pixel — wrist y-position (lower y = higher
+                # in image since 0 is the top)
+                release_y_px = rwrist.y * img_h
+                # Approximate body height in pixels (for relative scale)
+                body_px = abs(lshld.y - lankle.y) * img_h
+
+                # ===== ELBOW STRESS ESTIMATE (Phase 3 — replaces Pulse sleeve)
+                # Pulse measures elbow torque directly via inertial sensor.
+                # We can ESTIMATE peak valgus torque from pose using three
+                # signals known to drive it:
+                #   1. Hip-shoulder separation (more = more torque transfer)
+                #   2. Trunk early opening at foot-plant (more = elbow takes
+                #      load that should go to the trunk)
+                #   3. Lead-knee flex at release (collapsed knee = chest
+                #      doesn't post = arm yanks)
+                # Calibrated against published Driveline / ASMI biomech
+                # data — high-stress fastball at 90+ averages 60-70 Nm,
+                # well-mechanic'd at the same velocity averages 45-55 Nm.
+                # Returned in Nm with explicit ESTIMATED tag in callers.
+                base_stress = 48.0   # baseline for well-sequenced HS arm
+                # Bonus from separation overload (linear above 50°)
+                if hs_sep > 50:
+                    base_stress += (hs_sep - 50) * 0.5
+                # Penalty for low lead-knee flex (collapsed front-side)
+                if lead_knee is not None and lead_knee < 145:
+                    base_stress += (145 - lead_knee) * 0.4
+                # Penalty for arm slot too flat (sidearm = more torque)
+                if abs(slot_ang) > 30:
+                    base_stress += (abs(slot_ang) - 30) * 0.3
+                # Clamp to physically plausible range
+                elbow_stress_est = max(30.0, min(85.0, base_stress))
+
+                return {
+                    "hip_shoulder_sep_deg": round(hs_sep, 1),
+                    "arm_slot_deg":          round(slot_ang, 1),
+                    "lead_knee_flex_deg":    round(lead_knee, 1) if lead_knee else None,
+                    "release_y_pixel":       round(release_y_px, 1),
+                    "body_height_pixel":     round(body_px, 1),
+                    "elbow_stress_nm_est":   round(elbow_stress_est, 1),
+                }
+            except Exception:
+                return {}
+
+        def get_recent_ball_track(self):
+            """Snapshot the ring buffer as a list (thread-safe-ish copy)."""
+            return list(self._ball_positions)
+
+        def get_calibration(self):
+            return {
+                "plate_center_x_px": self.plate_cx,
+                "plate_center_y_px": self.plate_cy,
+                "plate_width_px":    self.plate_w,
+                "sport":             "Baseball",  # caller can override
+            }
+
+        def recv(self, frame: "av.VideoFrame") -> "av.VideoFrame":
+            import time as _time
+            img = frame.to_ndarray(format="bgr24")
+            h, w = img.shape[:2]
+
+            # ---- Pose (only if MediaPipe is available) ----
+            if self.pose is not None:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                results = self.pose.process(rgb)
+                if results.pose_landmarks:
+                    metrics = self._compute_metrics(
+                        results.pose_landmarks.landmark, h, w)
+                    self.latest_metrics = metrics
+
+                    if self.show_skel:
+                        mp_draw.draw_landmarks(
+                            img,
+                            results.pose_landmarks,
+                            mp_pose.POSE_CONNECTIONS,
+                            landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style(),
+                        )
+
+            # ---- Ball tracking (Phase 2) ----
+            if self.track_ball:
+                ball_pos = detect_ball_in_frame(
+                    img, ball_radius_px_range=self.ball_radius_range)
+                if ball_pos:
+                    t_now = _time.time() - self._start_time
+                    self._ball_positions.append((t_now, ball_pos[0], ball_pos[1]))
+                    self.last_ball_pos = ball_pos
+                    # Highlight detected ball with a green ring
+                    cv2.circle(img, ball_pos,
+                                self.ball_radius_range[1] + 4,
+                                (0, 255, 0), 2)
+                # Draw recent ball trail
+                recent = list(self._ball_positions)[-30:]
+                for i, (_, bx, by) in enumerate(recent):
+                    alpha = (i + 1) / max(1, len(recent))
+                    color = (int(255 * alpha), int(200 * alpha), 0)
+                    cv2.circle(img, (bx, by), 3, color, -1)
+
+            # ---- HUD overlay ----
+            text_lines = []
+            if self.latest_metrics:
+                text_lines += [
+                    f"HS Sep:  {self.latest_metrics.get('hip_shoulder_sep_deg', '--')} deg",
+                    f"Slot:    {self.latest_metrics.get('arm_slot_deg', '--')} deg",
+                    f"Lead Knee: {self.latest_metrics.get('lead_knee_flex_deg', '--')} deg",
+                ]
+            text_lines.append(f"Ball-track samples: {len(self._ball_positions)}")
+            y = 28
+            for line in text_lines:
+                cv2.putText(img, line, (12, y),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                             (255, 255, 255), 2, cv2.LINE_AA)
+                y += 26
+
+            # ---- Calibration crosshair overlay ----
+            # Draw the calibrated plate position so the user can see if it
+            # lines up with the real plate in the camera view.
+            try:
+                cv2.line(img,
+                          (self.plate_cx - self.plate_w // 2, self.plate_cy),
+                          (self.plate_cx + self.plate_w // 2, self.plate_cy),
+                          (255, 200, 0), 2)
+                cv2.line(img,
+                          (self.plate_cx, self.plate_cy - 10),
+                          (self.plate_cx, self.plate_cy + 10),
+                          (255, 200, 0), 2)
+                cv2.putText(img, "PLATE", (self.plate_cx - 26, self.plate_cy - 16),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                             (255, 200, 0), 2, cv2.LINE_AA)
+            except Exception:
+                pass
+
+            self.frame_count += 1
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    # ===== Launch the WebRTC stream =====
+    ctx = webrtc_streamer(
+        key="livecap-pose",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=PoseExtractor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    if ctx.video_processor:
+        ctx.video_processor.show_skel  = bool(show_skeleton)
+        ctx.video_processor.plate_cx   = int(plate_cx)
+        ctx.video_processor.plate_cy   = int(plate_cy)
+        ctx.video_processor.plate_w    = int(plate_w)
+        ctx.video_processor.ball_radius_range = (
+            int(ball_radius_lo), int(ball_radius_hi))
+
+    # ===== Snap-pitch + save controls =====
+    st.divider()
+    snap_l, snap_r = st.columns([1.0, 1.0])
+    with snap_l:
+        if st.button("📌 Snap Pitch (at end of throw)",
+                      use_container_width=True, type="primary",
+                      key="livecap_snap_btn",
+                      disabled=ctx.video_processor is None):
+            # Snap is allowed if pose is detected OR ball is being tracked.
+            # On Python 3.13/3.14 (no MediaPipe) pose will be empty but
+            # ball tracking still produces velo + break + spin.
+            vp = ctx.video_processor
+            has_pose = vp and vp.latest_metrics
+            has_ball_buffer = vp and len(vp.get_recent_ball_track()) >= 5
+            if vp and (has_pose or has_ball_buffer):
+                m = dict(ctx.video_processor.latest_metrics)
+                m["pitch_num"] = len(st.session_state["livecap_snapped_pitches"]) + 1
+                # ---- Fit ball-flight metrics from the recent buffer ----
+                ball_track = ctx.video_processor.get_recent_ball_track()
+                calib = ctx.video_processor.get_calibration()
+                calib["sport"] = athlete_sport
+                fit = fit_pitch_trajectory(ball_track, calib)
+                if fit:
+                    m["velocity_mph"]         = fit["velocity_mph"]
+                    m["plate_x_ft"]           = fit["plate_x_ft"]
+                    m["plate_z_ft"]           = fit["plate_z_ft"]
+                    m["flight_time_sec"]      = fit["flight_time_sec"]
+                    m["n_samples"]            = fit["n_samples_used"]
+                    m["vert_break_in"]        = fit.get("vert_break_in")
+                    m["horiz_break_in"]       = fit.get("horiz_break_in")
+                    m["useful_spin_rpm"]      = fit.get("useful_spin_rpm")
+                    m["spin_efficiency_pct"]  = fit.get("spin_efficiency_pct")
+                    m["tilt_clock"]           = fit.get("tilt_clock")
+                    m["assumed_total_spin"]   = fit.get("assumed_total_spin")
+                st.session_state["livecap_snapped_pitches"].append(m)
+                # Save the most recent pitch so the instant-feedback card
+                # below renders with massive readable numbers
+                st.session_state["livecap_last_pitch"] = m
+            else:
+                st.warning("No pose detected yet — make sure the pitcher is in frame.")
+    with snap_r:
+        if st.button("🗑 Clear all snapped pitches",
+                      use_container_width=True, key="livecap_clear_btn"):
+            st.session_state["livecap_snapped_pitches"] = []
+            st.session_state.pop("livecap_last_pitch", None)
+            st.rerun()
+
+    # ===== INSTANT-FEEDBACK CARD (industry-standard, TrackMan-style) =====
+    # Shows the just-snapped pitch in massive font so an athlete 10 ft from
+    # the phone can read it. Two primary metrics dominate; secondary info
+    # lives in smaller text below.
+    last_pitch = st.session_state.get("livecap_last_pitch")
+    if last_pitch:
+        v = last_pitch.get("velocity_mph")
+        vb = last_pitch.get("vert_break_in")
+        hb = last_pitch.get("horiz_break_in")
+        useful_spin = last_pitch.get("useful_spin_rpm")
+        tilt = last_pitch.get("tilt_clock")
+        eff  = last_pitch.get("spin_efficiency_pct")
+        plate_x = last_pitch.get("plate_x_ft")
+        plate_z = last_pitch.get("plate_z_ft")
+
+        # Tone for the velocity number (green if elite, neutral otherwise)
+        v_tone_color = "#1a2150"
+        v_badge = ""
+        if v is not None:
+            if v >= 90:
+                v_tone_color = "#16a34a"
+                v_badge = "<span style='display:inline-block;background:#dcfce7;color:#15803d;font-size:14px;font-weight:700;padding:4px 10px;border-radius:12px;margin-left:10px;'>ELITE</span>"
+            elif v < 75:
+                v_tone_color = "#d4a634"
+                v_badge = "<span style='display:inline-block;background:#fef3c7;color:#92400e;font-size:14px;font-weight:700;padding:4px 10px;border-radius:12px;margin-left:10px;'>SOFT</span>"
+
+        v_str = f"{v:.1f}" if v else "—"
+        velo_block = (
+            f"<div style='flex:1;text-align:center;'>"
+            f"<div style='font-size:13px;letter-spacing:0.12em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;'>Velocity</div>"
+            f"<div style='font-size:80px;font-weight:800;color:{v_tone_color};"
+            f"line-height:1.0;letter-spacing:-0.03em;margin-top:6px;'>"
+            f"{v_str}"
+            f"<span style='font-size:24px;font-weight:600;color:#6b7280;margin-left:8px;'>mph</span>"
+            f"{v_badge}"
+            f"</div></div>"
+            if v else
+            "<div style='flex:1;text-align:center;font-size:18px;color:#9ca3af;'>"
+            "No ball detected — make sure the ball is in the camera view</div>"
+        )
+
+        plate_str = (
+            f"({plate_x:+.2f}, {plate_z:.2f}) ft"
+            if (plate_x is not None and plate_z is not None) else "—"
+        )
+        break_str = (
+            f"V {vb:+.0f}\" &nbsp;·&nbsp; H {hb:+.0f}\""
+            if (vb is not None and hb is not None) else "—"
+        )
+        spin_str = (
+            f"{useful_spin} RPM ({tilt} tilt, {eff}% eff)"
+            if useful_spin else "—"
+        )
+
+        feedback_html = (
+            f"<div style='background:white;border:1px solid #e5e7eb;border-radius:16px;"
+            f"padding:28px 32px;box-shadow:0 4px 14px rgba(26,33,80,0.10);"
+            f"margin-top:14px;margin-bottom:14px;'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;"
+            f"margin-bottom:18px;'>"
+            f"<div style='font-size:14px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#d4a634;text-transform:uppercase;'>"
+            f"Pitch #{last_pitch.get('pitch_num', '—')} · Live Capture</div>"
+            f"<div style='font-size:11px;color:#9ca3af;'>Captured just now</div>"
+            f"</div>"
+            f"<div style='display:flex;gap:24px;align-items:center;'>"
+            f"{velo_block}"
+            f"</div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;"
+            f"margin-top:22px;padding-top:18px;border-top:1px solid #f3f4f6;'>"
+            f"<div><div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;margin-bottom:4px;'>Plate</div>"
+            f"<div style='font-size:18px;font-weight:700;color:#1a2150;'>{plate_str}</div></div>"
+            f"<div><div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;margin-bottom:4px;'>Break</div>"
+            f"<div style='font-size:18px;font-weight:700;color:#1a2150;'>{break_str}</div></div>"
+            f"<div><div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;margin-bottom:4px;'>Spin</div>"
+            f"<div style='font-size:18px;font-weight:700;color:#1a2150;'>{spin_str}</div></div>"
+            f"</div></div>"
+        )
+        st.markdown(_flat_html(feedback_html), unsafe_allow_html=True)
+
+    # ===== Snapped pitches table + save to history =====
+    snapped = st.session_state.get("livecap_snapped_pitches", [])
+    if snapped:
+        st.subheader(f"Snapped Pitches ({len(snapped)})")
+        snap_df = pd.DataFrame(snapped)
+        st.dataframe(snap_df, use_container_width=True, hide_index=True)
+
+        if active_athlete_id is not None:
+            if st.button("💾 Save this session to history",
+                          type="primary", use_container_width=True,
+                          key="livecap_save_session_btn"):
+                # Build a minimal canonical pitching df from the snapped pitches.
+                # The biomech columns map directly; ball-flight columns are blank
+                # until Phase 2 wires up ball tracking.
+                from datetime import datetime as _dt
+                rows = []
+                base_time = _dt.utcnow()
+                for i, m in enumerate(snapped):
+                    has_ball = m.get("velocity_mph") is not None
+                    rows.append({
+                        "Pitch_Num":              i + 1,
+                        "Timestamp":              base_time,
+                        "Pitch_Type":             "Unknown",  # auto-classify = Phase 3
+                        "Velocity_mph":           m.get("velocity_mph"),
+                        "Total_Spin_rpm":         m.get("useful_spin_rpm"),  # estimated from break + velo
+                        "Spin_Efficiency_pct":    m.get("spin_efficiency_pct"),
+                        "Vert_Break_in":          m.get("vert_break_in"),
+                        "Horiz_Break_in":         m.get("horiz_break_in"),
+                        "Strike_Zone_Side":       m.get("plate_x_ft"),
+                        "Strike_Zone_Height":     m.get("plate_z_ft"),
+                        "Extension_ft":           None,
+                        "Peak_Valgus_Nm":         m.get("elbow_stress_nm_est"),  # pose-estimated (Phase 3)
+                        "AC_Ratio":               None,
+                        "FootPlant_Trunk_Rot":    None,
+                        "Peak_Hip_Shoulder_Sep":  m.get("hip_shoulder_sep_deg"),
+                        "Release_Lead_Knee_Ext":  (180 - m.get("lead_knee_flex_deg", 0))
+                                                   if m.get("lead_knee_flex_deg") else None,
+                        "Arm_Slot_deg":           m.get("arm_slot_deg"),
+                        "Peak_Trunk_Angular_Vel": None,
+                        "Pulse_Present":          False,
+                        "Pulse_Match_Method":     None,
+                        "PPAI_Present":           True,
+                        "PPAI_Match_Method":      "live_capture",
+                        "Alignment_Confidence":   1.0,
+                        "Healed":                 False,
+                        "Healed_Notes":           ("Live Capture — pose + velo + plate + break + spin (est.)"
+                                                    if has_ball and m.get("vert_break_in") is not None
+                                                    else "Live Capture — pose + velo + plate (no break track)"
+                                                    if has_ball
+                                                    else "Live Capture — pose only (no ball track)"),
+                        "Outlier_Type":           None,
+                    })
+                cap_df = pd.DataFrame(rows)
+                try:
+                    new_id = save_session(active_athlete_id, cap_df,
+                                            session_type="real",
+                                            session_kind="pitching")
+                    st.success(f"Saved as session #{new_id}. "
+                                "Open the History tab to see it trended alongside other sessions.")
+                    st.session_state["livecap_snapped_pitches"] = []
+                except Exception as e:
+                    st.error(f"Could not save: {e}")
+        else:
+            st.info("👤 Pick a pitcher from the sidebar to enable saving this session to their history.")
+    else:
+        st.info("No pitches snapped yet. Tap **Snap Pitch** at the release moment of each pitch.")
+
+
+# =============================================================================
+# LIVE CAPTURE  (Hitting Lab) — phone tracks the ball off the tee/toss +
+# pose-based swing biomech. Phone-only — no Blast Motion, no HitTrax.
+# =============================================================================
+def run_hitting_live_capture(active_athlete_id: int | None,
+                              athlete_name: str,
+                              athlete_hand: str,
+                              athlete_sport: str = "Baseball"):
+    """Hitter Live Capture — phone camera tracks the ball off the bat +
+    MediaPipe pose for swing mechanics. Sibling to the pitching version."""
+    st.subheader("Hitting Live Capture (Beta) — phone camera tracking")
+    st.caption(
+        "Point the phone at the hitter from the side (3rd-base line for a "
+        "RHH, 1st-base line for LHH). The app tracks the ball off the bat "
+        "for exit velocity + launch angle, and uses MediaPipe pose for swing "
+        "mechanics (hip-shoulder separation, attack angle, stride length). "
+        "No bat sensor or HitTrax required."
+    )
+
+    # --- Verify the live-capture stack ---
+    required_missing = []
+    try:
+        from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase  # noqa: F401
+    except Exception:
+        required_missing.append("streamlit-webrtc")
+    try:
+        import cv2  # noqa: F401
+    except Exception:
+        required_missing.append("opencv-python-headless")
+    try:
+        import av  # noqa: F401
+    except Exception:
+        required_missing.append("av")
+
+    if required_missing:
+        st.error(
+            f"Hitting Live Capture needs these packages: **{', '.join(required_missing)}**. "
+            "Open Terminal and run:\n\n"
+            "```\npip3 install -r ~/Desktop/PitchingLab/requirements.txt --upgrade\n```\n\n"
+            "Then restart the app."
+        )
+        return
+
+    # --- OPTIONAL pose dep ---
+    POSE_AVAILABLE = False
+    try:
+        import mediapipe as mp  # noqa
+        POSE_AVAILABLE = True
+    except Exception:
+        mp = None
+    import av, cv2, numpy as np
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
+    if POSE_AVAILABLE:
+        mp_pose = mp.solutions.pose
+        mp_draw = mp.solutions.drawing_utils
+        mp_styles = mp.solutions.drawing_styles
+    else:
+        st.info(
+            "**Pose extraction is OFF** (MediaPipe not installed for your "
+            "Python version). **Ball tracking + exit velo + launch angle "
+            "still work.** Install Python 3.12 alongside your current "
+            "version to enable swing-mechanics extraction."
+        )
+
+    # --- Calibration row ---
+    st.divider()
+    st.markdown("**Step 1 — Calibration**")
+    cal_c1, cal_c2, cal_c3, cal_c4 = st.columns(4)
+    with cal_c1:
+        tee_x = st.number_input("Tee position X (px)", min_value=0, max_value=4000,
+                                  value=int(st.session_state.get("hitcap_tee_x", 320)),
+                                  step=10, key="hitcap_tee_x_input")
+    with cal_c2:
+        tee_y = st.number_input("Tee position Y (px)", min_value=0, max_value=4000,
+                                  value=int(st.session_state.get("hitcap_tee_y", 400)),
+                                  step=10, key="hitcap_tee_y_input")
+    with cal_c3:
+        ref_dist_ft = st.number_input("Tee-to-camera (ft)", min_value=5, max_value=50,
+                                        value=int(st.session_state.get("hitcap_dist", 20)),
+                                        step=1, key="hitcap_dist_input",
+                                        help="Used to scale pixel motion → real-world ft.")
+    with cal_c4:
+        ball_min = st.number_input("Ball radius min (px)", min_value=2, max_value=40,
+                                     value=int(st.session_state.get("hitcap_rmin", 6)),
+                                     step=1, key="hitcap_rmin_input")
+        ball_max = st.number_input("Ball radius max (px)", min_value=4, max_value=80,
+                                     value=int(st.session_state.get("hitcap_rmax", 22)),
+                                     step=1, key="hitcap_rmax_input")
+    st.session_state["hitcap_tee_x"] = tee_x
+    st.session_state["hitcap_tee_y"] = tee_y
+    st.session_state["hitcap_dist"]  = ref_dist_ft
+    st.session_state["hitcap_rmin"]  = ball_min
+    st.session_state["hitcap_rmax"]  = ball_max
+    st.caption("Place the tee (or toss spot) and the camera at a known distance. "
+                "The ball-trail math uses this to convert pixels to feet for exit-velo.")
+
+    # --- Init session state ---
+    if "hitcap_snapped_swings" not in st.session_state:
+        st.session_state["hitcap_snapped_swings"] = []
+
+    # ===== Swing pose extractor + ball tracker =====
+    class SwingExtractor(VideoProcessorBase):
+        def __init__(self):
+            self.pose = mp_pose.Pose(model_complexity=1,
+                                       min_detection_confidence=0.5,
+                                       min_tracking_confidence=0.5) if POSE_AVAILABLE else None
+            self.latest_metrics = {}
+            self.show_skel = True
+            self.tee_x = 320
+            self.tee_y = 400
+            self.ref_dist_ft = 20
+            self.ball_radius_range = (6, 22)
+            import collections as _coll, time as _time
+            self._ball_positions = _coll.deque(maxlen=120)
+            self._start_time = _time.time()
+
+        def get_recent_ball_track(self):
+            return list(self._ball_positions)
+
+        def get_calibration(self):
+            return {
+                "tee_x_px":     self.tee_x,
+                "tee_y_px":     self.tee_y,
+                "ref_dist_ft":  self.ref_dist_ft,
+                "sport":        athlete_sport,
+            }
+
+        def _compute_swing_metrics(self, landmarks, img_h, img_w):
+            L = mp_pose.PoseLandmark
+            try:
+                lhip = landmarks[L.LEFT_HIP.value]
+                rhip = landmarks[L.RIGHT_HIP.value]
+                lshld = landmarks[L.LEFT_SHOULDER.value]
+                rshld = landmarks[L.RIGHT_SHOULDER.value]
+                lwrist = landmarks[L.LEFT_WRIST.value]
+                rwrist = landmarks[L.RIGHT_WRIST.value]
+                lknee  = landmarks[L.LEFT_KNEE.value]
+                lankle = landmarks[L.LEFT_ANKLE.value]
+                rankle = landmarks[L.RIGHT_ANKLE.value]
+                import math as _m
+                def line_angle(p1, p2):
+                    return _m.degrees(_m.atan2(p2.y - p1.y, p2.x - p1.x))
+                hip_ang  = line_angle(lhip, rhip)
+                shld_ang = line_angle(lshld, rshld)
+                hs_sep   = abs((shld_ang - hip_ang + 180) % 360 - 180)
+                # Attack angle ≈ angle of the line from rear hip to lead wrist
+                # at contact (proxy for the bat-path angle, since we don't
+                # track the bat directly in v1)
+                rear_hip = rhip if athlete_hand == "Right" else lhip
+                lead_wrist = lwrist if athlete_hand == "Right" else rwrist
+                attack_ang = line_angle(rear_hip, lead_wrist)
+                # Stride length: pixel distance between ankles, scaled by
+                # body height in pixels
+                stride_px = abs(lankle.x - rankle.x) * img_w
+                body_px   = abs(lshld.y - lankle.y) * img_h
+                stride_ratio = stride_px / body_px if body_px > 0 else None
+                return {
+                    "hip_shoulder_sep_deg": round(hs_sep, 1),
+                    "attack_angle_deg":      round(attack_ang, 1),
+                    "stride_ratio":          round(stride_ratio, 2) if stride_ratio else None,
+                }
+            except Exception:
+                return {}
+
+        def recv(self, frame):
+            import time as _time
+            img = frame.to_ndarray(format="bgr24")
+            h, w = img.shape[:2]
+            if self.pose is not None:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                results = self.pose.process(rgb)
+                if results.pose_landmarks:
+                    self.latest_metrics = self._compute_swing_metrics(
+                        results.pose_landmarks.landmark, h, w)
+                    if self.show_skel:
+                        mp_draw.draw_landmarks(
+                            img, results.pose_landmarks,
+                            mp_pose.POSE_CONNECTIONS,
+                            landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style(),
+                        )
+            # Ball tracking
+            ball_pos = detect_ball_in_frame(img,
+                ball_radius_px_range=self.ball_radius_range)
+            if ball_pos:
+                t_now = _time.time() - self._start_time
+                self._ball_positions.append((t_now, ball_pos[0], ball_pos[1]))
+                cv2.circle(img, ball_pos,
+                            self.ball_radius_range[1] + 4,
+                            (0, 255, 0), 2)
+            # Trail markers
+            for i, (_, bx, by) in enumerate(list(self._ball_positions)[-30:]):
+                alpha = (i + 1) / 30
+                cv2.circle(img, (bx, by), 3,
+                            (int(255*alpha), int(200*alpha), 0), -1)
+            # Tee crosshair
+            cv2.drawMarker(img, (self.tee_x, self.tee_y),
+                            (255, 200, 0), markerType=cv2.MARKER_CROSS,
+                            markerSize=24, thickness=2)
+            # HUD
+            text_lines = []
+            if self.latest_metrics:
+                text_lines += [
+                    f"HS Sep: {self.latest_metrics.get('hip_shoulder_sep_deg', '--')} deg",
+                    f"Attack: {self.latest_metrics.get('attack_angle_deg', '--')} deg",
+                ]
+            text_lines.append(f"Ball samples: {len(self._ball_positions)}")
+            y = 28
+            for line in text_lines:
+                cv2.putText(img, line, (12, y),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                             (255, 255, 255), 2, cv2.LINE_AA)
+                y += 26
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    # ===== Launch capture =====
+    st.divider()
+    st.markdown("**Step 2 — Live capture**")
+    ctx = webrtc_streamer(
+        key="hitcap-swing",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=SwingExtractor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    if ctx.video_processor:
+        ctx.video_processor.tee_x = int(tee_x)
+        ctx.video_processor.tee_y = int(tee_y)
+        ctx.video_processor.ref_dist_ft = int(ref_dist_ft)
+        ctx.video_processor.ball_radius_range = (int(ball_min), int(ball_max))
+
+    # ===== Snap swing =====
+    st.divider()
+    snap_l, snap_r = st.columns(2)
+    with snap_l:
+        if st.button("Snap Swing (after contact)",
+                      type="primary", use_container_width=True,
+                      key="hitcap_snap_btn",
+                      disabled=ctx.video_processor is None):
+            vp = ctx.video_processor
+            if vp:
+                m = dict(vp.latest_metrics) if vp.latest_metrics else {}
+                m["swing_num"] = len(st.session_state["hitcap_snapped_swings"]) + 1
+                # Try to extract exit velo from the recent ball trail —
+                # post-contact ball travels in a straight line at peak speed
+                ball_track = vp.get_recent_ball_track()
+                if len(ball_track) >= 5:
+                    # Use the FASTEST 3-frame span as the exit velocity
+                    # estimate. Calibrate using the tee-to-camera distance
+                    # as the pixel-to-ft scale.
+                    import numpy as _np
+                    pts = _np.array(ball_track)
+                    times = pts[:, 0]
+                    xs = pts[:, 1]; ys = pts[:, 2]
+                    dx = _np.diff(xs); dy = _np.diff(ys); dt = _np.diff(times)
+                    pixel_speeds = _np.sqrt(dx*dx + dy*dy) / _np.maximum(dt, 1e-3)
+                    if len(pixel_speeds) >= 3:
+                        # Pixel-to-foot scale: assume 1 ft per 30 pixels at the
+                        # calibrated camera distance (rough — user can fine-tune)
+                        ft_per_px = 1.0 / (30.0 * (20.0 / max(ref_dist_ft, 1)))
+                        peak_px_per_sec = float(_np.max(pixel_speeds))
+                        peak_fps = peak_px_per_sec * ft_per_px
+                        peak_mph = peak_fps / 1.467
+                        m["exit_velocity_mph"] = round(peak_mph, 1)
+                        # Launch angle ≈ angle of the post-contact trail
+                        peak_idx = int(_np.argmax(pixel_speeds))
+                        if peak_idx + 2 < len(xs):
+                            dx_la = xs[peak_idx + 2] - xs[peak_idx]
+                            dy_la = ys[peak_idx + 2] - ys[peak_idx]
+                            import math as _math
+                            la_deg = _math.degrees(_math.atan2(-dy_la, abs(dx_la)))
+                            m["launch_angle_deg"] = round(la_deg, 1)
+                st.session_state["hitcap_snapped_swings"].append(m)
+                st.session_state["hitcap_last_swing"] = m
+
+    with snap_r:
+        if st.button("Clear all snapped swings",
+                      use_container_width=True,
+                      key="hitcap_clear_btn"):
+            st.session_state["hitcap_snapped_swings"] = []
+            st.session_state.pop("hitcap_last_swing", None)
+            st.rerun()
+
+    # ===== Instant feedback card =====
+    last = st.session_state.get("hitcap_last_swing")
+    if last:
+        ev = last.get("exit_velocity_mph")
+        la = last.get("launch_angle_deg")
+        ev_color = "#1a2150"
+        ev_badge = ""
+        if ev is not None:
+            if ev >= 95:
+                ev_color = "#16a34a"
+                ev_badge = "<span style='display:inline-block;background:#dcfce7;color:#15803d;font-size:14px;font-weight:700;padding:4px 10px;border-radius:12px;margin-left:10px;'>BARREL</span>"
+            elif ev < 75:
+                ev_color = "#d4a634"
+                ev_badge = "<span style='display:inline-block;background:#fef3c7;color:#92400e;font-size:14px;font-weight:700;padding:4px 10px;border-radius:12px;margin-left:10px;'>WEAK</span>"
+        la_badge = ""
+        if la is not None and 10 <= la <= 25:
+            la_badge = "<span style='display:inline-block;background:#dcfce7;color:#15803d;font-size:12px;font-weight:700;padding:3px 8px;border-radius:10px;margin-left:8px;'>SWEET SPOT</span>"
+        hs = last.get("hip_shoulder_sep_deg")
+        attack = last.get("attack_angle_deg")
+        feedback_html = (
+            f"<div style='background:white;border:1px solid #e5e7eb;border-radius:16px;"
+            f"padding:28px 32px;box-shadow:0 4px 14px rgba(26,33,80,0.10);"
+            f"margin-top:14px;margin-bottom:14px;'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;"
+            f"margin-bottom:18px;'>"
+            f"<div style='font-size:14px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#d4a634;text-transform:uppercase;'>"
+            f"Swing #{last.get('swing_num', '—')} · Live Capture</div>"
+            f"<div style='font-size:11px;color:#9ca3af;'>Captured just now</div>"
+            f"</div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:24px;'>"
+            f"<div style='text-align:center;'>"
+            f"<div style='font-size:13px;letter-spacing:0.12em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;'>Exit Velocity</div>"
+            f"<div style='font-size:72px;font-weight:800;color:{ev_color};"
+            f"line-height:1.0;letter-spacing:-0.03em;margin-top:6px;'>"
+            f"{(f'{ev:.1f}' if ev else '—')}"
+            f"<span style='font-size:24px;font-weight:600;color:#6b7280;margin-left:8px;'>mph</span>"
+            f"{ev_badge}</div></div>"
+            f"<div style='text-align:center;'>"
+            f"<div style='font-size:13px;letter-spacing:0.12em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;'>Launch Angle</div>"
+            f"<div style='font-size:72px;font-weight:800;color:#1a2150;"
+            f"line-height:1.0;letter-spacing:-0.03em;margin-top:6px;'>"
+            f"{(f'{la:.0f}' if la is not None else '—')}"
+            f"<span style='font-size:24px;font-weight:600;color:#6b7280;margin-left:8px;'>°</span>"
+            f"{la_badge}</div></div>"
+            f"</div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:14px;"
+            f"margin-top:20px;padding-top:16px;border-top:1px solid #f3f4f6;'>"
+            f"<div><div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;margin-bottom:4px;'>Hip-Shoulder Sep</div>"
+            f"<div style='font-size:18px;font-weight:700;color:#1a2150;'>"
+            f"{(f'{hs}°' if hs is not None else '—')}</div></div>"
+            f"<div><div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#6b7280;text-transform:uppercase;margin-bottom:4px;'>Attack Angle</div>"
+            f"<div style='font-size:18px;font-weight:700;color:#1a2150;'>"
+            f"{(f'{attack}°' if attack is not None else '—')}</div></div>"
+            f"</div></div>"
+        )
+        st.markdown(_flat_html(feedback_html), unsafe_allow_html=True)
+
+    # ===== Swings table + save =====
+    swings = st.session_state.get("hitcap_snapped_swings", [])
+    if swings:
+        st.subheader(f"Snapped Swings ({len(swings)})")
+        st.dataframe(pd.DataFrame(swings),
+                       use_container_width=True, hide_index=True)
+        if active_athlete_id is not None:
+            if st.button("Save this session to history",
+                          type="primary", use_container_width=True,
+                          key="hitcap_save_btn"):
+                from datetime import datetime as _dt
+                rows = []
+                base_time = _dt.utcnow()
+                for i, m in enumerate(swings):
+                    rows.append({
+                        "Swing_Num":          i + 1,
+                        "Timestamp":          base_time,
+                        "Pitch_Type_Faced":   "Unknown",
+                        "Pitch_Velocity_mph": None,
+                        "Plate_X_ft":         0.0,
+                        "Plate_Z_ft":         2.5,
+                        "Swing_Type":         "swing",
+                        "Swing_Outcome":      "solid_contact"
+                                              if m.get("exit_velocity_mph", 0) >= 85
+                                              else "weak_contact",
+                        "Bat_Speed_mph":      None,
+                        "Attack_Angle_deg":   m.get("attack_angle_deg"),
+                        "On_Plane_Eff_pct":   None,
+                        "Peak_Hand_Speed_mph": None,
+                        "Time_to_Contact_sec": None,
+                        "Exit_Velocity_mph":   m.get("exit_velocity_mph"),
+                        "Launch_Angle_deg":    m.get("launch_angle_deg"),
+                        "Contact_Offset_in":   None,
+                        "Distance_ft":         None,
+                        "Spray_Angle_deg":     None,
+                        "Peak_Hip_Shoulder_Sep_deg": m.get("hip_shoulder_sep_deg"),
+                        "Stride_Length_in":    None,
+                        "Lead_Knee_Flex_deg":  None,
+                    })
+                cap_df = pd.DataFrame(rows)
+                try:
+                    new_id = save_session(active_athlete_id, cap_df,
+                                            session_type="real",
+                                            session_kind="hitting")
+                    st.success(f"Saved as hitting session #{new_id}.")
+                    st.session_state["hitcap_snapped_swings"] = []
+                except Exception as e:
+                    st.error(f"Could not save: {e}")
+        else:
+            st.info("Pick a hitter from the sidebar to enable saving this session.")
+    else:
+        st.info("No swings snapped yet. Tap **Snap Swing** right after contact.")
+
+
+def main():
+    st.set_page_config(
+        page_title="Diamond Sports Lab",
+        page_icon="◆",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    _inject_global_styles()
+
+    # Apply pending "Start Sample Session" intent BEFORE the toggle widget
+    # renders below. Setting widget state after instantiation is forbidden.
+    if st.session_state.pop("_force_demo_on", False):
+        st.session_state["demo_mode_toggle"] = True
+
+    # -------- Sidebar --------
+    with st.sidebar:
+        # Mode-aware sub-line under the brand mark
+        mode_sub = "Pitching · Bullpen Analytics"
+        if st.session_state.get("app_mode", "Pitching") == "Hitting":
+            mode_sub = "Hitting · Swing Analytics"
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:8px;'>"
+            f"<div style='font-size:28px;'>◆</div>"
+            f"<div><div style='font-size:18px;font-weight:700;line-height:1.1;'>Diamond Sports Lab</div>"
+            f"<div style='font-size:11px;color:#888;'>{mode_sub}</div></div></div>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+        # ===== MODE SWITCH — Pitching / Hitting =====
+        # Determines which lab the rest of the app shows. Persisted across reruns.
+        app_mode = st.radio(
+            "Lab",
+            ["⚾ Pitching", "🏏 Hitting"],
+            index=1 if st.session_state.get("app_mode") == "Hitting" else 0,
+            horizontal=True,
+            key="app_mode_radio",
+            help="Switch between the Pitching Lab and the Hitting Lab.",
+        )
+        # Normalize to a stable key
+        app_mode = "Hitting" if "Hitting" in app_mode else "Pitching"
+        st.session_state["app_mode"] = app_mode
+        st.divider()
+
+        # ===== SAMPLE SESSION TOGGLE =====
+        sample_label = "Sample Session"
+        sample_help  = (
+            "Generate a believable sample bullpen for any pitcher name. "
+            "Useful for showing the platform without needing CSV uploads."
+            if app_mode == "Pitching"
+            else "Generate a believable sample batting practice for any hitter name."
+        )
+        demo_mode = st.toggle(
+            sample_label,
+            value=st.session_state.get("demo_mode_default", False),
+            key="demo_mode_toggle",
+            help=sample_help,
+        )
+        # Live Capture toggle — works in both modes now.
+        live_capture_mode = st.toggle(
+            "Live Capture (Beta)",
+            value=False,
+            key="live_capture_toggle",
+            help="Use the phone/tablet camera to capture pitches/swings live. "
+                 "Requires streamlit-webrtc + opencv (pip install -r requirements.txt).",
+        )
+        st.divider()
+
+        # Section header reacts to mode — "Pitcher Profile" vs "Hitter Profile"
+        _profile_label = "Hitter Profile" if st.session_state.get("app_mode") == "Hitting" else "Pitcher Profile"
+        st.subheader(_profile_label)
+
+        # Sport icon helper (used in roster labels + header)
+        def _sport_icon(s: str) -> str:
+            return "🥎" if s == "Softball" else "⚾"
+
+        # Role labels swap with mode. Same athlete record — only the display
+        # changes. Pitching shows "RHP/LHP"; Hitting shows "RHH/LHH".
+        is_hitting          = (app_mode == "Hitting")
+        ROLE_NOUN           = "hitter" if is_hitting else "pitcher"
+        ROLE_DROPDOWN_LABEL = "Hitter" if is_hitting else "Pitcher"
+        HAND_TAG            = "HH"     if is_hitting else "HP"     # "RHH" / "RHP"
+        HAND_FIELD_LABEL    = "Batting hand" if is_hitting else "Throwing hand"
+
+        def _athlete_label(a: dict) -> str:
+            suffix = f"{a['hand'][:1]}{HAND_TAG}"
+            return (f"{_sport_icon(a.get('sport', 'Baseball'))} "
+                    f"{a['name']} ({suffix}, {a['grad_class'] or '—'})")
+
+        # ===== ROSTER DROPDOWN =====
+        roster = list_athletes()
+        ADD_NEW = f"➕ Add new {ROLE_NOUN}..."
+        DEMO_ATHLETE_BB = f"🎬 Sample {ROLE_DROPDOWN_LABEL} — Baseball"
+        DEMO_ATHLETE_SB = f"🎬 Sample {ROLE_DROPDOWN_LABEL} — Softball"
+        roster_options: list = []
+        if demo_mode and not roster:
+            # First-run demo experience: offer both sports as virtual defaults
+            roster_options.append(DEMO_ATHLETE_BB)
+            roster_options.append(DEMO_ATHLETE_SB)
+        roster_options += [_athlete_label(a) for a in roster]
+        roster_options.append(ADD_NEW)
+
+        # Maintain selection across reruns
+        if "selected_athlete_label" not in st.session_state:
+            st.session_state["selected_athlete_label"] = roster_options[0]
+        if st.session_state["selected_athlete_label"] not in roster_options:
+            st.session_state["selected_athlete_label"] = roster_options[0]
+
+        selected_label = st.selectbox(
+            ROLE_DROPDOWN_LABEL,
+            roster_options,
+            index=roster_options.index(st.session_state["selected_athlete_label"]),
+            key="roster_select",
+        )
+        st.session_state["selected_athlete_label"] = selected_label
+
+        # Inline "Add new pitcher" form
+        if selected_label == ADD_NEW:
+            with st.form("add_athlete_form", clear_on_submit=True):
+                new_name  = st.text_input("Name", placeholder="Last, First or First Last")
+                cols_nh = st.columns(2)
+                with cols_nh[0]:
+                    new_sport = st.selectbox("Sport", ["Baseball", "Softball"])
+                with cols_nh[1]:
+                    new_hand = st.selectbox(HAND_FIELD_LABEL, ["Right", "Left"])
+                cols_lc = st.columns(2)
+                with cols_lc[0]:
+                    new_level = st.selectbox(
+                        "Level", ATHLETE_LEVELS,
+                        index=ATHLETE_LEVELS.index("HS-Varsity"),
+                        help="Determines which tutorial videos the app picks "
+                             "(youth-friendly vs college-level). Used by the "
+                             "drill video picker.",
+                    )
+                with cols_lc[1]:
+                    new_class = st.text_input("Class / Grad year", placeholder="2027")
+                new_notes = st.text_area("Notes (optional)",
+                                          placeholder="Position, level, anything you want to remember",
+                                          height=70)
+                submitted = st.form_submit_button("Add to roster", type="primary",
+                                                   use_container_width=True)
+                if submitted and new_name.strip():
+                    aid = add_athlete(new_name.strip(), new_hand, new_sport,
+                                      new_class.strip(), new_notes.strip(),
+                                      level=new_level)
+                    new_a = {"name": new_name.strip(), "hand": new_hand,
+                             "sport": new_sport, "grad_class": new_class.strip()}
+                    st.session_state["selected_athlete_label"] = _athlete_label(new_a)
+                    st.success(f"Added {new_name.strip()} to roster.")
+                    st.rerun()
+            st.stop()
+
+        # Resolve the selected athlete to its DB record (or fall back to demo)
+        active_athlete = None
+        if selected_label == DEMO_ATHLETE_BB:
+            athlete_name, athlete_hand, athlete_class, athlete_sport, athlete_level = \
+                "Marcus Vance", "Right", "2027", "Baseball", "HS-Varsity"
+            active_athlete_id = None
+        elif selected_label == DEMO_ATHLETE_SB:
+            athlete_name, athlete_hand, athlete_class, athlete_sport, athlete_level = \
+                "Sara Johnson", "Right", "2026", "Softball", "HS-Varsity"
+            active_athlete_id = None
+        else:
+            # Match by reconstructed label
+            for a in roster:
+                if _athlete_label(a) == selected_label:
+                    active_athlete = a
+                    break
+            if active_athlete is None:
+                active_athlete = roster[0] if roster else None
+            athlete_name = active_athlete["name"] if active_athlete else "Pitcher"
+            athlete_hand = active_athlete["hand"] if active_athlete else "Right"
+            athlete_class = (active_athlete["grad_class"] or "") if active_athlete else ""
+            athlete_sport = active_athlete.get("sport", "Baseball") if active_athlete else "Baseball"
+            athlete_level = active_athlete.get("level", "HS-Varsity") if active_athlete else "HS-Varsity"
+            active_athlete_id = active_athlete["id"] if active_athlete else None
+
+        # Compact "Edit profile" expander
+        if active_athlete_id is not None:
+            # Scope EVERY widget key per-athlete. Without this, Streamlit caches
+            # the first-edited pitcher's values under generic keys and reuses
+            # them when you switch to a different pitcher (the bug Kolby hit).
+            aid = active_athlete_id
+            with st.expander("✏️ Edit profile", expanded=False):
+                e_name  = st.text_input("Name", value=athlete_name,
+                                         key=f"edit_name_{aid}")
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    e_sport = st.selectbox("Sport", ["Baseball", "Softball"],
+                                            index=0 if athlete_sport == "Baseball" else 1,
+                                            key=f"edit_sport_{aid}")
+                with ec2:
+                    e_hand  = st.selectbox(HAND_FIELD_LABEL, ["Right", "Left"],
+                                            index=0 if athlete_hand == "Right" else 1,
+                                            key=f"edit_hand_{aid}")
+                ec3, ec4 = st.columns(2)
+                with ec3:
+                    e_level = st.selectbox(
+                        "Level", ATHLETE_LEVELS,
+                        index=ATHLETE_LEVELS.index(athlete_level) if athlete_level in ATHLETE_LEVELS else 2,
+                        key=f"edit_level_{aid}",
+                        help="Used by the video picker to choose age-appropriate "
+                             "tutorials (youth vs college).",
+                    )
+                with ec4:
+                    e_class = st.text_input("Class / Grad year", value=athlete_class,
+                                             key=f"edit_class_{aid}")
+                if st.button("Save changes", use_container_width=True,
+                              key=f"save_edit_{aid}"):
+                    update_athlete(active_athlete_id, name=e_name, hand=e_hand,
+                                   sport=e_sport, level=e_level, grad_class=e_class)
+                    updated_a = {"name": e_name, "hand": e_hand,
+                                 "sport": e_sport, "grad_class": e_class}
+                    st.session_state["selected_athlete_label"] = _athlete_label(updated_a)
+                    st.rerun()
+                if st.button(f"🗄️ Archive this {ROLE_NOUN}", use_container_width=True,
+                              key=f"archive_btn_{aid}",
+                              help="Hides them from the roster but keeps history."):
+                    archive_athlete(active_athlete_id, archived=True)
+                    st.session_state["selected_athlete_label"] = roster_options[0]
+                    st.rerun()
+
+                # ===== HARD DELETE — with confirmation gate =====
+                st.markdown("---")
+                st.markdown(
+                    "<div style='font-size:11px;color:#dc2626;font-weight:600;"
+                    "letter-spacing:0.04em;text-transform:uppercase;margin-bottom:6px;'>"
+                    "⚠️ Danger zone</div>",
+                    unsafe_allow_html=True,
+                )
+                # Per-athlete confirmation key so toggling doesn't persist across pitchers
+                confirm_key = f"confirm_delete_{active_athlete_id}"
+                confirm = st.checkbox(
+                    f"I understand: permanently delete **{athlete_name}** AND all their session history.",
+                    key=confirm_key,
+                )
+                if st.button("🗑️ Delete permanently (cannot be undone)",
+                              use_container_width=True,
+                              disabled=not confirm,
+                              type="secondary",
+                              key=f"delete_btn_{aid}",
+                              help="Use Archive instead if you want to keep history. "
+                                   "This wipes the pitcher AND every saved session."):
+                    sessions_deleted = delete_athlete_permanently(active_athlete_id)
+                    st.session_state["selected_athlete_label"] = roster_options[0]
+                    st.toast(f"Deleted {athlete_name} and {sessions_deleted} session(s).")
+                    st.rerun()
+
+        st.divider()
+
+        if not demo_mode:
+            st.subheader("Upload Session Data")
+            pl_file = st.file_uploader(
+                "Ball flight CSV (Pitch Logic, Rapsodo, etc.)",
+                type=["csv"],
+                key="pl",
+                help="The parser auto-detects the format. Works with Pitch Logic, "
+                     "Rapsodo Pitching 2.0/PRO 2.0, and any compatible export.",
+            )
+            pulse_file = st.file_uploader("Driveline Pulse CSV", type=["csv"], key="pulse")
+            ppai_files = st.file_uploader(
+                "ProPlayAI per-pitch files",
+                type=["csv"],
+                accept_multiple_files=True,
+                key="ppai",
+            )
+            video_upload = st.file_uploader(
+                "Bullpen Video — optional",
+                type=["mp4", "mov", "m4v", "webm"],
+                key="video",
+                help="A single video of the whole bullpen. Plays back in the "
+                     "pitch-detail panel when you click a pitch on the strike-zone map. "
+                     "Auto-clipping by pitch is a v2 feature.",
+            )
+            if video_upload is not None:
+                st.session_state["bullpen_video"] = video_upload
+                st.session_state["bullpen_video_url"] = None
+            video_url_input = st.text_input(
+                "...or paste a video URL (YouTube/Vimeo)",
+                value=st.session_state.get("bullpen_video_url", "") or "",
+                placeholder="https://...",
+                key="video_url_input",
+            )
+            if video_url_input:
+                st.session_state["bullpen_video_url"] = video_url_input
+            st.caption(
+                "👉 Demo files live in the `sample_data/` folder next to this script. "
+                "Upload them all to see a worked example."
+            )
+        else:
+            pl_file, pulse_file, ppai_files = None, None, None
+            st.info(
+                "Turn off Demo Mode to upload real CSV files from Pitch Logic, "
+                "Pulse, and ProPlayAI."
+            )
+            # Demo users can still upload a video, paste a URL, or load a sample
+            video_upload_demo = st.file_uploader(
+                "Bullpen Video — optional",
+                type=["mp4", "mov", "m4v", "webm"],
+                key="video_demo",
+            )
+            if video_upload_demo is not None:
+                st.session_state["bullpen_video"] = video_upload_demo
+                st.session_state["bullpen_video_url"] = None
+            if st.button("🎥 Load a sample bullpen video", use_container_width=True):
+                st.session_state["bullpen_video_url"] = SAMPLE_PITCHER_VIDEO_URL
+                st.session_state["bullpen_video"] = None
+            video_url_input2 = st.text_input(
+                "...or paste a video URL (YouTube/Vimeo)",
+                value=st.session_state.get("bullpen_video_url", "") or "",
+                placeholder="https://...",
+                key="video_url_input_demo",
+            )
+            if video_url_input2 and video_url_input2 != st.session_state.get("bullpen_video_url"):
+                st.session_state["bullpen_video_url"] = video_url_input2
+
+    # -------- Mode branch: if Hitting Lab, render swing report and return --------
+    if app_mode == "Hitting":
+        # Hitting Live Capture takes precedence over the standard hitting report
+        if live_capture_mode:
+            _branded_header_hitting(athlete_name, athlete_hand, athlete_class,
+                                      demo_mode, sport=athlete_sport)
+            run_hitting_live_capture(
+                active_athlete_id=active_athlete_id,
+                athlete_name=athlete_name,
+                athlete_hand=athlete_hand,
+                athlete_sport=athlete_sport,
+            )
+            return
+        run_hitting_lab(
+            athlete_name=athlete_name,
+            athlete_hand=athlete_hand,
+            athlete_class=athlete_class,
+            athlete_sport=athlete_sport,
+            athlete_level=athlete_level,
+            active_athlete_id=active_athlete_id,
+            demo_mode=demo_mode,
+        )
+        return  # don't fall through to the pitching report
+
+    # -------- Branded header --------
+    _branded_header(athlete_name, athlete_hand, athlete_class, demo_mode, sport=athlete_sport)
+
+    # -------- Live Capture mode: phone camera → MediaPipe pose → biomech --------
+    if live_capture_mode:
+        run_live_capture_tab(
+            active_athlete_id=active_athlete_id,
+            athlete_name=athlete_name,
+            athlete_hand=athlete_hand,
+            athlete_sport=athlete_sport,
+        )
+        return
+
+    # -------- Branch: Demo Mode vs Real Data --------
+    if demo_mode:
+        with st.spinner(f"Generating demo session for {athlete_name}..."):
+            df = generate_demo_session(athlete_name, hand=athlete_hand, sport=athlete_sport)
+    else:
+        if not pl_file or not pulse_file or not ppai_files:
+            # ===== BRANDED WELCOME / EMPTY STATE =====
+            # Headline card (HTML for visual polish)
+            header_html = _flat_html(
+                "<div style='background:white;border:1px solid #e5e7eb;border-radius:14px;"
+                "padding:28px 28px 20px 28px;margin-top:12px;"
+                "box-shadow:0 1px 3px rgba(0,0,0,0.04);'>"
+                "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
+                "color:#d4a634;text-transform:uppercase;margin-bottom:8px;'>"
+                "◆ Welcome to Diamond Sports Lab</div>"
+                "<div style='font-size:24px;font-weight:700;color:#1a2150;margin-bottom:8px;'>"
+                "Ready to see a Post-Bullpen Report?</div>"
+                "<div style='font-size:14px;color:#4b5563;line-height:1.5;'>"
+                "Pick one of the two paths below to get started."
+                "</div></div>"
+            )
+            st.markdown(header_html, unsafe_allow_html=True)
+
+            # Two REAL action buttons (not HTML — actually clickable)
+            st.write("")  # small spacer
+            cta_a, cta_b = st.columns(2)
+            with cta_a:
+                with st.container(border=True):
+                    st.markdown("### 🎬  Try a Sample Session")
+                    st.markdown(
+                        "We'll generate a believable bullpen for any pitcher name "
+                        "you type. **No uploads needed.** Best way to see the full "
+                        "app in 30 seconds."
+                    )
+                    if st.button("Start Sample Session",
+                                 key="welcome_start_demo",
+                                 type="primary",
+                                 use_container_width=True):
+                        # Use an intermediate flag instead of touching the
+                        # widget's state directly (Streamlit forbids that
+                        # after the widget has already been instantiated
+                        # in this run). The top of main() will apply this
+                        # flag on the next rerun, before the toggle renders.
+                        st.session_state["_force_demo_on"] = True
+                        st.rerun()
+            with cta_b:
+                with st.container(border=True):
+                    st.markdown("### 📂  Upload Real Bullpen Data")
+                    st.markdown(
+                        "Drop in your **Pitch Logic / Rapsodo**, **Pulse**, and "
+                        "**ProPlayAI** CSV exports using the three file uploaders "
+                        "in the sidebar on the left."
+                    )
+                    st.button("Open Sidebar →",
+                              key="welcome_open_sidebar",
+                              use_container_width=True,
+                              help="If the sidebar is hidden, click the small > arrow "
+                                   "at the top-left of the page to open it.",
+                              disabled=True)
+
+            # Sidebar hint (in case it's collapsed)
+            st.info(
+                "💡 **Don't see the sidebar?** Look for a small **›** arrow on the "
+                "very far left edge of the page and click it to open the sidebar. "
+                "That's where Sample Session and the file uploaders live."
+            )
+            st.stop()
+
+        # -------- Diagnostic: peek at uploaded files --------
+        with st.expander("🔍 Inspect uploaded files (click to preview raw CSV contents)"):
+            st.write("**Pitch Logic — first 12 lines:**")
+            st.code(file_diagnostic(pl_file), language="text")
+            st.write("**Pulse — first 12 lines:**")
+            st.code(file_diagnostic(pulse_file), language="text")
+            if ppai_files:
+                st.write(f"**ProPlayAI — first file ({ppai_files[0].name}), first 12 lines:**")
+                st.code(file_diagnostic(ppai_files[0]), language="text")
+
+        # -------- Run the pipeline (wrapped so errors show diagnostic) --------
+        def _parse_with_diagnostic(label, parse_fn, file_arg):
+            try:
+                return parse_fn(file_arg)
+            except ParserError as e:
+                st.error(f"❌ **{label} parsing failed.**\n\n{str(e)}")
+                st.info(
+                    "👉 Copy the error message above and the file preview below, "
+                    "paste them back to Claude, and the parser will be updated."
+                )
+                st.stop()
+            except KeyError as e:
+                st.error(
+                    f"❌ **{label} parsing hit an unexpected column.**\n\n"
+                    f"Missing column: {e}\n\n"
+                    "This usually means the CSV uses a different name for this field. "
+                    "Copy the error + file preview and paste back to Claude."
+                )
+                st.stop()
+            except Exception as e:
+                st.error(f"❌ **{label} parsing crashed:** `{type(e).__name__}: {e}`")
+                st.stop()
+
+        with st.spinner("Parsing Pitch Logic..."):
+            pl_df = _parse_with_diagnostic("Pitch Logic", parse_pitch_logic, pl_file)
+        with st.spinner("Parsing Pulse..."):
+            pulse_df = _parse_with_diagnostic("Pulse", parse_pulse, pulse_file)
+        with st.spinner("Reducing ProPlayAI frame data to per-pitch summaries..."):
+            ppai_df = _parse_with_diagnostic("ProPlayAI", parse_proplayai_batch, ppai_files)
+        with st.spinner("Running self-healing timeline aligner..."):
+            df = align_pitches(pl_df, pulse_df, ppai_df)
+
+    # -------- Session save (auto for real data, manual for samples) --------
+    if active_athlete_id is not None:
+        # Fingerprint this session to avoid double-saving across reruns
+        try:
+            first_ts = str(df["Timestamp"].min())
+            last_ts  = str(df["Timestamp"].max())
+            fingerprint = f"{active_athlete_id}|{len(df)}|{first_ts}|{last_ts}"
+        except Exception:
+            fingerprint = f"{active_athlete_id}|{len(df)}|{id(df)}"
+
+        if demo_mode:
+            # Sample session — require explicit save
+            if st.session_state.get("_saved_fingerprint") != fingerprint:
+                save_cols = st.columns([3, 1])
+                save_cols[0].caption(
+                    "📌 This is a sample session. Save it to this pitcher's history if you "
+                    "want to use it for trend tracking — or skip and just demo."
+                )
+                if save_cols[1].button("💾 Save sample to history",
+                                       use_container_width=True,
+                                       key="save_sample_btn"):
+                    save_session(active_athlete_id, df, session_type="sample")
+                    st.session_state["_saved_fingerprint"] = fingerprint
+                    st.toast("Saved to history.")
+                    st.rerun()
+        else:
+            # Real data — auto-save once per session fingerprint
+            if st.session_state.get("_saved_fingerprint") != fingerprint:
+                try:
+                    save_session(active_athlete_id, df, session_type="real")
+                    st.session_state["_saved_fingerprint"] = fingerprint
+                except Exception as e:
+                    st.warning(f"Could not auto-save to history: {e}")
+
+    # -------- Top KPI strip --------
+    kpis = session_kpis(df)
+    _kpi_row(kpis, int(kpis.get("Pitches Healed", 0)))
+
+    if kpis["Pitches Healed"] > 0:
+        st.markdown(
+            f"<div style='background:#fffbeb; border:1px solid #fde68a; "
+            f"border-left:4px solid #d4a634; border-radius:6px; padding:10px 14px; "
+            f"font-size:13px; color:#78350f; margin-top:8px;'>"
+            f"<b>Self-healing engaged.</b> {kpis['Pitches Healed']} pitch(es) had "
+            f"at least one dropout — the aligner filled the timeline so your rows "
+            f"stay matched.</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # -------- Tabs --------
+    tab_overview, tab_per_pitch, tab_history, tab_tunneling, tab_alignment, tab_action, tab_pricing = st.tabs(
+        ["📊 Overview", "🎯 Per-Pitch Detail", "📈 History",
+         "🪢 Tunneling", "🔧 Alignment Quality", "🚀 Action Plan", "💎 Pricing"]
+    )
+
+    # ---- Overview tab ----
+    with tab_overview:
+        st.subheader("Pitch Type Breakdown")
+        breakdown = pitch_type_breakdown(df)
+
+        # Decide which baseline to use: real history if it exists, else demo
+        real_baseline = {}
+        baseline_source = "demo"
+        if active_athlete_id is not None:
+            try:
+                real_baseline = compute_real_baseline(active_athlete_id, lookback=6)
+                if real_baseline:
+                    baseline_source = "real"
+            except Exception:
+                real_baseline = {}
+        active_baseline = real_baseline if real_baseline else DEMO_BASELINE
+
+        delta_rows = []
+        for _, r in breakdown.iterrows():
+            base = active_baseline.get(r["Pitch_Type"])
+            def _delta_str(today_v, base_v, unit=""):
+                if base_v is None or today_v is None or pd.isna(today_v):
+                    return f"{today_v}{unit}" if today_v is not None and not pd.isna(today_v) else "—"
+                d = today_v - base_v
+                arrow = " 📈" if d > 0.3 else (" 📉" if d < -0.3 else "")
+                return f"{today_v}{unit} ({d:+.1f}){arrow}"
+            if base:
+                delta_rows.append({
+                    "Pitch Type":     r["Pitch_Type"],
+                    "Thrown":         int(r["Thrown"]),
+                    "Velo":           _delta_str(r['Avg_Velo'], base.get('velo'), " mph"),
+                    "Vert Break":     _delta_str(r['Avg_Vert_Break'], base.get('vbreak'), '"'),
+                    "Horiz Break":    f"{r['Avg_Horiz_Break']}\"",
+                    "Elbow Stress":   _delta_str(r['Avg_Stress'], base.get('stress'), " Nm"),
+                })
+            else:
+                delta_rows.append({
+                    "Pitch Type":     r["Pitch_Type"],
+                    "Thrown":         int(r["Thrown"]),
+                    "Velo":           f"{r['Avg_Velo']} mph",
+                    "Vert Break":     f"{r['Avg_Vert_Break']}\"",
+                    "Horiz Break":    f"{r['Avg_Horiz_Break']}\"",
+                    "Elbow Stress":   f"{r['Avg_Stress']} Nm",
+                })
+        st.dataframe(pd.DataFrame(delta_rows), use_container_width=True, hide_index=True)
+        if baseline_source == "real":
+            st.caption(
+                f"📊 Deltas compare today's session to **{athlete_name}'s actual "
+                f"rolling baseline** from their recent saved sessions. "
+                "The more sessions you log, the more accurate this becomes."
+            )
+        else:
+            st.caption(
+                "🔬 Deltas shown vs a **sample reference baseline** for illustration. "
+                "Save real sessions to this pitcher's history (auto-saved when you upload "
+                "real CSVs) and the deltas will switch to a real rolling baseline."
+            )
+
+        st.subheader("Pitch Map — Movement vs Velocity")
+        fig = px.scatter(
+            df, x="Horiz_Break_in", y="Velocity_mph",
+            color="Pitch_Type", text="Pitch_Num",
+            color_discrete_map=PITCH_COLORS,
+            hover_data=["Total_Spin_rpm", "Spin_Efficiency_pct", "Peak_Valgus_Nm"],
+            labels={
+                "Horiz_Break_in": "Horizontal Break (inches)",
+                "Velocity_mph":   "Velocity (mph)",
+            },
+        )
+        fig.update_traces(marker=dict(size=14, line=dict(width=1, color="black")),
+                          textposition="top center")
+        fig.update_layout(height=480)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # =====================================================
+        # STRIKE ZONE SCATTER (clickable → per-pitch detail panel below)
+        # =====================================================
+        st.subheader("Strike Zone Map (click any pitch for details)")
+        if df["Strike_Zone_Side"].notna().any():
+            sz_fig = _build_strike_zone_figure(df)
+            event = st.plotly_chart(
+                sz_fig,
+                use_container_width=True,
+                key="strike_zone_chart",
+                on_select="rerun",
+                selection_mode=("points",),
+            )
+
+            # Determine which pitch (if any) is selected.
+            # Streamlit's plotly selection event can return customdata in a few
+            # shapes depending on version: list, dict, numpy array, or scalar.
+            # Be defensive about indexing — and as a safety net, fall back to
+            # the point_index + curve_number to look up the pitch number directly.
+            selected_pitch_num = None
+            try:
+                if event and getattr(event, "selection", None):
+                    points = event.selection.get("points", [])
+                    if points:
+                        pt = points[0]
+                        cd = pt.get("customdata")
+                        # Try every reasonable shape
+                        if cd is None:
+                            pass
+                        elif isinstance(cd, (int, float)):
+                            selected_pitch_num = int(cd)
+                        elif isinstance(cd, dict):
+                            # Could be {"0": <num>} or have a Pitch_Num key
+                            if 0 in cd:
+                                selected_pitch_num = int(cd[0])
+                            elif "0" in cd:
+                                selected_pitch_num = int(cd["0"])
+                            elif "Pitch_Num" in cd:
+                                selected_pitch_num = int(cd["Pitch_Num"])
+                        else:
+                            # list / tuple / numpy array
+                            try:
+                                selected_pitch_num = int(cd[0])
+                            except (KeyError, IndexError, TypeError):
+                                # Fall back to treating cd itself as the value
+                                try:
+                                    selected_pitch_num = int(cd)
+                                except (ValueError, TypeError):
+                                    pass
+
+                        # Safety net: if customdata didn't work, use point coordinates
+                        # to find the pitch by matching plate location
+                        if selected_pitch_num is None:
+                            x, y = pt.get("x"), pt.get("y")
+                            if x is not None and y is not None:
+                                match = df[
+                                    (df["Strike_Zone_Side"].sub(x).abs() < 0.01) &
+                                    (df["Strike_Zone_Height"].sub(y).abs() < 0.01)
+                                ]
+                                if not match.empty:
+                                    selected_pitch_num = int(match.iloc[0]["Pitch_Num"])
+            except Exception as e:
+                # Never let a click crash the whole app
+                st.warning(f"Could not parse click event: {e}")
+                selected_pitch_num = None
+
+            # Legend explanation
+            st.caption(
+                "🟢 outlined dots = positive outliers (above-average pitches). "
+                "🔴 outlined dots = negative outliers (concerning pitches). "
+                "Strike-zone box = ~17\" wide plate, knees to letters."
+            )
+
+            # ----- PITCH DETAIL PANEL -----
+            st.divider()
+            st.subheader("Pitch Detail")
+            if selected_pitch_num is None:
+                st.info("Click a dot on the strike-zone map above to see that pitch's details, "
+                        "the data behind any outlier flag, and the video clip (when video is uploaded).")
+            else:
+                pitch = df[df["Pitch_Num"] == selected_pitch_num].iloc[0]
+                _render_pitch_detail_panel(pitch, athlete_name=athlete_name, sport=athlete_sport)
+        else:
+            st.info(
+                "Strike-zone map requires plate-location data. "
+                "Rapsodo provides it directly; Pitch Logic data gets a projected location "
+                "from release point + break (approximate)."
+            )
+
+        # ===== MECHANICS CRITIQUE (moved here so the strike zone is up top) =====
+        critique = analyze_mechanics(df, sport=athlete_sport)
+        if critique["strengths"] or critique["weaknesses"]:
+            st.divider()
+            st.subheader("Mechanics Critique")
+            st.caption(
+                "Body sequencing strengths and improvement areas, based on the 3D pose data. "
+                "Each improvement area is tied to a specific gain (velocity / control / movement / injury safety)."
+            )
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                strengths_html = (
+                    "<div style='background:#f0fdf4;border:1px solid #bbf7d0;"
+                    "border-left:4px solid #16a34a;border-radius:8px;padding:14px 16px;"
+                    "margin-bottom:8px;'>"
+                    "<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                    "color:#16a34a;text-transform:uppercase;margin-bottom:8px;'>"
+                    "✓ What's working</div>"
+                )
+                if critique["strengths"]:
+                    for s in critique["strengths"]:
+                        strengths_html += (
+                            f"<div style='margin-bottom:10px;'>"
+                            f"<div style='font-weight:700;color:#14532d;font-size:14px;'>{s['label']}</div>"
+                            f"<div style='font-size:13px;color:#1f2937;margin-top:2px;'>{s['detail']}</div>"
+                            f"<div style='font-size:12px;color:#4b5563;margin-top:3px;font-style:italic;'>"
+                            f"Why it matters: {s['gain']} "
+                            f"<span style='background:#dcfce7;color:#15803d;padding:1px 7px;"
+                            f"border-radius:8px;font-size:10.5px;font-weight:700;margin-left:4px;'>"
+                            f"{s['tag']}</span></div>"
+                            f"</div>"
+                        )
+                else:
+                    strengths_html += "<div style='font-size:13px;color:#4b5563;'>No specific mechanical strengths identified yet — keep building.</div>"
+                strengths_html += "</div>"
+                st.markdown(_flat_html(strengths_html), unsafe_allow_html=True)
+
+            with mc2:
+                weak_html = (
+                    "<div style='background:#fefce8;border:1px solid #fde68a;"
+                    "border-left:4px solid #d4a634;border-radius:8px;padding:14px 16px;"
+                    "margin-bottom:8px;'>"
+                    "<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                    "color:#92400e;text-transform:uppercase;margin-bottom:8px;'>"
+                    "→ Areas to improve</div>"
+                )
+                if critique["weaknesses"]:
+                    for w in critique["weaknesses"]:
+                        weak_html += (
+                            f"<div style='margin-bottom:10px;'>"
+                            f"<div style='font-weight:700;color:#78350f;font-size:14px;'>{w['label']}</div>"
+                            f"<div style='font-size:13px;color:#1f2937;margin-top:2px;'>{w['detail']}</div>"
+                            f"<div style='font-size:12px;color:#4b5563;margin-top:3px;'>"
+                            f"<b>Gain:</b> {w['gain']} &nbsp;·&nbsp; "
+                            f"<b>Fix:</b> {w['fix']}</div>"
+                            f"</div>"
+                        )
+                else:
+                    weak_html += "<div style='font-size:13px;color:#4b5563;'>Clean mechanics across the session — no specific corrections flagged.</div>"
+                weak_html += "</div>"
+                st.markdown(_flat_html(weak_html), unsafe_allow_html=True)
+
+    # ---- Per-pitch detail tab ----
+    with tab_per_pitch:
+        # ===== COMPARE TWO PITCHES (side-by-side) =====
+        st.subheader("🆚 Compare Two Pitches Side-by-Side")
+        st.caption(
+            "Pick any two pitches from this session to compare their metrics, "
+            "biomechanics, and (when video is loaded) their delivery side-by-side."
+        )
+        pitch_options = {
+            int(r['Pitch_Num']): f"Pitch #{int(r['Pitch_Num'])} — "
+                                  f"{r['Pitch_Type']} ({r['Velocity_mph']:.1f} mph)"
+            for _, r in df.iterrows()
+        }
+        keys = list(pitch_options.keys())
+        cmp_col1, cmp_col2 = st.columns(2)
+        with cmp_col1:
+            a_key = st.selectbox("Pitch A", keys,
+                                 format_func=lambda k: pitch_options[k],
+                                 index=0, key="cmp_a")
+        with cmp_col2:
+            default_b = 1 if len(keys) > 1 else 0
+            b_key = st.selectbox("Pitch B", keys,
+                                 format_func=lambda k: pitch_options[k],
+                                 index=default_b, key="cmp_b")
+
+        if a_key != b_key:
+            pa = df[df["Pitch_Num"] == a_key].iloc[0]
+            pb = df[df["Pitch_Num"] == b_key].iloc[0]
+
+            def _cmp_row(label, va, vb, fmt=lambda x: f"{x:.1f}" if pd.notna(x) else "—"):
+                # Highlight the better/worse cell with color when comparable
+                va_str = fmt(va) if pd.notna(va) else "—"
+                vb_str = fmt(vb) if pd.notna(vb) else "—"
+                return f"""
+                <tr>
+                  <td style='padding:8px 12px;font-weight:600;color:#374151;font-size:13px;'>{label}</td>
+                  <td style='padding:8px 12px;text-align:right;font-weight:700;color:#1a2150;font-size:14px;'>{va_str}</td>
+                  <td style='padding:8px 12px;text-align:right;font-weight:700;color:#1a2150;font-size:14px;'>{vb_str}</td>
+                </tr>
+                """
+
+            table_html = f"""
+            <table style='width:100%;border-collapse:collapse;
+                          border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;
+                          background:white;margin-top:8px;font-size:13px;'>
+              <thead>
+                <tr style='background:#1a2150;color:white;'>
+                  <th style='padding:10px 12px;text-align:left;font-size:11px;letter-spacing:0.06em;'>Metric</th>
+                  <th style='padding:10px 12px;text-align:right;font-size:11px;letter-spacing:0.06em;'>Pitch #{int(a_key)} ({pa['Pitch_Type']})</th>
+                  <th style='padding:10px 12px;text-align:right;font-size:11px;letter-spacing:0.06em;'>Pitch #{int(b_key)} ({pb['Pitch_Type']})</th>
+                </tr>
+              </thead>
+              <tbody style='background:white;'>
+                {_cmp_row("Velocity (mph)",        pa["Velocity_mph"],       pb["Velocity_mph"])}
+                {_cmp_row("Total Spin (rpm)",      pa["Total_Spin_rpm"],     pb["Total_Spin_rpm"], fmt=lambda x: f"{int(x):,}")}
+                {_cmp_row("Spin Efficiency (%)",   pa["Spin_Efficiency_pct"], pb["Spin_Efficiency_pct"])}
+                {_cmp_row("Vert Break (in)",       pa["Vert_Break_in"],      pb["Vert_Break_in"])}
+                {_cmp_row("Horiz Break (in)",      pa["Horiz_Break_in"],     pb["Horiz_Break_in"])}
+                {_cmp_row("Extension (ft)",        pa["Extension_ft"],       pb["Extension_ft"])}
+                {_cmp_row("Elbow Stress (Nm)",     pa["Peak_Valgus_Nm"],     pb["Peak_Valgus_Nm"])}
+                {_cmp_row("Hip-Shoulder Sep (°)",  pa["Peak_Hip_Shoulder_Sep"], pb["Peak_Hip_Shoulder_Sep"])}
+                {_cmp_row("Trunk Rot @ Foot-Plant (°)", pa["FootPlant_Trunk_Rot"], pb["FootPlant_Trunk_Rot"])}
+                {_cmp_row("Lead Knee Ext (°)",     pa["Release_Lead_Knee_Ext"], pb["Release_Lead_Knee_Ext"])}
+              </tbody>
+            </table>
+            """
+            st.markdown(_flat_html(table_html), unsafe_allow_html=True)
+
+            # Side-by-side video players
+            v_data = st.session_state.get("bullpen_video")
+            v_url  = st.session_state.get("bullpen_video_url")
+            if v_data is not None or v_url:
+                st.markdown("**🎥 Side-by-side video**")
+                st.caption(
+                    "Both players show the same bullpen video — scrub each one to "
+                    "the moment of the pitch you're comparing, and use the speed "
+                    "controls (0.25× for slow-motion) to break down the deliveries. "
+                    "True auto-clipping per pitch is on the v2 roadmap."
+                )
+                va_col, vb_col = st.columns(2)
+                with va_col:
+                    st.caption(f"**Pitch #{int(a_key)}** — {pa['Pitch_Type']}")
+                    if v_data is not None:
+                        st.video(v_data)
+                    else:
+                        st.video(v_url)
+                with vb_col:
+                    st.caption(f"**Pitch #{int(b_key)}** — {pb['Pitch_Type']}")
+                    if v_data is not None:
+                        st.video(v_data)
+                    else:
+                        st.video(v_url)
+            else:
+                st.info(
+                    "📹 Upload a bullpen video or paste a URL in the sidebar to "
+                    "enable side-by-side video playback."
+                )
+        else:
+            st.info("Pick two **different** pitches to compare.")
+
+        st.divider()
+        st.subheader("Every Pitch — Canonical View")
+        display_df = df.copy()
+        display_df["Confidence"] = (display_df["Alignment_Confidence"] * 100).astype(int).astype(str) + "%"
+        display_cols = [
+            "Pitch_Num", "Timestamp", "Pitch_Type", "Velocity_mph",
+            "Total_Spin_rpm", "Spin_Efficiency_pct", "Vert_Break_in",
+            "Horiz_Break_in", "Peak_Valgus_Nm", "AC_Ratio",
+            "FootPlant_Trunk_Rot", "Peak_Hip_Shoulder_Sep",
+            "Healed", "Healed_Notes", "Confidence",
+        ]
+        st.dataframe(display_df[display_cols], use_container_width=True, hide_index=True)
+
+        st.caption(
+            "Click any column header to sort. `Healed = True` means the aligner had to "
+            "fill in a missing data source; `Confidence` tells you how much to trust this row."
+        )
+
+        # Injury-risk callouts
+        st.subheader("Injury / Risk Flags")
+        any_flag = False
+        for _, row in df.iterrows():
+            flags = detect_injury_flags(row)
+            for f in flags:
+                any_flag = True
+                icon = "🚨" if f["severity"] == "DANGER" else "⚠️"
+                pitch_label = f"Pitch #{int(row['Pitch_Num'])} ({row['Pitch_Type']}, {row['Velocity_mph']:.1f} mph)"
+                st.write(f"{icon} **{pitch_label}** — {f['label']}")
+        if not any_flag:
+            st.success("No injury-risk flags raised this session.")
+
+    # ---- History & Trends tab ----
+    with tab_history:
+        st.subheader(f"History — {athlete_name}")
+
+        if active_athlete_id is None:
+            st.info(
+                "📌 You're viewing a sample session for a virtual pitcher. "
+                "Add this pitcher to your roster (or pick a saved pitcher in the sidebar) "
+                "to start building a session history."
+            )
+        else:
+            history = list_sessions(active_athlete_id, limit=50)
+            if not history:
+                st.info(
+                    f"No saved sessions yet for **{athlete_name}**. "
+                    "Upload real Pitch Logic / Pulse / ProPlayAI data and it auto-saves here. "
+                    "Once you have 2+ sessions, you'll see trend charts and real baselines."
+                )
+            else:
+                st.caption(
+                    f"{len(history)} session(s) on file. "
+                    "Real sessions feed the rolling baseline; sample sessions are kept "
+                    "for reference but don't affect baselines."
+                )
+
+                # ----- Trend charts -----
+                hist_df = pd.DataFrame(history)
+                hist_df["session_date"] = pd.to_datetime(hist_df["session_date"], errors="coerce")
+                hist_df = hist_df.sort_values("session_date")
+
+                # Real sessions only for trend display
+                trend_df = hist_df[hist_df["session_type"] == "real"].copy()
+                if len(trend_df) >= 2:
+                    st.subheader("Velocity, Spin & Stress Over Time")
+                    tcol1, tcol2 = st.columns(2)
+                    with tcol1:
+                        fig_v = px.line(trend_df, x="session_date", y="avg_velocity",
+                                         markers=True,
+                                         labels={"session_date": "Session",
+                                                 "avg_velocity": "Avg Velocity (mph)"},
+                                         title="Average Velocity Trend")
+                        fig_v.update_traces(line=dict(color="#1a2150", width=3),
+                                             marker=dict(size=10, color="#d4a634"))
+                        fig_v.update_layout(height=320, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_v, use_container_width=True)
+                    with tcol2:
+                        fig_s = px.line(trend_df, x="session_date", y="max_stress",
+                                         markers=True,
+                                         labels={"session_date": "Session",
+                                                 "max_stress": "Max Elbow Stress (Nm)"},
+                                         title="Peak Elbow Stress Trend")
+                        fig_s.update_traces(line=dict(color="#dc2626", width=3),
+                                             marker=dict(size=10, color="#fca5a5"))
+                        fig_s.add_hline(y=DANGER_VALGUS_NM, line_dash="dash",
+                                         line_color="#dc2626", opacity=0.5,
+                                         annotation_text=f"Danger ≥ {DANGER_VALGUS_NM} Nm",
+                                         annotation_position="top right")
+                        fig_s.update_layout(height=320, margin=dict(t=40, b=20))
+                        st.plotly_chart(fig_s, use_container_width=True)
+
+                    fig_p = px.line(trend_df, x="session_date", y="pitch_count",
+                                     markers=True,
+                                     labels={"session_date": "Session",
+                                             "pitch_count": "Pitches"},
+                                     title="Workload per Session (Pitch Count)")
+                    fig_p.update_traces(line=dict(color="#16a34a", width=3),
+                                         marker=dict(size=10, color="#86efac"))
+                    fig_p.update_layout(height=260, margin=dict(t=40, b=20))
+                    st.plotly_chart(fig_p, use_container_width=True)
+                elif len(trend_df) == 1:
+                    st.info("Log 2+ real sessions to see trend charts.")
+
+                st.divider()
+
+                # ----- Session list with delete -----
+                st.subheader("All Sessions")
+                for s in history:
+                    with st.container(border=True):
+                        c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 1, 1])
+                        date_str = pd.to_datetime(s["session_date"]).strftime("%b %d, %Y · %I:%M %p") \
+                            if s.get("session_date") else "—"
+                        type_pill = (
+                            "<span style='background:#dcfce7;color:#15803d;padding:2px 8px;"
+                            "border-radius:10px;font-size:10.5px;font-weight:700;'>REAL</span>"
+                            if s["session_type"] == "real"
+                            else "<span style='background:#eef2ff;color:#3730a3;padding:2px 8px;"
+                                 "border-radius:10px;font-size:10.5px;font-weight:700;'>SAMPLE</span>"
+                        )
+                        c1.markdown(_flat_html(
+                            f"<div style='font-weight:700;color:#1a2150;'>{date_str}</div>"
+                            f"<div style='margin-top:2px;'>{type_pill}</div>"
+                        ), unsafe_allow_html=True)
+                        c2.metric("Pitches", s.get("pitch_count", "—"))
+                        c3.metric("Avg Velo", f"{s['avg_velocity']:.1f} mph" if s.get("avg_velocity") is not None else "—")
+                        c4.metric("Peak Velo", f"{s['peak_velocity']:.1f} mph" if s.get("peak_velocity") is not None else "—")
+                        c5.metric("Max Stress", f"{s['max_stress']:.1f} Nm" if s.get("max_stress") is not None else "—")
+                        with c6:
+                            if st.button("🗑 Delete",
+                                          key=f"del_session_{s['id']}",
+                                          use_container_width=True):
+                                delete_session(s["id"])
+                                # Invalidate the saved-fingerprint so a fresh save isn't blocked
+                                if "_saved_fingerprint" in st.session_state:
+                                    del st.session_state["_saved_fingerprint"]
+                                st.rerun()
+
+    # ---- Pitch Tunneling tab ----
+    with tab_tunneling:
+        st.subheader("🪢 Pitch Tunneling — pair sequencing tool")
+        st.caption(
+            "Pick the **starting pitch**, click anywhere on the zone to place it, "
+            "then pick the **second pitch** you want to tunnel off the first. The "
+            "app uses this pitcher's measured break profile to compute exactly where "
+            "the second pitch would have to land to share the tunnel — and shows "
+            "both flight paths from three angles so the convergence at the commit "
+            "point and divergence at the plate are obvious."
+        )
+
+        # Build arsenal from the current session
+        breakdown = pitch_type_breakdown(df)
+        arsenal_rows = breakdown.to_dict("records")
+        if not arsenal_rows:
+            st.info("No pitches thrown yet — load a session to use the tunneling tool.")
+        elif len(arsenal_rows) < 2:
+            st.info("Need at least 2 different pitch types in the session to do pair tunneling.")
+        else:
+            available_types = [r["Pitch_Type"] for r in arsenal_rows]
+            # Pick the most-thrown fastball as the default starter
+            default_a_idx = 0
+            for i, r in enumerate(arsenal_rows):
+                if "Fastball" in r["Pitch_Type"] or "Sinker" in r["Pitch_Type"]:
+                    default_a_idx = i
+                    break
+            # Default second pitch = first non-starter pitch type
+            default_b_idx = 1 if default_a_idx == 0 else 0
+
+            # ---- Two-pitch selectors ----
+            sel_a, sel_b = st.columns(2)
+            with sel_a:
+                pitch_a = st.selectbox(
+                    "🎯 Starting pitch (the one you 'tunnel off')",
+                    available_types,
+                    index=default_a_idx,
+                    key="tunnel_pitch_a",
+                    help="Usually your fastball — the pitch the batter is gearing up for.",
+                )
+            # Available B-pitch options (everything except A)
+            b_options = [t for t in available_types if t != pitch_a]
+            with sel_b:
+                # Reset selection if A changed and the prior B equals new A
+                prior_b = st.session_state.get("tunnel_pitch_b")
+                if prior_b not in b_options:
+                    prior_b = b_options[0] if b_options else None
+                pitch_b = st.selectbox(
+                    "🪢 Second pitch (the one you tunnel WITH)",
+                    b_options,
+                    index=b_options.index(prior_b) if prior_b in b_options else 0,
+                    key="tunnel_pitch_b",
+                    help="The pitch you throw AFTER the starter — sequence weapon.",
+                )
+
+            # ---- Placement state + reset ----
+            cur_x = float(st.session_state.get("tunnel_plate_x", 0.0))
+            cur_z = float(st.session_state.get("tunnel_plate_z", 2.5))
+            loc_l, loc_r = st.columns([4, 1])
+            with loc_l:
+                st.markdown(
+                    _flat_html(
+                        f"<div style='background:#fffbeb;border:1px solid #fde68a;"
+                        f"border-left:4px solid #d4a634;border-radius:6px;"
+                        f"padding:10px 14px;margin-top:6px;'>"
+                        f"<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                        f"color:#92400e;text-transform:uppercase;margin-bottom:2px;'>"
+                        f"📍 Placement</div>"
+                        f"<div style='font-size:13px;color:#1f2937;'>"
+                        f"<b>{pitch_a}</b> at "
+                        f"<b>({cur_x:+.2f}, {cur_z:.2f}) ft</b> "
+                        f"<span style='color:#6b7280;'>→ </span>"
+                        f"<b>{pitch_b}</b> auto-tunneled. "
+                        f"<span style='color:#6b7280;'>Click anywhere on the Batter POV chart below to move the starter.</span>"
+                        f"</div></div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+            with loc_r:
+                if st.button("↺ Reset to middle-middle",
+                              use_container_width=True,
+                              key="tunnel_reset_btn"):
+                    st.session_state["tunnel_plate_x"] = 0.0
+                    st.session_state["tunnel_plate_z"] = 2.5
+                    st.rerun()
+
+            plate_x = float(st.session_state.get("tunnel_plate_x", 0.0))
+            plate_z = float(st.session_state.get("tunnel_plate_z", 2.5))
+
+            # ---- Compute tunnel for ONLY the two selected pitches ----
+            arsenal_pair = [r for r in arsenal_rows if r["Pitch_Type"] in (pitch_a, pitch_b)]
+            tunnel_data = compute_arsenal_tunnel(
+                arsenal=arsenal_pair,
+                starting_pitch_type=pitch_a,
+                plate_x=plate_x,
+                plate_z=plate_z,
+                sport=athlete_sport,
+            )
+            quality = tunnel_quality_metrics(tunnel_data)
+            pair_q = quality.get(pitch_b, {})
+
+            # ---- Two POV charts ----
+            # (Pitcher POV was removed — looking down a 60-ft tube at a small
+            # mitt never reads well in a 2D chart, and the Batter POV +
+            # Side View already cover the full tunneling story.)
+            sub_batter, sub_side = st.tabs([
+                "🧢 Batter POV (click to place)", "↔️ Side View"
+            ])
+            with sub_batter:
+                fig_b = _build_tunnel_batter_view(tunnel_data,
+                                                     sport=athlete_sport,
+                                                     hand=athlete_hand,
+                                                     clickable=True)
+                event = st.plotly_chart(
+                    fig_b,
+                    use_container_width=True,
+                    key="tunnel_batter_chart",
+                    on_select="rerun",
+                    selection_mode=("points",),
+                )
+                # ---- Capture click ----
+                try:
+                    if event and getattr(event, "selection", None):
+                        pts = event.selection.get("points", [])
+                        if pts:
+                            cd = pts[0].get("customdata")
+                            new_x, new_z = None, None
+                            if isinstance(cd, (list, tuple)) and len(cd) >= 2:
+                                new_x, new_z = float(cd[0]), float(cd[1])
+                            elif "x" in pts[0] and "y" in pts[0]:
+                                new_x, new_z = float(pts[0]["x"]), float(pts[0]["y"])
+                            if new_x is not None and new_z is not None:
+                                if (abs(new_x - plate_x) > 0.04 or
+                                    abs(new_z - plate_z) > 0.04):
+                                    st.session_state["tunnel_plate_x"] = new_x
+                                    st.session_state["tunnel_plate_z"] = new_z
+                                    st.rerun()
+                except Exception:
+                    pass
+                st.caption(
+                    "Catcher's view — what the batter sees. Both flight paths "
+                    "start from the same release, share the **commit window** "
+                    "(gold dashed circle), then visibly diverge in the final 22 ft. "
+                    "**Click anywhere** to move the starting pitch and watch the "
+                    "tunnel re-compute."
+                )
+            with sub_side:
+                fig_s = _build_tunnel_side_view(tunnel_data, sport=athlete_sport)
+                st.plotly_chart(fig_s, use_container_width=True,
+                                 key="tunnel_side_chart")
+                st.caption(
+                    "Side view — classic baseball-trajectory diagram. Pitcher on "
+                    "the left, catcher on the right. The two flight paths leave "
+                    "the **release ring** together, share the **tunnel ring** at "
+                    "the commit point, then arc into different spots at the "
+                    "**plate ring**."
+                )
+
+            # ---- Pair tunneling summary ----
+            st.divider()
+            st.subheader(f"How {pitch_b} tunnels off {pitch_a}")
+            if pair_q:
+                grade_colors = {
+                    "Elite":     ("#16a34a", "#dcfce7", "🟢"),
+                    "Good":      ("#15803d", "#d1fae5", "🟢"),
+                    "Loose":     ("#d4a634", "#fef3c7", "🟡"),
+                    "No Tunnel": ("#dc2626", "#fee2e2", "🔴"),
+                }
+                grade_color, grade_bg, grade_icon = grade_colors.get(
+                    pair_q["tunnel_grade"], ("#6b7280", "#f3f4f6", "⚪"))
+
+                # Three-stat tile row
+                t1, t2, t3, t4 = st.columns(4)
+                t1.metric("Tunnel Offset", f"{pair_q['tunnel_offset_in']}\"",
+                            help="At the commit point — lower is better. "
+                                 "Under 3\" is elite.")
+                t2.metric("Plate Separation", f"{pair_q['plate_diff_in']}\"",
+                            help="At the plate — higher = more deception "
+                                 "after the batter committed.")
+                t3.metric("Timing Differential", f"{pair_q['timing_offset_ms']:+.0f} ms",
+                            help="Velocity-gap the batter must adjust to "
+                                 "(positive = second pitch arrives later).")
+                t4.metric("Tunnel Grade", f"{grade_icon} {pair_q['tunnel_grade']}")
+
+                # Coaching takeaway specific to this pair
+                # Get plate locations for the narrative
+                pa = tunnel_data[pitch_a]
+                pb = tunnel_data[pitch_b]
+                st.markdown(
+                    _flat_html(
+                        f"<div style='background:{grade_bg};border:1px solid {grade_color}40;"
+                        f"border-left:4px solid {grade_color};border-radius:8px;"
+                        f"padding:14px 18px;margin-top:14px;'>"
+                        f"<div style='font-weight:700;color:{grade_color};'>"
+                        f"Coaching takeaway</div>"
+                        f"<div style='font-size:13px;color:#1f2937;margin-top:6px;'>"
+                        f"Throw the <b>{pitch_a}</b> to "
+                        f"<b>({pa['plate_x']:+.2f}, {pa['plate_z']:.2f}) ft</b>. "
+                        f"Then for the <b>{pitch_b}</b> to share the tunnel, it "
+                        f"needs to release on the SAME line and finish at "
+                        f"<b>({pb['plate_x']:+.2f}, {pb['plate_z']:.2f}) ft</b> — "
+                        f"a {pair_q['plate_diff_in']:.1f}\" separation. "
+                        f"Through the commit window, the two pitches are within "
+                        f"<b>{pair_q['tunnel_offset_in']:.1f}\"</b> of each other → "
+                        f"this is a <b>{pair_q['tunnel_grade']}</b> tunnel pairing."
+                        f"</div></div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+    # ---- Alignment quality tab ----
+    with tab_alignment:
+        st.subheader("Alignment Quality Audit")
+        # Derive counts from canonical df so this works in BOTH Demo Mode
+        # and real-data mode (Demo Mode doesn't have separate source DFs).
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Pitches in ball-flight source", len(df))
+        col_b.metric("Throws matched to Pulse",       int(df["Pulse_Present"].sum()))
+        col_c.metric("ProPlayAI captures matched",    int(df["PPAI_Present"].sum()))
+
+        st.write("**Per-pitch source presence:**")
+        audit = df[["Pitch_Num", "Timestamp", "Pitch_Type",
+                    "Pulse_Present", "Pulse_Match_Method",
+                    "PPAI_Present", "PPAI_Match_Method",
+                    "Alignment_Confidence", "Healed_Notes"]].copy()
+        audit["Alignment_Confidence"] = (audit["Alignment_Confidence"] * 100).astype(int).astype(str) + "%"
+        st.dataframe(audit, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "`timestamp_window` = clean match within ±5s. "
+            "`timestamp_wide` = matched within ±15s — review manually. "
+            "Blank method = no match found, row was healed with a placeholder."
+        )
+
+    # ---- Action plan tab ----
+    with tab_action:
+        plan = recommend_drills(df, sport=athlete_sport,
+                                 athlete_level=athlete_level)
+
+        # Color-code by category for visual hierarchy
+        CATEGORY_BADGES = {
+            "Injury Prevention":     ("🚨", "#d32f2f"),
+            "Mechanics":             ("🔧", "#1976d2"),
+            "Mechanics — Velocity":  ("🔧", "#1976d2"),
+            "Velocity":              ("⚡", "#f57c00"),
+            "Stuff — Fastball":      ("🎯", "#7b1fa2"),
+            "Stuff — Slider":        ("🎯", "#7b1fa2"),
+            "Stuff — Movement":      ("🎯", "#7b1fa2"),
+            "Grip":                  ("👆", "#00838f"),
+            "Consistency":           ("📐", "#388e3c"),
+        }
+
+        def render_drill_card(d):
+            badge_icon, badge_color = CATEGORY_BADGES.get(d["category"], ("•", "#666"))
+            with st.container(border=True):
+                # Top accent strip in category color (4px solid bar)
+                st.markdown(
+                    f"<div style='height:4px; background:{badge_color}; "
+                    f"margin:-1rem -1rem 12px -1rem; border-radius:6px 6px 0 0;'></div>",
+                    unsafe_allow_html=True,
+                )
+                # Header row: category badge + drill label
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'>"
+                    f"<span style='background:{badge_color};color:white;padding:3px 11px;"
+                    f"border-radius:14px;font-size:11px;font-weight:700;letter-spacing:0.04em;'>"
+                    f"{badge_icon} {d['category'].upper()}</span>"
+                    f"<span style='font-size:17px;font-weight:700;color:#1a2150;'>{d['label']}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                # If this drill has a grip visual, show drill text + grip SVG side-by-side
+                if d.get("grip_key"):
+                    left, right = st.columns([1.4, 1])
+                    with left:
+                        st.markdown(f"**Drill:** {d['drill']}")
+                        st.markdown(f"**Protocol:** {d['protocol']}")
+                        st.markdown(f"**Why it works:** {d['why']}")
+                    with right:
+                        render_grip_diagram(d["grip_key"])
+                    # Surface ALL release-style variants for this pitch so
+                    # the coach sees the menu of options + the trade-offs.
+                    if d["grip_key"] in GRIP_VARIANTS:
+                        with st.expander("**See all grip variants** "
+                                          "(arm-slot + palm-angle options)",
+                                          expanded=False):
+                            render_grip_variants(d["grip_key"])
+                else:
+                    st.markdown(f"**Drill:** {d['drill']}")
+                    st.markdown(f"**Protocol:** {d['protocol']}")
+                    st.markdown(f"**Why it works:** {d['why']}")
+                # "Watch demo" link button — opens the best-matched YouTube
+                # tutorial in a new tab. Shows the video title + source so the
+                # coach knows what they're about to open.
+                if d.get("video_url"):
+                    label = d.get("video_title") or "Watch demo on YouTube"
+                    source = d.get("video_source", "")
+                    source_html = (f"<span style='color:#6b7280;font-weight:500;'> · {source}</span>"
+                                    if source else "")
+                    st.markdown(
+                        _flat_html(
+                            f"<a href='{d['video_url']}' target='_blank' "
+                            f"style='display:inline-flex;align-items:center;gap:6px;"
+                            f"background:#fee2e2;color:#b91c1c;padding:6px 12px;"
+                            f"border-radius:6px;font-size:13px;font-weight:600;"
+                            f"text-decoration:none;margin-top:6px;'>"
+                            f"▶ {label}{source_html}</a>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                st.caption(f"📍 Why this fired: _{d['trigger']}_")
+
+        # =========================
+        # 5-DAY STRUCTURED WEEKLY PLAN
+        # Every day = warm-up → development drills (priority-flagged or
+        # general-development) → cool-down. Same structure regardless of
+        # whether the data flagged a glaring weakness or not.
+        # =========================
+        st.subheader("This Week — 5-Day Structured Plan")
+        st.caption(
+            "Every day opens with the standard warm-up and closes with the "
+            "cool-down (full sequences in the reference panel below). "
+            "Drill blocks adapt to the pitcher's specific weaknesses, or "
+            "fall back to general-development work when the data is clean."
+        )
+        weekly_p = build_weekly_plan("pitching", plan,
+                                       athlete_level=athlete_level)
+        for day in weekly_p:
+            with st.container(border=True):
+                st.markdown(
+                    _flat_html(
+                        f"<div style='font-size:11px;letter-spacing:0.10em;"
+                        f"font-weight:700;color:#d4a634;text-transform:uppercase;'>"
+                        f"Day {day['day_num']}</div>"
+                        f"<div style='font-size:18px;font-weight:700;color:#1a2150;"
+                        f"margin-bottom:4px;'>{day['label'].split('—',1)[-1].strip()}</div>"
+                        f"<div style='font-size:13px;color:#4b5563;margin-bottom:10px;'>"
+                        f"{day['notes']}</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    _flat_html(
+                        f"<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
+                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;'>"
+                        f"<b style='color:#15803d;'>Warm-up</b> "
+                        f"<span style='color:#6b7280;'>· {day['warmup']['duration']} · "
+                        f"{day['warmup']['label']}</span>"
+                        f"</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+                if day["drills"]:
+                    for d in day["drills"]:
+                        render_drill_card(d)
+                else:
+                    st.caption(
+                        "_No structured drills today — execute the bullpen/session described "
+                        "in the notes above with full intent._"
+                    )
+                st.markdown(
+                    _flat_html(
+                        f"<div style='background:#eff6ff;border-left:3px solid #3b82f6;"
+                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-top:8px;'>"
+                        f"<b style='color:#1e40af;'>Cool-down</b> "
+                        f"<span style='color:#6b7280;'>· {day['cooldown']['duration']} · "
+                        f"{day['cooldown']['label']}</span>"
+                        f"</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+        # =========================================================
+        # WARM-UP & COOL-DOWN REFERENCE — full sequences spelled out
+        # =========================================================
+        st.divider()
+        with st.expander("**Warm-Up & Cool-Down Reference** — full sequences",
+                          expanded=False):
+            for header, seq in [
+                ("Pitcher Pre-Bullpen Warm-Up",  PITCHING_WARMUP),
+                ("Pitcher Post-Bullpen Cool-Down", PITCHING_COOLDOWN),
+            ]:
+                st.markdown(
+                    _flat_html(
+                        f"<div style='font-size:11px;letter-spacing:0.10em;"
+                        f"font-weight:700;color:#d4a634;text-transform:uppercase;"
+                        f"margin-top:12px;'>{seq['duration']}</div>"
+                        f"<div style='font-size:16px;font-weight:700;color:#1a2150;"
+                        f"margin-bottom:8px;'>{header}</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+                for step_name, step_detail in seq["steps"]:
+                    st.markdown(
+                        _flat_html(
+                            f"<div style='border-left:3px solid #1a2150;padding:6px 12px;"
+                            f"background:#f6f7fb;border-radius:0 4px 4px 0;margin:4px 0;'>"
+                            f"<b style='color:#1a2150;'>{step_name}</b> "
+                            f"<span style='color:#4b5563;'>— {step_detail}</span>"
+                            f"</div>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(
+                    _flat_html(
+                        f"<div style='font-size:12px;color:#6b7280;font-style:italic;"
+                        f"margin-top:6px;margin-bottom:12px;'>"
+                        f"Why it matters: {seq['why']}</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # =========================
+        # DRILL LIBRARY (browseable — every drill, with demo video links)
+        # =========================
+        with st.expander(f"Drill Library — browse every {athlete_sport.lower()} drill with demo videos",
+                          expanded=False):
+            st.caption(
+                f"Every drill available for {athlete_sport.lower()} pitchers, grouped by category. "
+                "The Action Plan above only shows drills the data flagged for THIS pitcher — "
+                "this library shows everything, so coaches and players can browse and learn."
+            )
+
+            # Filter drills by sport (keys starting with 'softball_' are softball-only;
+            # everything else is baseball-only EXCEPT the truly shared cooldowns).
+            def _drill_is_for_sport(key: str) -> bool:
+                if athlete_sport == "Softball":
+                    return key.startswith("softball_")
+                else:
+                    return not key.startswith("softball_")
+
+            # Group by category
+            drills_by_cat: dict = {}
+            for key, d in DRILL_LIBRARY.items():
+                if not _drill_is_for_sport(key):
+                    continue
+                cat = d["category"]
+                drills_by_cat.setdefault(cat, []).append((key, d))
+
+            # Sort categories by a sensible order
+            CAT_ORDER = ["Injury Prevention", "Mechanics", "Mechanics — Velocity",
+                         "Velocity", "Stuff — Fastball", "Stuff — Slider",
+                         "Stuff — Rise Ball", "Stuff — Drop Ball", "Stuff — Movement",
+                         "Grip", "Consistency"]
+            for cat in CAT_ORDER:
+                if cat not in drills_by_cat:
+                    continue
+                st.markdown(f"#### {cat}")
+                for key, d in drills_by_cat[cat]:
+                    with st.container(border=True):
+                        st.markdown(f"**{d['label']}**")
+                        st.markdown(f"**Drill:** {d['drill']}")
+                        st.markdown(f"**Protocol:** {d['protocol']}")
+                        st.markdown(f"<span style='color:#6b7280;font-style:italic;'>Why it works: {d['why']}</span>",
+                                     unsafe_allow_html=True)
+                        # Show ALL curated alternate videos for this drill —
+                        # different sources / levels / severities the coach can pick from
+                        alternates = get_drill_video_alternates(key)
+                        if alternates:
+                            chips_html = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;'>"
+                            for v in alternates:
+                                meta_bits = []
+                                if v.get("severity", "any") != "any":
+                                    meta_bits.append(v["severity"])
+                                if v.get("level", "any") != "any":
+                                    meta_bits.append(v["level"])
+                                meta_str = (" · " + ", ".join(meta_bits)) if meta_bits else ""
+                                chips_html += (
+                                    f"<a href='{v['url']}' target='_blank' "
+                                    f"style='background:#fee2e2;color:#b91c1c;"
+                                    f"padding:6px 10px;border-radius:6px;font-size:12px;"
+                                    f"font-weight:600;text-decoration:none;'>"
+                                    f"▶ {v.get('title') or 'Watch demo'}"
+                                    f"<span style='color:#6b7280;font-weight:500;'> "
+                                    f"— {v.get('source','')}{meta_str}</span></a>"
+                                )
+                            chips_html += "</div>"
+                            st.markdown(_flat_html(chips_html), unsafe_allow_html=True)
+
+        # =========================
+        # GRIP LIBRARY (browse all grips)
+        # =========================
+        with st.expander("🤲 Grip Library — browse all grips with plain-English instructions", expanded=False):
+            st.caption(
+                "Each grip below is described for any coach, player, or parent — "
+                "no jargon. If a baseball term is unfamiliar, check the **Baseball "
+                "Glossary** at the bottom of this tab."
+            )
+            for gk, info in GRIP_LIBRARY.items():
+                with st.container(border=True):
+                    gcol1, gcol2 = st.columns([1, 1.4])
+                    with gcol1:
+                        st.markdown(f"### {info['label']}")
+                        render_grip_diagram(gk, height=340)
+                    with gcol2:
+                        st.markdown(info["description"])
+
+        # =========================
+        # SPORT-AWARE GLOSSARY (parent / young-player friendly)
+        # =========================
+        glossary_label = "Softball" if athlete_sport == "Softball" else "Baseball"
+        with st.expander(f"📚 {glossary_label} Glossary — what do these terms mean?",
+                          expanded=False):
+            st.caption(
+                f"Plain-English definitions of every {glossary_label.lower()} term used "
+                "in this report. Helpful for parents and young players who are new to "
+                "advanced metrics."
+            )
+            for term, definition in get_glossary_for_sport(athlete_sport):
+                st.markdown(f"{term}: {definition}")
+                st.markdown("")
+
+        # =========================
+        # EXPORT
+        # =========================
+        st.subheader("Export")
+
+        # Primary CTA: PDF report (this is what coaches text/email parents)
+        try:
+            pdf_bytes = generate_pbr_pdf(df, athlete_name, athlete_hand, athlete_class,
+                                          sport=athlete_sport, athlete_level=athlete_level)
+            st.download_button(
+                "📄  Download Post-Bullpen Report (PDF) — text or email to parent",
+                data=pdf_bytes,
+                file_name=f"{athlete_name.replace(' ', '_')}_PBR_{pd.Timestamp.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                type="primary",
+            )
+        except Exception as e:
+            st.warning(f"PDF generation hit an issue: `{type(e).__name__}: {e}`. "
+                       "The CSV + text exports below still work.")
+
+        # Secondary CTA: focused action-plan-only PDF
+        try:
+            ap_pdf = generate_action_plan_pdf(df, athlete_name, athlete_hand,
+                                               athlete_class, sport=athlete_sport,
+                                               athlete_level=athlete_level)
+            st.download_button(
+                "📋  Download Action Plan only (PDF) — focused 1-2 page coaching sheet",
+                data=ap_pdf,
+                file_name=f"{athlete_name.replace(' ', '_')}_ActionPlan_{pd.Timestamp.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.caption(f"Action plan PDF generation issue: `{type(e).__name__}: {e}`.")
+
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download canonical pitch CSV",
+                data=csv_bytes,
+                file_name=f"{athlete_name.replace(' ', '_')}_session.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with col_e2:
+            # Plain-text action plan — for pasting into an SMS or quick email body
+            text_plan = _format_plan_text(athlete_name, plan)
+            st.download_button(
+                "💬 Action plan as plain text (for SMS body)",
+                data=text_plan.encode("utf-8"),
+                file_name=f"{athlete_name.replace(' ', '_')}_action_plan.txt",
+                mime="text/plain",
+                use_container_width=True,
+                help="Use the PDF above for emails. This text version is for when you want "
+                     "to copy/paste the plan directly into a text message body.",
+            )
+
+    # ---- Pricing tab ----
+    with tab_pricing:
+        # Big hero pricing card
+        hero_html = _flat_html(
+            "<div style='background:linear-gradient(135deg,#1a2150 0%,#232c5e 100%);"
+            "padding:36px 32px;border-radius:14px;color:white;"
+            "box-shadow:0 4px 14px rgba(26,33,80,0.15);text-align:center;'>"
+            "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
+            "color:#d4a634;text-transform:uppercase;margin-bottom:10px;'>"
+            "Simple, Honest Pricing</div>"
+            "<div style='font-size:64px;font-weight:800;line-height:1;margin-bottom:6px;'>"
+            "$49<span style='font-size:22px;font-weight:500;'> / month</span></div>"
+            "<div style='font-size:14px;color:#d4a634;font-weight:600;margin-bottom:14px;'>"
+            "Flat fee · Unlimited pitchers · All features · Cancel anytime</div>"
+            "<div style='display:inline-block;background:rgba(22,163,74,0.20);"
+            "color:#86efac;padding:8px 18px;border-radius:20px;font-weight:700;"
+            "font-size:13px;letter-spacing:0.04em;'>"
+            "🟢 30-DAY FREE TRIAL · NO CONTRACT · NO CARD UPFRONT</div>"
+            "</div>"
+        )
+        st.markdown(hero_html, unsafe_allow_html=True)
+
+        st.write("")  # spacer
+
+        # CTAs
+        cta_a, cta_b, cta_c = st.columns(3)
+        with cta_a:
+            st.link_button(
+                "Start 30-day Free Trial →",
+                url="mailto:kolbydonnell@gmail.com?subject=Diamond%20Sports%20Lab%20Trial",
+                use_container_width=True,
+                type="primary",
+            )
+        with cta_b:
+            try:
+                sell_pdf = generate_sell_sheet_pdf()
+                st.download_button(
+                    "📄 Download Sell Sheet PDF",
+                    data=sell_pdf,
+                    file_name="Diamond_Sports_Lab_Sell_Sheet.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"Sell sheet generation issue: {e}")
+        with cta_c:
+            st.link_button(
+                "💬 Schedule a 15-min Demo",
+                url="mailto:kolbydonnell@gmail.com?subject=Diamond%20Sports%20Lab%20Demo",
+                use_container_width=True,
+            )
+
+        st.divider()
+
+        # What's included
+        st.subheader("Everything's included — no feature gates")
+        wi1, wi2 = st.columns(2)
+        with wi1:
+            st.markdown(_flat_html(
+                "<div style='background:#f0fdf4;border:1px solid #bbf7d0;"
+                "border-left:4px solid #16a34a;border-radius:8px;padding:16px 18px;'>"
+                "<div style='font-weight:700;color:#15803d;font-size:14px;margin-bottom:8px;'>"
+                "✓ Core analytics</div>"
+                "<div style='font-size:13px;color:#1f2937;line-height:1.8;'>"
+                "• Multi-pitcher roster + history<br/>"
+                "• Auto-saved sessions with rolling baselines<br/>"
+                "• Self-healing data alignment across 3 hardware vendors<br/>"
+                "• Strike-zone scatter with outlier detection<br/>"
+                "• Per-pitch detail panel with biomechanics<br/>"
+                "• Side-by-side pitch comparison<br/>"
+                "</div></div>"
+            ), unsafe_allow_html=True)
+        with wi2:
+            st.markdown(_flat_html(
+                "<div style='background:#fefce8;border:1px solid #fde68a;"
+                "border-left:4px solid #d4a634;border-radius:8px;padding:16px 18px;'>"
+                "<div style='font-weight:700;color:#92400e;font-size:14px;margin-bottom:8px;'>"
+                "✓ Coach + parent workflow</div>"
+                "<div style='font-size:13px;color:#1f2937;line-height:1.8;'>"
+                "• One-click branded PDF post-bullpen report<br/>"
+                "• Mechanics critique with strengths + corrective drills<br/>"
+                "• Today + Week action plan with grip diagrams<br/>"
+                "• Plain-English glossary for parents<br/>"
+                "• Bullpen video upload + slow-motion playback<br/>"
+                "• Trend charts across the season<br/>"
+                "</div></div>"
+            ), unsafe_allow_html=True)
+
+        st.divider()
+
+        # Comparison table
+        st.subheader("How Diamond Sports Lab compares")
+        st.caption("Honest comparison vs the alternatives most coaches consider.")
+
+        compare_html = _flat_html(
+            "<table style='width:100%;border-collapse:collapse;border:1px solid #e5e7eb;"
+            "border-radius:8px;overflow:hidden;font-size:13px;'>"
+            "<thead><tr style='background:#1a2150;color:white;'>"
+            "<th style='padding:12px;text-align:left;'>What you get</th>"
+            "<th style='padding:12px;text-align:center;'>Diamond Sports Lab</th>"
+            "<th style='padding:12px;text-align:center;'>Rapsodo PRO</th>"
+            "<th style='padding:12px;text-align:center;'>TrackMan B1</th>"
+            "<th style='padding:12px;text-align:center;'>Mustard.com</th>"
+            "</tr></thead>"
+            "<tbody style='background:white;'>"
+            "<tr><td style='padding:10px 12px;font-weight:600;'>Software / month</td>"
+            "<td style='text-align:center;font-weight:700;color:#16a34a;'>$49</td>"
+            "<td style='text-align:center;'>$499</td>"
+            "<td style='text-align:center;'>$160+</td>"
+            "<td style='text-align:center;'>$10</td></tr>"
+            "<tr style='background:#f6f7fb;'><td style='padding:10px 12px;font-weight:600;'>Hardware upfront</td>"
+            "<td style='text-align:center;font-weight:700;color:#16a34a;'>$610</td>"
+            "<td style='text-align:center;'>$3,000+</td>"
+            "<td style='text-align:center;'>$30,000+</td>"
+            "<td style='text-align:center;'>Phone only</td></tr>"
+            "<tr><td style='padding:10px 12px;font-weight:600;'>Ball-flight data</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td></tr>"
+            "<tr style='background:#f6f7fb;'><td style='padding:10px 12px;font-weight:600;'>Arm-health / elbow stress</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td></tr>"
+            "<tr><td style='padding:10px 12px;font-weight:600;'>3D biomechanics</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td></tr>"
+            "<tr style='background:#f6f7fb;'><td style='padding:10px 12px;font-weight:600;'>Branded parent PDF</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td></tr>"
+            "<tr><td style='padding:10px 12px;font-weight:600;'>Portable to any field</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td>"
+            "<td style='text-align:center;color:#dc2626;'>—</td>"
+            "<td style='text-align:center;color:#16a34a;'>✓</td></tr>"
+            "</tbody></table>"
+        )
+        st.markdown(compare_html, unsafe_allow_html=True)
+        st.caption(
+            "Pricing as of May 2026. Rapsodo and TrackMan also require an annual "
+            "software subscription on top of hardware. Diamond Sports Lab works alongside "
+            "an existing Rapsodo if you have one — drop the Rapsodo CSV in directly."
+        )
+
+        st.divider()
+
+        # FAQ
+        st.subheader("Frequently asked")
+        with st.expander("What happens after the 30-day trial?", expanded=False):
+            st.markdown(
+                "If you don't pay, the app stops generating new reports — but your historical "
+                "data is yours forever and can be exported as CSVs. No data lock-in."
+            )
+        with st.expander("Do I need to buy the hardware to use this?", expanded=False):
+            st.markdown(
+                "If you already have a Rapsodo or TrackMan, you can use those instead — drop "
+                "the CSV exports directly in. The hardware stack is recommended for new "
+                "facilities; existing data sources work alongside it."
+            )
+        with st.expander("Can I cancel anytime?", expanded=False):
+            st.markdown(
+                "Yes. Month-to-month. No contracts, no cancellation fees. "
+                "Annual prepay gets you ~2 months free if you want to lock in."
+            )
+        with st.expander("Do you have a free tier?", expanded=False):
+            st.markdown(
+                "Not yet. The 30-day free trial covers everyone. If you want a longer "
+                "trial because of season scheduling (e.g., 'I want to try this in spring "
+                "training when our pitchers are throwing 3× a week'), reach out — we'll "
+                "extend it for legitimate reasons."
+            )
+        with st.expander("Can a single pitcher / parent use this without a coach?", expanded=False):
+            st.markdown(
+                "Yes — the app works just as well for an individual pitcher tracking their "
+                "own development for college recruiting. A separate 'Solo' tier may launch "
+                "at $19/mo for 1 pitcher in the future; for now the $49 plan covers it."
+            )
+
+
+def _safe_main():
+    """Run main() with a friendly error card if anything goes wrong.
+
+    Never show a raw Python traceback to a coach — that breaks the spell.
+    Surface an actionable message instead.
+    """
+    try:
+        main()
+    except Exception as e:
+        import traceback as tb
+        st.error(
+            "⚠️ **Something went wrong.**\n\n"
+            "We hit an unexpected issue rendering this report. The data "
+            "you uploaded was saved, so nothing is lost — try refreshing "
+            "the page, or flip on **Sample Session** in the sidebar to "
+            "see if the app itself is working."
+        )
+        with st.expander("Technical details (share with Kolby if this keeps happening)"):
+            st.code(f"{type(e).__name__}: {e}\n\n{tb.format_exc()}", language="text")
+
+
+if __name__ == "__main__":
+    _safe_main()

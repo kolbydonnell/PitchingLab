@@ -1,0 +1,10 @@
+"Athlete_ID","Athlete_Name","Throw_ID","Timestamp","Throw_Type","Tag","Arm_Speed_deg_sec","Peak_Valgus_Torque_Nm","Arm_Slot_deg","Shoulder_Rotation_deg","Daily_Workload","Chronic_Workload","AC_Ratio","One_Day_Stress"
+"A992","Marcus Vance",10482,"2026-05-15 14:02:13","Mound_Pitch","Bullpen",985,53.8,48,172,8.2,21.4,0.38,28.4
+"A992","Marcus Vance",10483,"2026-05-15 14:02:58","Mound_Pitch","Bullpen",992,54.2,48,173,16.4,21.4,0.77,29.1
+"A992","Marcus Vance",10484,"2026-05-15 14:03:43","Mound_Pitch","Bullpen",945,52.1,46,170,24.8,21.4,1.16,26.8
+"A992","Marcus Vance",10485,"2026-05-15 14:04:28","Mound_Pitch","Bullpen",988,53.4,48,172,33.1,21.4,1.55,27.9
+"A992","Marcus Vance",10486,"2026-05-15 14:05:58","Mound_Pitch","Bullpen",905,65.2,42,168,49.7,21.4,2.32,48.5
+"A992","Marcus Vance",10487,"2026-05-15 14:06:43","Mound_Pitch","Bullpen",948,52.4,46,170,58.0,21.4,2.71,26.9
+"A992","Marcus Vance",10488,"2026-05-15 14:07:28","Mound_Pitch","Bullpen",990,53.6,48,172,66.3,21.4,3.10,28.1
+"A992","Marcus Vance",10489,"2026-05-15 14:08:13","Mound_Pitch","Bullpen",915,66.8,42,168,82.7,21.4,3.86,50.2
+"A992","Marcus Vance",10490,"2026-05-15 14:08:58","Mound_Pitch","Bullpen",898,48.7,42,168,90.8,21.4,4.24,24.2
