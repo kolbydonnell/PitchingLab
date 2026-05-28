@@ -14,8 +14,12 @@ showErrorDetails = true
 gatherUsageStats = false
 
 [server]
-# Local: open browser automatically. Streamlit Cloud overrides this anyway.
-headless = false
+# headless = true tells Streamlit "no terminal, no browser pop-up" —
+# REQUIRED on Streamlit Cloud, otherwise the boot hangs on the
+# "Welcome to Streamlit / Email:" prompt waiting for user input that
+# can never come. For local use, start.command auto-opens the browser
+# anyway, so this doesn't hurt the local experience.
+headless = true
 runOnSave = true
 # Allow larger video uploads for Live Capture beta testing.
 maxUploadSize = 200
