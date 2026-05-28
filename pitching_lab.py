@@ -5012,63 +5012,11 @@ def generate_post_swing_pdf(df: pd.DataFrame,
         "</font>", small
     ))
 
-    # =========================================================
-    # FULL DRILL LIBRARY — reference page
-    # Every issue + every drill, organized so coaches can swap
-    # alternates without re-running the app.
-    # =========================================================
-    story.append(PageBreak())
-    story.append(Paragraph("Full Hitting Drill Library — Reference", h1))
-    story.append(Paragraph(
-        "<font color='#6b7280'>Every drill in the system, organized by the issue "
-        "it targets. Pick whichever fits the hitter and your facility.</font>", small))
-    story.append(Spacer(1, 10))
-
-    issue_meta_pdf = [
-        ("bat_speed",      "Bat Speed",
-          "When average bat speed is below the target for the hitter's level."),
-        ("hip_separation", "Hip-Shoulder Separation",
-          "When the hips and shoulders are firing together — no rubber-band torque."),
-        ("flat_swing",     "Flat / Chopping-Down Swing Path",
-          "When the bat plane is below the productive 8°-16° attack-angle range."),
-        ("steep_swing",    "Steep Uppercut Swing Path",
-          "When attack angle is above 20° — whiffs and pop-ups."),
-        ("off_plane",      "Off-Plane Bat Path",
-          "When the bat is in the hitting zone for too small a window."),
-        ("slow_ttc",       "Slow Time-to-Contact",
-          "When the swing takes too long to get the barrel through the zone."),
-        ("whiffs",         "Elevated Whiff Rate",
-          "When the hitter is chasing offspeed or expanding the zone."),
-        ("weak_contact",   "Weak Contact Pattern",
-          "When the hitter rolls over or pops up too many balls."),
-    ]
-
-    for issue_key, heading, blurb in issue_meta_pdf:
-        keys = HITTING_ISSUE_TO_DRILLS.get(issue_key, [])
-        if not keys:
-            continue
-        story.append(Paragraph(f"<b>{heading}</b>", h2))
-        story.append(Paragraph(f"<font color='#6b7280' size='8'>{blurb}</font>", small))
-        story.append(Spacer(1, 3))
-        for k in keys:
-            d = HITTING_DRILL_LIBRARY[k]
-            v = pick_video(k, severity="any",
-                            level=LEVEL_TO_VIDEO_BUCKET.get(athlete_level, "any"))
-            parts = [
-                Paragraph(f"<b>• {d['label']}</b>", body),
-                Paragraph(f"<b>Drill:</b> {d['drill']}", body),
-                Paragraph(f"<b>Protocol:</b> {d['protocol']}", body),
-                Paragraph(f"<font color='#6b7280'><i>{d['why']}</i></font>", body),
-            ]
-            if v:
-                parts.append(Paragraph(
-                    f"<font color='#b91c1c' size='9'>▶ "
-                    f"<link href='{v['url']}' color='#b91c1c'>{v['title']}</link></font>",
-                    body
-                ))
-            parts.append(Spacer(1, 6))
-            story.append(KeepTogether(parts))
-        story.append(Spacer(1, 4))
+    # NOTE: The "Full Hitting Drill Library" reference page that used to
+    # live here has been intentionally removed — the Post-Swing PDF now
+    # ends with the per-hitter Action Plan only. Coaches who want the
+    # full library still have it inside the app (the expandable
+    # "Full Hitting Drill Library" panel on the Action Plan tab).
 
     doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
     return buf.getvalue()
@@ -7106,13 +7054,22 @@ def grip_svg(grip_key: str) -> str:
 # =============================================================================
 _GLOBAL_CSS = """
 <style>
-/* Pull Inter via CSS @import so Streamlit's markdown parser doesn't
-   render the link tags as literal text at the top of the page. */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
-/* === Diamond Sports Lab — design system === */
+/* =====================================================================
+   Diamond Sports Lab — DARK design system (night mode)
+   Palette:
+     --ink-50    text on dark        (#f1f5f9)
+     --ink-100   muted/secondary     (#cbd5e1)
+     --ink-300   tertiary/captions   (#94a3b8)
+     --bg-900    page background     (#0f172a)
+     --bg-800    elevated cards      (#1e293b)
+     --bg-700    borders/dividers    (#334155)
+     --blue-500  primary action      (#3b82f6)
+     --gold-500  accent (sparingly)  (#d4a634)
+   ===================================================================== */
 
-/* Typography & spacing — Inter for UI, JetBrains Mono for code */
+/* ===== Typography ===== */
 html, body, [class*="css"], .stApp, .main, section,
 .stMarkdown, .stMarkdown p, .stMarkdown div,
 .stPlotlyChart, .js-plotly-plot, .plotly,
@@ -7128,141 +7085,179 @@ button, input, select, textarea {
     max-width: 1240px;
 }
 
-/* Hide the Plotly toolbar globally — charts should look native, not
-   like embedded widgets. */
+/* ===== Hide Plotly modebar (charts should feel native) ===== */
 .modebar-container, .modebar, .modebar-group { display: none !important; }
 .plotly .modebar { display: none !important; }
 
-/* Hide ONLY the obvious "Python app" tells — do NOT hide the whole toolbar,
-   because the sidebar expand button lives in there. */
+/* ===== Page chrome cleanup ===== */
 #MainMenu { visibility: hidden; height: 0; }
 footer { visibility: hidden; height: 0; }
 [data-testid="stDeployButton"] { display: none; }
 [data-testid="stStatusWidget"] { display: none; }
 [data-testid="stDecoration"] { display: none; }
-
-/* Sidebar: keep visible + always-expandable */
 section[data-testid="stSidebar"] {
     visibility: visible !important;
     display: block !important;
 }
-/* Make the collapse/expand control always visible */
 [data-testid="collapsedControl"] {
     visibility: visible !important;
     display: flex !important;
 }
 
-/* Titles + headings — tighter weights, brand-aligned */
+/* ===== Headings ===== */
 h1, h2, h3, h4 {
-    color: #1a2150;
+    color: #f1f5f9 !important;
     font-weight: 700;
     letter-spacing: -0.01em;
 }
-h1 { font-size: 1.65rem !important; }
-h2 { font-size: 1.18rem !important; margin-top: 1.2rem !important; }
-h3 { font-size: 1.00rem !important; }
+h1 { font-size: 1.7rem !important; }
+h2 { font-size: 1.2rem  !important; margin-top: 1.2rem !important; }
+h3 { font-size: 1.02rem !important; }
+.stMarkdown p, .stMarkdown li, p, li {
+    color: #cbd5e1;
+}
+.stCaption, [data-testid="stCaptionContainer"], .stMarkdown small {
+    color: #94a3b8 !important;
+}
 
-/* Subtle section accent under subheaders */
-[data-testid="stMarkdownContainer"] h2::after,
-[data-testid="stMarkdownContainer"] h3::after { content: ""; }
-
-/* Tabs — large, bold, distinct.
-   Streamlit nests the tab label inside <p>, so we must target both the
-   button AND its inner text element with !important + absolute sizing. */
+/* ===== Tabs — blue/gray with bright-blue underline on active ===== */
 .stTabs [data-baseweb="tab-list"] {
     gap: 8px;
-    border-bottom: 2px solid #e5e7eb;
+    border-bottom: 2px solid #334155;
     background: transparent;
     margin-bottom: 6px;
 }
 .stTabs [data-baseweb="tab"],
 .stTabs button[role="tab"] {
-    font-size: 20px !important;
-    font-weight: 800 !important;
-    color: #6b7280 !important;
-    padding: 16px 26px !important;
+    font-size: 18px !important;
+    font-weight: 700 !important;
+    color: #94a3b8 !important;
+    padding: 14px 22px !important;
     background: transparent !important;
     border-radius: 8px 8px 0 0 !important;
     letter-spacing: 0.005em !important;
-    min-height: 56px !important;
+    min-height: 52px !important;
 }
 .stTabs [data-baseweb="tab"] p,
 .stTabs button[role="tab"] p,
 .stTabs [data-baseweb="tab"] *,
 .stTabs button[role="tab"] * {
-    font-size: 20px !important;
-    font-weight: 800 !important;
+    font-size: 18px !important;
+    font-weight: 700 !important;
     line-height: 1.2 !important;
 }
 .stTabs [data-baseweb="tab"]:hover,
 .stTabs button[role="tab"]:hover {
-    color: #1a2150 !important;
-    background: #f6f7fb !important;
+    color: #f1f5f9 !important;
+    background: #1e293b !important;
 }
 .stTabs [aria-selected="true"],
 .stTabs button[role="tab"][aria-selected="true"] {
-    color: #1a2150 !important;
-    background: #f6f7fb !important;
-    border-bottom: 4px solid #d4a634 !important;
+    color: #f1f5f9 !important;
+    background: #1e293b !important;
+    border-bottom: 3px solid #3b82f6 !important;
 }
 .stTabs [aria-selected="true"] p,
 .stTabs button[role="tab"][aria-selected="true"] p {
-    color: #1a2150 !important;
+    color: #f1f5f9 !important;
 }
 .stTabs [data-baseweb="tab-panel"] { padding-top: 1.2rem !important; }
 
-/* Buttons — clean rounded primary */
+/* ===== Buttons ===== */
 .stButton > button, .stDownloadButton > button {
     border-radius: 8px;
     font-weight: 600;
     padding: 0.55rem 1rem;
-    transition: transform 0.05s ease;
+    transition: transform 0.05s ease, background 0.15s ease;
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: #e2e8f0;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+    background: #334155;
+    border-color: #475569;
 }
 .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
-    background: linear-gradient(180deg, #232c5e 0%, #1a2150 100%);
-    border: 1px solid #1a2150;
+    background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+    border: 1px solid #2563eb;
     color: white;
+}
+.stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {
+    background: linear-gradient(180deg, #60a5fa 0%, #3b82f6 100%);
 }
 .stButton > button:active { transform: translateY(1px); }
 
-/* Sidebar polish */
+/* ===== Sidebar ===== */
 [data-testid="stSidebar"] {
-    background: #f6f7fb;
-    border-right: 1px solid #e5e7eb;
+    background: #111827 !important;
+    border-right: 1px solid #1e293b;
 }
+[data-testid="stSidebar"] * {
+    color: #e2e8f0;
+}
+[data-testid="stSidebar"] hr { border-color: #1e293b; }
 
-/* Native st.metric polish (used in tabs that still rely on it) */
+/* ===== Native st.metric — dark cards ===== */
 [data-testid="stMetric"] {
-    background: white;
-    border: 1px solid #e5e7eb;
+    background: #1e293b;
+    border: 1px solid #334155;
     border-radius: 10px;
     padding: 12px 14px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.12);
 }
 [data-testid="stMetricLabel"] {
     text-transform: uppercase;
     letter-spacing: 0.06em;
     font-size: 0.72rem !important;
-    color: #6b7280;
+    color: #94a3b8;
     font-weight: 600;
 }
 [data-testid="stMetricValue"] {
-    color: #1a2150;
+    color: #f1f5f9;
     font-weight: 700;
     font-size: 1.55rem !important;
 }
 
-/* Divider */
-hr { border-color: #e5e7eb; margin: 1.2rem 0; }
+/* ===== Inputs / selectboxes / sliders ===== */
+.stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"],
+.stNumberInput input, .stDateInput input {
+    background: #1e293b !important;
+    color: #e2e8f0 !important;
+    border-color: #334155 !important;
+}
 
-/* Code blocks — readable */
+/* ===== Dividers / expanders ===== */
+hr { border-color: #1e293b !important; margin: 1.2rem 0; }
+[data-testid="stExpander"] {
+    background: #1e293b !important;
+    border: 1px solid #334155 !important;
+    border-radius: 10px !important;
+}
+.streamlit-expanderHeader, [data-testid="stExpander"] summary {
+    font-weight: 600;
+    color: #f1f5f9 !important;
+}
+
+/* ===== st.success / info / warning / error banners — dark mode ===== */
+[data-testid="stAlert"] {
+    background: #1e293b !important;
+    border: 1px solid #334155 !important;
+    color: #e2e8f0 !important;
+}
+
+/* ===== Code blocks ===== */
 code, pre {
     font-family: "SF Mono", Menlo, Monaco, Consolas, monospace;
     font-size: 0.85rem;
+    background: #1e293b !important;
+    color: #cbd5e1 !important;
 }
 
-/* Expander headers */
-.streamlit-expanderHeader { font-weight: 600; color: #1a2150; }
+/* ===== Bordered containers (st.container(border=True)) ===== */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: #1e293b !important;
+    border-color: #334155 !important;
+}
 </style>
 """
 
@@ -7288,17 +7283,19 @@ CHART_FONT_STACK = (
 )
 
 CHART_PALETTE = {
-    "ink":         "#1a2150",   # primary text + bold lines
-    "ink_soft":    "#374151",   # body text
-    "muted":       "#6b7280",   # tertiary text
-    "border":      "#e5e7eb",   # subtle borders
-    "gridline":    "#f1f3f7",   # very subtle gridlines
-    "bg":          "#ffffff",   # chart background
-    "page_bg":     "#ffffff",   # page background
+    # Dark mode palette — matches the global CSS dark theme so charts
+    # blend into the page instead of looking like white cutouts.
+    "ink":         "#f1f5f9",   # primary text + bold lines (slate-100)
+    "ink_soft":    "#cbd5e1",   # body text (slate-300)
+    "muted":       "#94a3b8",   # tertiary text (slate-400)
+    "border":      "#334155",   # subtle borders (slate-700)
+    "gridline":    "#1e293b",   # very subtle gridlines (slate-800)
+    "bg":          "#1e293b",   # chart background (slate-800 — lifted card)
+    "page_bg":     "#0f172a",   # page background (slate-900)
     "accent":      "#d4a634",   # gold accent
-    "success":     "#16a34a",
+    "success":     "#22c55e",
     "warn":        "#d4a634",
-    "danger":      "#dc2626",
+    "danger":      "#ef4444",
 }
 
 
@@ -10540,11 +10537,39 @@ def main():
         mode_sub = "Pitching · Bullpen Analytics"
         if st.session_state.get("app_mode", "Pitching") == "Hitting":
             mode_sub = "Hitting · Swing Analytics"
+        # ===== DIAMOND SPORTS LAB — brand logo =====
+        # Stylized diamond (baseball-field shape) in brand blue/gold with
+        # the wordmark next to it. Renders cleanly on the dark sidebar.
+        logo_svg = (
+            "<svg width='40' height='40' viewBox='0 0 40 40' xmlns='http://www.w3.org/2000/svg'>"
+            # Outer diamond (baseball-field shape)
+            "<path d='M 20 4 L 36 20 L 20 36 L 4 20 Z' "
+            "fill='url(#grad1)' stroke='#3b82f6' stroke-width='1.5' />"
+            # Inner diamond (infield)
+            "<path d='M 20 12 L 28 20 L 20 28 L 12 20 Z' "
+            "fill='none' stroke='#d4a634' stroke-width='1.5' opacity='0.85' />"
+            # Center dot (home plate marker)
+            "<circle cx='20' cy='20' r='2' fill='#d4a634' />"
+            # Gradient def
+            "<defs><linearGradient id='grad1' x1='0%' y1='0%' x2='100%' y2='100%'>"
+            "<stop offset='0%' stop-color='#1e3a8a' />"
+            "<stop offset='100%' stop-color='#3b82f6' />"
+            "</linearGradient></defs>"
+            "</svg>"
+        )
         st.markdown(
-            f"<div style='display:flex;align-items:center;gap:8px;'>"
-            f"<div style='font-size:28px;'>◆</div>"
-            f"<div><div style='font-size:18px;font-weight:700;line-height:1.1;'>Diamond Sports Lab</div>"
-            f"<div style='font-size:11px;color:#888;'>{mode_sub}</div></div></div>",
+            _flat_html(
+                f"<div style='display:flex;align-items:center;gap:12px;"
+                f"padding:6px 0 4px 0;'>"
+                f"{logo_svg}"
+                f"<div>"
+                f"<div style='font-size:18px;font-weight:800;line-height:1.05;"
+                f"color:#f1f5f9;letter-spacing:-0.01em;'>Diamond Sports Lab</div>"
+                f"<div style='font-size:11px;color:#94a3b8;letter-spacing:0.06em;"
+                f"text-transform:uppercase;font-weight:600;margin-top:2px;'>"
+                f"{mode_sub}</div>"
+                f"</div></div>"
+            ),
             unsafe_allow_html=True,
         )
         st.divider()

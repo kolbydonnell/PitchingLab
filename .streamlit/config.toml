@@ -1,10 +1,11 @@
-# Diamond Sports Lab — Streamlit theme
+# Diamond Sports Lab — DARK theme (night mode)
 [theme]
-primaryColor = "#1a2150"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f6f7fb"
-textColor = "#1f2937"
-font = "sans serif"
+base = "dark"
+primaryColor          = "#3b82f6"   # bright blue — primary actions, tab accent
+backgroundColor       = "#0f172a"   # slate-900, deep navy page background
+secondaryBackgroundColor = "#1e293b"  # slate-800, lifted cards/sidebar
+textColor             = "#e2e8f0"   # slate-200, body text
+font                  = "sans serif"
 
 [client]
 toolbarMode = "minimal"
@@ -14,12 +15,7 @@ showErrorDetails = true
 gatherUsageStats = false
 
 [server]
-# headless = true tells Streamlit "no terminal, no browser pop-up" —
-# REQUIRED on Streamlit Cloud, otherwise the boot hangs on the
-# "Welcome to Streamlit / Email:" prompt waiting for user input that
-# can never come. For local use, start.command auto-opens the browser
-# anyway, so this doesn't hurt the local experience.
+# headless = true REQUIRED on Streamlit Cloud — skips email onboarding hang.
 headless = true
 runOnSave = true
-# Allow larger video uploads for Live Capture beta testing.
 maxUploadSize = 200
