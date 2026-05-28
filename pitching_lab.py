@@ -9010,54 +9010,52 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         )
         weekly = build_weekly_plan("hitting", plan,
                                      athlete_level=athlete_level)
+        # Lazy-load Days 2-5 into expanders — Streamlit Cloud's renderer
+        # chokes on 5 bordered containers × nested drill cards all at once.
+        def _render_hitting_day(day):
+            st.markdown(
+                _flat_html(
+                    f"<div style='font-size:13px;color:#4b5563;margin-bottom:10px;'>"
+                    f"{day['notes']}</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                _flat_html(
+                    f"<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
+                    f"padding:8px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;'>"
+                    f"<b style='color:#15803d;'>Warm-up</b> "
+                    f"<span style='color:#6b7280;'>· {day['warmup']['duration']} · "
+                    f"{day['warmup']['label']}</span>"
+                    f"</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            if day["drills"]:
+                for d in day["drills"]:
+                    render_hit_drill_card(d)
+            else:
+                st.caption(
+                    "_No structured drills today — execute the live BP/session described "
+                    "in the notes above with full intent._"
+                )
+            st.markdown(
+                _flat_html(
+                    f"<div style='background:#eff6ff;border-left:3px solid #3b82f6;"
+                    f"padding:8px 12px;border-radius:0 6px 6px 0;margin-top:8px;'>"
+                    f"<b style='color:#1e40af;'>Cool-down</b> "
+                    f"<span style='color:#6b7280;'>· {day['cooldown']['duration']} · "
+                    f"{day['cooldown']['label']}</span>"
+                    f"</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
         for day in weekly:
-            with st.container(border=True):
-                # Day header
-                st.markdown(
-                    _flat_html(
-                        f"<div style='font-size:11px;letter-spacing:0.10em;"
-                        f"font-weight:700;color:#d4a634;text-transform:uppercase;'>"
-                        f"Day {day['day_num']}</div>"
-                        f"<div style='font-size:18px;font-weight:700;color:#1a2150;"
-                        f"margin-bottom:4px;'>{day['label'].split('—',1)[-1].strip()}</div>"
-                        f"<div style='font-size:13px;color:#4b5563;margin-bottom:10px;'>"
-                        f"{day['notes']}</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
-                # Warm-up summary line
-                st.markdown(
-                    _flat_html(
-                        f"<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
-                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;'>"
-                        f"<b style='color:#15803d;'>Warm-up</b> "
-                        f"<span style='color:#6b7280;'>· {day['warmup']['duration']} · "
-                        f"{day['warmup']['label']}</span>"
-                        f"</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
-                # Drill blocks
-                if day["drills"]:
-                    for d in day["drills"]:
-                        render_hit_drill_card(d)
-                else:
-                    st.caption(
-                        "_No structured drills today — execute the live BP/session described "
-                        "in the notes above with full intent._"
-                    )
-                # Cool-down summary line
-                st.markdown(
-                    _flat_html(
-                        f"<div style='background:#eff6ff;border-left:3px solid #3b82f6;"
-                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-top:8px;'>"
-                        f"<b style='color:#1e40af;'>Cool-down</b> "
-                        f"<span style='color:#6b7280;'>· {day['cooldown']['duration']} · "
-                        f"{day['cooldown']['label']}</span>"
-                        f"</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
+            day_label = day["label"].split("—", 1)[-1].strip()
+            header = f"**Day {day['day_num']} — {day_label}**"
+            with st.expander(header, expanded=(day["day_num"] == 1)):
+                _render_hitting_day(day)
 
         # =========================================================
         # WARM-UP & COOL-DOWN REFERENCE — full sequences spelled out
@@ -11831,50 +11829,54 @@ def main():
         )
         weekly_p = build_weekly_plan("pitching", plan,
                                        athlete_level=athlete_level)
+        # Render Day 1 expanded by default + Days 2-5 collapsed.
+        # Streamlit Cloud's free tier struggles to render 5 dense bordered
+        # containers + nested drill cards all at once — lazy-loading the
+        # later days as expanders keeps the initial render light.
+        def _render_pitching_day(day):
+            st.markdown(
+                _flat_html(
+                    f"<div style='font-size:13px;color:#4b5563;margin-bottom:10px;'>"
+                    f"{day['notes']}</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                _flat_html(
+                    f"<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
+                    f"padding:8px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;'>"
+                    f"<b style='color:#15803d;'>Warm-up</b> "
+                    f"<span style='color:#6b7280;'>· {day['warmup']['duration']} · "
+                    f"{day['warmup']['label']}</span>"
+                    f"</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            if day["drills"]:
+                for d in day["drills"]:
+                    render_drill_card(d)
+            else:
+                st.caption(
+                    "_No structured drills today — execute the bullpen/session described "
+                    "in the notes above with full intent._"
+                )
+            st.markdown(
+                _flat_html(
+                    f"<div style='background:#eff6ff;border-left:3px solid #3b82f6;"
+                    f"padding:8px 12px;border-radius:0 6px 6px 0;margin-top:8px;'>"
+                    f"<b style='color:#1e40af;'>Cool-down</b> "
+                    f"<span style='color:#6b7280;'>· {day['cooldown']['duration']} · "
+                    f"{day['cooldown']['label']}</span>"
+                    f"</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
         for day in weekly_p:
-            with st.container(border=True):
-                st.markdown(
-                    _flat_html(
-                        f"<div style='font-size:11px;letter-spacing:0.10em;"
-                        f"font-weight:700;color:#d4a634;text-transform:uppercase;'>"
-                        f"Day {day['day_num']}</div>"
-                        f"<div style='font-size:18px;font-weight:700;color:#1a2150;"
-                        f"margin-bottom:4px;'>{day['label'].split('—',1)[-1].strip()}</div>"
-                        f"<div style='font-size:13px;color:#4b5563;margin-bottom:10px;'>"
-                        f"{day['notes']}</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    _flat_html(
-                        f"<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
-                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;'>"
-                        f"<b style='color:#15803d;'>Warm-up</b> "
-                        f"<span style='color:#6b7280;'>· {day['warmup']['duration']} · "
-                        f"{day['warmup']['label']}</span>"
-                        f"</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
-                if day["drills"]:
-                    for d in day["drills"]:
-                        render_drill_card(d)
-                else:
-                    st.caption(
-                        "_No structured drills today — execute the bullpen/session described "
-                        "in the notes above with full intent._"
-                    )
-                st.markdown(
-                    _flat_html(
-                        f"<div style='background:#eff6ff;border-left:3px solid #3b82f6;"
-                        f"padding:8px 12px;border-radius:0 6px 6px 0;margin-top:8px;'>"
-                        f"<b style='color:#1e40af;'>Cool-down</b> "
-                        f"<span style='color:#6b7280;'>· {day['cooldown']['duration']} · "
-                        f"{day['cooldown']['label']}</span>"
-                        f"</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
+            day_label = day["label"].split("—", 1)[-1].strip()
+            header = f"**Day {day['day_num']} — {day_label}**"
+            with st.expander(header, expanded=(day["day_num"] == 1)):
+                _render_pitching_day(day)
 
         # =========================================================
         # WARM-UP & COOL-DOWN REFERENCE — full sequences spelled out
