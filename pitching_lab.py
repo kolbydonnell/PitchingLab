@@ -7089,6 +7089,19 @@ button, input, select, textarea {
 .modebar-container, .modebar, .modebar-group { display: none !important; }
 .plotly .modebar { display: none !important; }
 
+/* ===== Mobile scroll fix — tell touch devices to pass vertical scroll
+   through the plotly container to the page. Without this, dragging on
+   any chart hijacks the scroll on iOS and the user can't get past it. */
+.stPlotlyChart, .js-plotly-plot, .plotly, .plot-container, .svg-container {
+    touch-action: pan-y !important;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+/* Disable the cursor showing "drag" on hover too */
+.js-plotly-plot .plotly .nsewdrag, .js-plotly-plot .plotly .cursor-pointer {
+    cursor: default !important;
+}
+
 /* ===== Page chrome cleanup ===== */
 #MainMenu { visibility: hidden; height: 0; }
 footer { visibility: hidden; height: 0; }
@@ -7273,8 +7286,11 @@ def _inject_global_styles():
 # Use CHART_CONFIG for st.plotly_chart() calls to hide the modebar.
 # =============================================================================
 CHART_CONFIG = {
-    "displayModeBar": False,
-    "responsive":     True,
+    "displayModeBar":   False,
+    "responsive":       True,
+    "scrollZoom":       False,   # no pinch-to-zoom — page handles vertical scroll
+    "doubleClick":      False,   # no double-tap-to-reset (steals taps)
+    "showAxisDragHandles": False,
 }
 
 CHART_FONT_STACK = (
@@ -7323,6 +7339,11 @@ def _apply_chart_theme(fig, *, preserve_bg: bool = False):
         font=dict(family=CHART_FONT_STACK,
                    size=12,
                    color=CHART_PALETTE["ink_soft"]),
+        # dragmode=False locks the chart so touch drags pass through to
+        # the page scroll instead of panning the chart. Critical for
+        # mobile UX — otherwise users can't scroll past any chart on
+        # their phone. Clicks (for click-to-place / on_select) still work.
+        dragmode=False,
         hoverlabel=dict(
             font=dict(family=CHART_FONT_STACK, size=12, color="white"),
             bgcolor=CHART_PALETTE["ink"],
