@@ -7286,11 +7286,29 @@ def _inject_global_styles():
 # Use CHART_CONFIG for st.plotly_chart() calls to hide the modebar.
 # =============================================================================
 CHART_CONFIG = {
-    "displayModeBar":   False,
-    "responsive":       True,
-    "scrollZoom":       False,   # no pinch-to-zoom — page handles vertical scroll
-    "doubleClick":      False,   # no double-tap-to-reset (steals taps)
-    "showAxisDragHandles": False,
+    # Default config for non-interactive charts — staticPlot: True freezes
+    # the chart completely. No drag, no pan, no zoom, no double-tap-reset.
+    # Tap events still bubble up to Streamlit, but the chart itself can't be
+    # moved off the page or zoomed in. This is the right default for any
+    # chart that doesn't use st.plotly_chart(..., on_select=...).
+    "staticPlot":         True,
+    "displayModeBar":     False,
+    "responsive":         True,
+    "scrollZoom":         False,
+    "doubleClick":        False,
+    "showAxisDragHandles":False,
+}
+
+# Subset for the few charts that need click events (click-to-place tunneling,
+# spray-chart-click-for-swing-detail, etc.). staticPlot must be False for
+# Streamlit's on_select to fire — but all other interactivity is locked.
+CHART_CONFIG_INTERACTIVE = {
+    "staticPlot":         False,
+    "displayModeBar":     False,
+    "responsive":         True,
+    "scrollZoom":         False,
+    "doubleClick":        False,
+    "showAxisDragHandles":False,
 }
 
 CHART_FONT_STACK = (
@@ -7357,9 +7375,11 @@ def _apply_chart_theme(fig, *, preserve_bg: bool = False):
         ),
     )
     if not preserve_bg:
-        layout_kwargs["paper_bgcolor"] = CHART_PALETTE["bg"]
-        # Don't override plot_bgcolor — some charts use a contextual bg
-        # (e.g. spray chart uses stadium navy, side view uses sky blue).
+        # Make the chart look "built into" the page — same background as the
+        # page itself. Without overriding plot_bgcolor too, the inside-the-
+        # axes area would show as a white rectangle against the dark page.
+        layout_kwargs["paper_bgcolor"] = CHART_PALETTE["page_bg"]
+        layout_kwargs["plot_bgcolor"]  = CHART_PALETTE["page_bg"]
     # Update title font (but NOT title text) — preserves headline content
     # while restyling its typography. Wrapped because stub figures used in
     # tests don't always expose .layout / .layout.title attributes.
@@ -8404,6 +8424,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                 key="hitting_spray_chart",
                 on_select="rerun",
                 selection_mode=("points",),
+                config=CHART_CONFIG_INTERACTIVE,
             )
 
             # Pull the clicked swing number
@@ -8479,6 +8500,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
             key="hitting_zone_chart",
             on_select="rerun",
             selection_mode=("points",),
+            config=CHART_CONFIG_INTERACTIVE,
         )
         # Zone click overrides spray click if more recent
         try:
@@ -8536,7 +8558,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
             fig.update_traces(marker=dict(size=14, line=dict(width=1, color="black")),
                                 textposition="top center")
             fig.update_layout(height=480, legend_title_text="")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
         else:
             st.info("No balls in play this session.")
 
@@ -8828,7 +8850,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_bs.update_traces(line=dict(color="#1a2150", width=3),
                                               marker=dict(size=10, color="#d4a634"))
                         fig_bs.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_bs, use_container_width=True)
+                        st.plotly_chart(fig_bs, use_container_width=True, config=CHART_CONFIG)
                     with t2:
                         fig_ev = px.line(trend_df, x="session_date",
                                           y=["avg_exit_velo", "peak_exit_velo"],
@@ -8839,7 +8861,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                                           title="Exit Velocity (Avg + Peak)")
                         fig_ev.update_traces(line=dict(width=3))
                         fig_ev.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_ev, use_container_width=True)
+                        st.plotly_chart(fig_ev, use_container_width=True, config=CHART_CONFIG)
 
                     # ----- Trend chart row 2: contact quality -----
                     st.subheader("Contact Quality Over Time")
@@ -8853,7 +8875,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_brl.update_traces(line=dict(color="#7f1d1d", width=3),
                                                marker=dict(size=10, color="#fca5a5"))
                         fig_brl.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_brl, use_container_width=True)
+                        st.plotly_chart(fig_brl, use_container_width=True, config=CHART_CONFIG)
                     with t4:
                         fig_wf = px.line(trend_df, x="session_date", y="whiff_pct",
                                           markers=True,
@@ -8867,7 +8889,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                                           annotation_text="HS average ≈ 22%",
                                           annotation_position="top right")
                         fig_wf.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_wf, use_container_width=True)
+                        st.plotly_chart(fig_wf, use_container_width=True, config=CHART_CONFIG)
 
                     # ----- Trend chart row 3: on-plane + workload -----
                     st.subheader("Bat Path & Workload Over Time")
@@ -8881,7 +8903,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_op.update_traces(line=dict(color="#16a34a", width=3),
                                               marker=dict(size=10, color="#86efac"))
                         fig_op.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_op, use_container_width=True)
+                        st.plotly_chart(fig_op, use_container_width=True, config=CHART_CONFIG)
                     with t6:
                         fig_w = px.line(trend_df, x="session_date", y="total_swings",
                                          markers=True,
@@ -8891,7 +8913,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_w.update_traces(line=dict(color="#d4a634", width=3),
                                              marker=dict(size=10, color="#fde68a"))
                         fig_w.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_w, use_container_width=True)
+                        st.plotly_chart(fig_w, use_container_width=True, config=CHART_CONFIG)
                 elif len(trend_df) == 1:
                     st.info("Log 2+ hitting sessions to see trend charts here.")
 
@@ -11158,7 +11180,7 @@ def main():
         fig.update_traces(marker=dict(size=14, line=dict(width=1, color="black")),
                           textposition="top center")
         fig.update_layout(height=480)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
 
         # =====================================================
         # STRIKE ZONE SCATTER (clickable → per-pitch detail panel below)
@@ -11172,6 +11194,7 @@ def main():
                 key="strike_zone_chart",
                 on_select="rerun",
                 selection_mode=("points",),
+                config=CHART_CONFIG_INTERACTIVE,
             )
 
             # Determine which pitch (if any) is selected.
@@ -11486,7 +11509,7 @@ def main():
                         fig_v.update_traces(line=dict(color="#1a2150", width=3),
                                              marker=dict(size=10, color="#d4a634"))
                         fig_v.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_v, use_container_width=True)
+                        st.plotly_chart(fig_v, use_container_width=True, config=CHART_CONFIG)
                     with tcol2:
                         fig_s = px.line(trend_df, x="session_date", y="max_stress",
                                          markers=True,
@@ -11500,7 +11523,7 @@ def main():
                                          annotation_text=f"Danger ≥ {DANGER_VALGUS_NM} Nm",
                                          annotation_position="top right")
                         fig_s.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_s, use_container_width=True)
+                        st.plotly_chart(fig_s, use_container_width=True, config=CHART_CONFIG)
 
                     fig_p = px.line(trend_df, x="session_date", y="pitch_count",
                                      markers=True,
@@ -11510,7 +11533,7 @@ def main():
                     fig_p.update_traces(line=dict(color="#16a34a", width=3),
                                          marker=dict(size=10, color="#86efac"))
                     fig_p.update_layout(height=260, margin=dict(t=40, b=20))
-                    st.plotly_chart(fig_p, use_container_width=True)
+                    st.plotly_chart(fig_p, use_container_width=True, config=CHART_CONFIG)
                 elif len(trend_df) == 1:
                     st.info("Log 2+ real sessions to see trend charts.")
 
@@ -11667,6 +11690,7 @@ def main():
                     key="tunnel_batter_chart",
                     on_select="rerun",
                     selection_mode=("points",),
+                    config=CHART_CONFIG_INTERACTIVE,
                 )
                 # ---- Capture click ----
                 try:
@@ -11697,7 +11721,7 @@ def main():
             with sub_side:
                 fig_s = _build_tunnel_side_view(tunnel_data, sport=athlete_sport)
                 st.plotly_chart(fig_s, use_container_width=True,
-                                 key="tunnel_side_chart")
+                                 key="tunnel_side_chart", config=CHART_CONFIG)
                 st.caption(
                     "Side view — classic baseball-trajectory diagram. Pitcher on "
                     "the left, catcher on the right. The two flight paths leave "
