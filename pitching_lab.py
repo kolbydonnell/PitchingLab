@@ -7089,17 +7089,52 @@ button, input, select, textarea {
 .modebar-container, .modebar, .modebar-group { display: none !important; }
 .plotly .modebar { display: none !important; }
 
-/* ===== Mobile scroll fix — tell touch devices to pass vertical scroll
-   through the plotly container to the page. Without this, dragging on
-   any chart hijacks the scroll on iOS and the user can't get past it. */
-.stPlotlyChart, .js-plotly-plot, .plotly, .plot-container, .svg-container {
+/* ===== Mobile scroll lockdown for Plotly charts =====
+   Plotly draws an invisible "pan-grab" rectangle (.nsewdrag class) that
+   captures touch/drag events for panning. On mobile, that hijacks the
+   page scroll. We disable pointer-events on JUST that pan layer so
+   swipes fall through to the page, while taps on the actual data dots
+   still register their on_select event. */
+.stPlotlyChart, .js-plotly-plot, .plotly, .plot-container, .svg-container,
+.main-svg, .draglayer {
     touch-action: pan-y !important;
     -webkit-user-select: none;
     -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: contain;
 }
-/* Disable the cursor showing "drag" on hover too */
-.js-plotly-plot .plotly .nsewdrag, .js-plotly-plot .plotly .cursor-pointer {
+/* The pan-grab overlay — invisible, intercepts swipes. Turn it off. */
+.js-plotly-plot .nsewdrag,
+.js-plotly-plot .draglayer .nsewdrag,
+.js-plotly-plot .draglayer .nsewdrag-bg,
+.js-plotly-plot .draglayer .nwdrag,
+.js-plotly-plot .draglayer .nedrag,
+.js-plotly-plot .draglayer .sedrag,
+.js-plotly-plot .draglayer .swdrag,
+.js-plotly-plot .draglayer .ndrag,
+.js-plotly-plot .draglayer .edrag,
+.js-plotly-plot .draglayer .sdrag,
+.js-plotly-plot .draglayer .wdrag {
+    pointer-events: none !important;
     cursor: default !important;
+}
+/* Keep clicks on data points working — these are the "scatter trace"
+   markers, the layer that fires Plotly's on_select. */
+.js-plotly-plot .scatterlayer,
+.js-plotly-plot .scatterlayer .points,
+.js-plotly-plot .scatterlayer .points path,
+.js-plotly-plot .scatterlayer .point {
+    pointer-events: auto !important;
+}
+
+/* ===== Tunneling Batter POV — slight 3D perspective tilt =====
+   Targets the chart keyed "tunnel_batter_chart". A small leftward rotateY
+   makes the trail recede convincingly so the flight path reads as depth
+   instead of a flat overlay. */
+[data-testid="stPlotlyChart"]:has(> div > div[id*="tunnel_batter_chart"]),
+.element-container:has([data-testid*="tunnel_batter_chart"]) {
+    transform: perspective(1400px) rotateY(-6deg) translateX(-12px);
+    transform-origin: center center;
+    transition: transform 0.2s ease;
 }
 
 /* ===== Page chrome cleanup ===== */
@@ -7299,12 +7334,21 @@ CHART_CONFIG = {
     "showAxisDragHandles":False,
 }
 
-# Previously CHART_CONFIG_INTERACTIVE allowed click events at the cost of
-# letting the chart be dragged off the screen on mobile. Mobile UX wins —
-# every chart is now fully static. Click-to-select interactions on the
-# zone/spray/tunneling charts are replaced with dropdowns + sliders so
-# they still work on phone AND laptop.
-CHART_CONFIG_INTERACTIVE = CHART_CONFIG
+# For the few charts that need click events. staticPlot must be False here
+# so Streamlit's on_select fires when the user taps a data point. Drag-
+# based interactions (pan, zoom, double-click reset) are still all OFF.
+# The mobile scroll-trap is solved by the aggressive CSS below in
+# _GLOBAL_CSS — `pointer-events: none` on Plotly's invisible pan-overlay
+# layer means swipes pass through to the page, while taps on the visible
+# data dots still register.
+CHART_CONFIG_INTERACTIVE = {
+    "staticPlot":         False,
+    "displayModeBar":     False,
+    "responsive":         True,
+    "scrollZoom":         False,
+    "doubleClick":        False,
+    "showAxisDragHandles":False,
+}
 
 CHART_FONT_STACK = (
     'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", '
@@ -7955,7 +7999,7 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         plot_bgcolor="#0f172a",  # dark blue-gray "stadium" background
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=620,
+        height=760,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -8137,7 +8181,7 @@ def _build_hit_quality_zone_heatmap_figure(
         yaxis=dict(title="Height (ft)", range=(0.5, 4.5),
                     zeroline=False, showgrid=False,
                     scaleanchor="x", scaleratio=1),
-        height=620,
+        height=800,
         legend=dict(orientation="h", yanchor="bottom", y=1.04),
         margin=dict(l=20, r=20, t=60, b=40),
         plot_bgcolor="white",
@@ -8411,17 +8455,34 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Spray chart click capture
         spray_fig = _build_spray_chart_figure(df, sport=athlete_sport, hand=athlete_hand)
 
-        spray_col, detail_col = st.columns([1.25, 1.0])
+        # Wider spray column — the field is the centerpiece of this tab.
+        spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
             spray_event = st.plotly_chart(
                 spray_fig,
                 use_container_width=True,
                 key="hitting_spray_chart",
-                config=CHART_CONFIG,
+                on_select="rerun",
+                selection_mode=("points",),
+                config=CHART_CONFIG_INTERACTIVE,
             )
+            # ----- Pull a clicked swing number from the chart event -----
+            chart_clicked = None
+            try:
+                if spray_event and getattr(spray_event, "selection", None):
+                    pts = spray_event.selection.get("points", [])
+                    if pts:
+                        cd = pts[0].get("customdata")
+                        if isinstance(cd, (int, float)):
+                            chart_clicked = int(cd)
+                        elif isinstance(cd, (list, tuple)) and len(cd):
+                            chart_clicked = int(cd[0])
+            except Exception:
+                chart_clicked = None
 
         with detail_col:
-            # Mobile-friendly swing picker (replaces click-on-chart)
+            # Picker — works as fallback on mobile and as a direct selector.
+            # Pre-fills with the most recent CLICK if there was one.
             swing_options = {
                 int(r["Swing_Num"]):
                     f"Swing #{int(r['Swing_Num'])} — "
@@ -8429,10 +8490,14 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                 for _, r in df.iterrows()
             }
             keys = list(swing_options.keys())
+            # If a click just happened, override the dropdown's default
+            if chart_clicked is not None and chart_clicked in keys:
+                st.session_state["hitting_swing_picker"] = chart_clicked
+                st.session_state["hitting_selected_swing"] = chart_clicked
             prior = st.session_state.get("hitting_selected_swing")
             default_idx = keys.index(prior) if prior in keys else 0
             selected_swing_num = st.selectbox(
-                "Pick a swing",
+                "Pick a swing (or click a dot on the spray chart)",
                 keys,
                 format_func=lambda k: swing_options[k],
                 index=default_idx,
@@ -8468,12 +8533,31 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                 history_df = pd.DataFrame()
 
         zone_fig = _build_hit_quality_zone_heatmap_figure(df, history_df=history_df)
-        st.plotly_chart(
+        zone_event = st.plotly_chart(
             zone_fig,
             use_container_width=True,
             key="hitting_zone_chart",
-            config=CHART_CONFIG,
+            on_select="rerun",
+            selection_mode=("points",),
+            config=CHART_CONFIG_INTERACTIVE,
         )
+        # Sync chart click into the spray-side picker (zone click overrides).
+        try:
+            if zone_event and getattr(zone_event, "selection", None):
+                pts = zone_event.selection.get("points", [])
+                if pts:
+                    cd = pts[0].get("customdata")
+                    clicked = None
+                    if isinstance(cd, (int, float)):
+                        clicked = int(cd)
+                    elif isinstance(cd, (list, tuple)) and len(cd):
+                        clicked = int(cd[0])
+                    if clicked is not None and clicked != st.session_state.get("hitting_selected_swing"):
+                        st.session_state["hitting_swing_picker"] = clicked
+                        st.session_state["hitting_selected_swing"] = clicked
+                        st.rerun()
+        except Exception:
+            pass
 
         st.divider()
         # =====================================================
@@ -11146,19 +11230,37 @@ def main():
         st.subheader("Strike Zone Map")
         if df["Strike_Zone_Side"].notna().any():
             sz_fig = _build_strike_zone_figure(df)
-            st.plotly_chart(
+            sz_event = st.plotly_chart(
                 sz_fig,
                 use_container_width=True,
                 key="strike_zone_chart",
-                config=CHART_CONFIG,
+                on_select="rerun",
+                selection_mode=("points",),
+                config=CHART_CONFIG_INTERACTIVE,
             )
+            # ----- If a click happened, sync to the dropdown -----
+            try:
+                if sz_event and getattr(sz_event, "selection", None):
+                    pts = sz_event.selection.get("points", [])
+                    if pts:
+                        cd = pts[0].get("customdata")
+                        clicked = None
+                        if isinstance(cd, (int, float)):
+                            clicked = int(cd)
+                        elif isinstance(cd, (list, tuple)) and len(cd):
+                            clicked = int(cd[0])
+                        if clicked is not None:
+                            st.session_state["strike_zone_pitch_picker"] = clicked
+            except Exception:
+                pass
+
             st.caption(
                 "Green-outlined dots = positive outliers (above-average pitches). "
                 "Red-outlined dots = negative outliers (concerning pitches). "
                 "Strike-zone box = ~17\" wide plate, knees to letters."
             )
 
-            # ----- PITCH DETAIL via dropdown (mobile-friendly) -----
+            # ----- PITCH DETAIL via dropdown (mobile-friendly fallback) -----
             st.divider()
             st.subheader("Pitch Detail")
             pitch_options = {
@@ -11169,7 +11271,7 @@ def main():
             }
             keys = list(pitch_options.keys())
             selected_pitch_num = st.selectbox(
-                "Pick a pitch to inspect",
+                "Pick a pitch (or click a dot on the chart)",
                 keys,
                 format_func=lambda k: pitch_options[k],
                 index=0,
