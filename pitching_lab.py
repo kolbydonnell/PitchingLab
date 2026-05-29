@@ -7299,17 +7299,12 @@ CHART_CONFIG = {
     "showAxisDragHandles":False,
 }
 
-# Subset for the few charts that need click events (click-to-place tunneling,
-# spray-chart-click-for-swing-detail, etc.). staticPlot must be False for
-# Streamlit's on_select to fire — but all other interactivity is locked.
-CHART_CONFIG_INTERACTIVE = {
-    "staticPlot":         False,
-    "displayModeBar":     False,
-    "responsive":         True,
-    "scrollZoom":         False,
-    "doubleClick":        False,
-    "showAxisDragHandles":False,
-}
+# Previously CHART_CONFIG_INTERACTIVE allowed click events at the cost of
+# letting the chart be dragged off the screen on mobile. Mobile UX wins —
+# every chart is now fully static. Click-to-select interactions on the
+# zone/spray/tunneling charts are replaced with dropdowns + sliders so
+# they still work on phone AND laptop.
+CHART_CONFIG_INTERACTIVE = CHART_CONFIG
 
 CHART_FONT_STACK = (
     'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", '
@@ -8422,51 +8417,30 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                 spray_fig,
                 use_container_width=True,
                 key="hitting_spray_chart",
-                on_select="rerun",
-                selection_mode=("points",),
-                config=CHART_CONFIG_INTERACTIVE,
+                config=CHART_CONFIG,
             )
 
-            # Pull the clicked swing number
-            selected_swing_num = None
-            try:
-                if spray_event and getattr(spray_event, "selection", None):
-                    points = spray_event.selection.get("points", [])
-                    if points:
-                        cd = points[0].get("customdata")
-                        if isinstance(cd, (int, float)):
-                            selected_swing_num = int(cd)
-                        elif isinstance(cd, (list, tuple)) and len(cd):
-                            selected_swing_num = int(cd[0])
-            except Exception:
-                selected_swing_num = None
-
         with detail_col:
-            # Pull through any previously-clicked swing from session state so
-            # the panel persists across reruns until a new selection is made
-            if selected_swing_num is None:
-                selected_swing_num = st.session_state.get("hitting_selected_swing")
-
-            if selected_swing_num is None:
-                st.markdown(
-                    _flat_html(
-                        "<div style='background:#f6f7fb;border:1px dashed #cbd5e1;"
-                        "border-radius:10px;padding:18px;color:#475569;"
-                        "font-size:13px;line-height:1.5;'>"
-                        "<div style='font-size:12px;letter-spacing:0.08em;font-weight:700;"
-                        "color:#1a2150;text-transform:uppercase;margin-bottom:6px;'>"
-                        "🔍 Swing Detail</div>"
-                        "Click any landing dot on the spray chart (or a dot on the "
-                        "strike-zone heat map below) and the swing's pitch, bat, "
-                        "and contact metrics show up here."
-                        "</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
-            else:
-                match = df[df["Swing_Num"] == selected_swing_num]
-                if not match.empty:
-                    _render_swing_detail_panel(match.iloc[0], sport=athlete_sport)
+            # Mobile-friendly swing picker (replaces click-on-chart)
+            swing_options = {
+                int(r["Swing_Num"]):
+                    f"Swing #{int(r['Swing_Num'])} — "
+                    f"{str(r['Swing_Outcome']).replace('_',' ').title()}"
+                for _, r in df.iterrows()
+            }
+            keys = list(swing_options.keys())
+            prior = st.session_state.get("hitting_selected_swing")
+            default_idx = keys.index(prior) if prior in keys else 0
+            selected_swing_num = st.selectbox(
+                "Pick a swing",
+                keys,
+                format_func=lambda k: swing_options[k],
+                index=default_idx,
+                key="hitting_swing_picker",
+            )
+            match = df[df["Swing_Num"] == selected_swing_num]
+            if not match.empty:
+                _render_swing_detail_panel(match.iloc[0], sport=athlete_sport)
 
         # Remember the selection across reruns
         if selected_swing_num is not None:
@@ -8494,28 +8468,12 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                 history_df = pd.DataFrame()
 
         zone_fig = _build_hit_quality_zone_heatmap_figure(df, history_df=history_df)
-        zone_event = st.plotly_chart(
+        st.plotly_chart(
             zone_fig,
             use_container_width=True,
             key="hitting_zone_chart",
-            on_select="rerun",
-            selection_mode=("points",),
-            config=CHART_CONFIG_INTERACTIVE,
+            config=CHART_CONFIG,
         )
-        # Zone click overrides spray click if more recent
-        try:
-            if zone_event and getattr(zone_event, "selection", None):
-                points = zone_event.selection.get("points", [])
-                if points:
-                    cd = points[0].get("customdata")
-                    if isinstance(cd, (int, float)):
-                        st.session_state["hitting_selected_swing"] = int(cd)
-                        st.rerun()
-                    elif isinstance(cd, (list, tuple)) and len(cd):
-                        st.session_state["hitting_selected_swing"] = int(cd[0])
-                        st.rerun()
-        except Exception:
-            pass
 
         st.divider()
         # =====================================================
@@ -11185,84 +11143,39 @@ def main():
         # =====================================================
         # STRIKE ZONE SCATTER (clickable → per-pitch detail panel below)
         # =====================================================
-        st.subheader("Strike Zone Map (click any pitch for details)")
+        st.subheader("Strike Zone Map")
         if df["Strike_Zone_Side"].notna().any():
             sz_fig = _build_strike_zone_figure(df)
-            event = st.plotly_chart(
+            st.plotly_chart(
                 sz_fig,
                 use_container_width=True,
                 key="strike_zone_chart",
-                on_select="rerun",
-                selection_mode=("points",),
-                config=CHART_CONFIG_INTERACTIVE,
+                config=CHART_CONFIG,
             )
-
-            # Determine which pitch (if any) is selected.
-            # Streamlit's plotly selection event can return customdata in a few
-            # shapes depending on version: list, dict, numpy array, or scalar.
-            # Be defensive about indexing — and as a safety net, fall back to
-            # the point_index + curve_number to look up the pitch number directly.
-            selected_pitch_num = None
-            try:
-                if event and getattr(event, "selection", None):
-                    points = event.selection.get("points", [])
-                    if points:
-                        pt = points[0]
-                        cd = pt.get("customdata")
-                        # Try every reasonable shape
-                        if cd is None:
-                            pass
-                        elif isinstance(cd, (int, float)):
-                            selected_pitch_num = int(cd)
-                        elif isinstance(cd, dict):
-                            # Could be {"0": <num>} or have a Pitch_Num key
-                            if 0 in cd:
-                                selected_pitch_num = int(cd[0])
-                            elif "0" in cd:
-                                selected_pitch_num = int(cd["0"])
-                            elif "Pitch_Num" in cd:
-                                selected_pitch_num = int(cd["Pitch_Num"])
-                        else:
-                            # list / tuple / numpy array
-                            try:
-                                selected_pitch_num = int(cd[0])
-                            except (KeyError, IndexError, TypeError):
-                                # Fall back to treating cd itself as the value
-                                try:
-                                    selected_pitch_num = int(cd)
-                                except (ValueError, TypeError):
-                                    pass
-
-                        # Safety net: if customdata didn't work, use point coordinates
-                        # to find the pitch by matching plate location
-                        if selected_pitch_num is None:
-                            x, y = pt.get("x"), pt.get("y")
-                            if x is not None and y is not None:
-                                match = df[
-                                    (df["Strike_Zone_Side"].sub(x).abs() < 0.01) &
-                                    (df["Strike_Zone_Height"].sub(y).abs() < 0.01)
-                                ]
-                                if not match.empty:
-                                    selected_pitch_num = int(match.iloc[0]["Pitch_Num"])
-            except Exception as e:
-                # Never let a click crash the whole app
-                st.warning(f"Could not parse click event: {e}")
-                selected_pitch_num = None
-
-            # Legend explanation
             st.caption(
-                "🟢 outlined dots = positive outliers (above-average pitches). "
-                "🔴 outlined dots = negative outliers (concerning pitches). "
+                "Green-outlined dots = positive outliers (above-average pitches). "
+                "Red-outlined dots = negative outliers (concerning pitches). "
                 "Strike-zone box = ~17\" wide plate, knees to letters."
             )
 
-            # ----- PITCH DETAIL PANEL -----
+            # ----- PITCH DETAIL via dropdown (mobile-friendly) -----
             st.divider()
             st.subheader("Pitch Detail")
-            if selected_pitch_num is None:
-                st.info("Click a dot on the strike-zone map above to see that pitch's details, "
-                        "the data behind any outlier flag, and the video clip (when video is uploaded).")
-            else:
+            pitch_options = {
+                int(r["Pitch_Num"]):
+                    f"Pitch #{int(r['Pitch_Num'])} — {r['Pitch_Type']} "
+                    f"({r['Velocity_mph']:.1f} mph)"
+                for _, r in df.iterrows()
+            }
+            keys = list(pitch_options.keys())
+            selected_pitch_num = st.selectbox(
+                "Pick a pitch to inspect",
+                keys,
+                format_func=lambda k: pitch_options[k],
+                index=0,
+                key="strike_zone_pitch_picker",
+            )
+            if selected_pitch_num is not None:
                 pitch = df[df["Pitch_Num"] == selected_pitch_num].iloc[0]
                 _render_pitch_detail_panel(pitch, athlete_name=athlete_name, sport=athlete_sport)
         else:
@@ -11626,39 +11539,39 @@ def main():
                     help="The pitch you throw AFTER the starter — sequence weapon.",
                 )
 
-            # ---- Placement state + reset ----
-            cur_x = float(st.session_state.get("tunnel_plate_x", 0.0))
-            cur_z = float(st.session_state.get("tunnel_plate_z", 2.5))
-            loc_l, loc_r = st.columns([4, 1])
-            with loc_l:
-                st.markdown(
-                    _flat_html(
-                        f"<div style='background:#fffbeb;border:1px solid #fde68a;"
-                        f"border-left:4px solid #d4a634;border-radius:6px;"
-                        f"padding:10px 14px;margin-top:6px;'>"
-                        f"<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
-                        f"color:#92400e;text-transform:uppercase;margin-bottom:2px;'>"
-                        f"📍 Placement</div>"
-                        f"<div style='font-size:13px;color:#1f2937;'>"
-                        f"<b>{pitch_a}</b> at "
-                        f"<b>({cur_x:+.2f}, {cur_z:.2f}) ft</b> "
-                        f"<span style='color:#6b7280;'>→ </span>"
-                        f"<b>{pitch_b}</b> auto-tunneled. "
-                        f"<span style='color:#6b7280;'>Click anywhere on the Batter POV chart below to move the starter.</span>"
-                        f"</div></div>"
-                    ),
-                    unsafe_allow_html=True,
+            # ---- Placement controls — sliders work on phone + laptop ----
+            # The old click-to-place on the chart let the chart get dragged
+            # off screen on mobile. Two sliders below give the same control
+            # in a way that cooperates with page scrolling.
+            slide_l, slide_r, reset_col = st.columns([3, 3, 1])
+            with slide_l:
+                plate_x = st.slider(
+                    "Plate side (ft)",
+                    min_value=-1.5, max_value=1.5,
+                    value=float(st.session_state.get("tunnel_plate_x", 0.0)),
+                    step=0.05,
+                    key="tunnel_plate_x_slider",
+                    help="Negative = third-base side. Positive = first-base side.",
                 )
-            with loc_r:
-                if st.button("↺ Reset to middle-middle",
+            with slide_r:
+                plate_z = st.slider(
+                    "Plate height (ft)",
+                    min_value=0.5, max_value=4.5,
+                    value=float(st.session_state.get("tunnel_plate_z", 2.5)),
+                    step=0.05,
+                    key="tunnel_plate_z_slider",
+                    help="1.6 ft = bottom of zone, 3.5 ft = top of zone.",
+                )
+            with reset_col:
+                st.write("")  # spacer
+                if st.button("Reset",
                               use_container_width=True,
                               key="tunnel_reset_btn"):
-                    st.session_state["tunnel_plate_x"] = 0.0
-                    st.session_state["tunnel_plate_z"] = 2.5
+                    st.session_state["tunnel_plate_x_slider"] = 0.0
+                    st.session_state["tunnel_plate_z_slider"] = 2.5
                     st.rerun()
-
-            plate_x = float(st.session_state.get("tunnel_plate_x", 0.0))
-            plate_z = float(st.session_state.get("tunnel_plate_z", 2.5))
+            st.session_state["tunnel_plate_x"] = plate_x
+            st.session_state["tunnel_plate_z"] = plate_z
 
             # ---- Compute tunnel for ONLY the two selected pitches ----
             arsenal_pair = [r for r in arsenal_rows if r["Pitch_Type"] in (pitch_a, pitch_b)]
@@ -11673,50 +11586,26 @@ def main():
             pair_q = quality.get(pitch_b, {})
 
             # ---- Two POV charts ----
-            # (Pitcher POV was removed — looking down a 60-ft tube at a small
-            # mitt never reads well in a 2D chart, and the Batter POV +
-            # Side View already cover the full tunneling story.)
             sub_batter, sub_side = st.tabs([
-                "🧢 Batter POV (click to place)", "↔️ Side View"
+                "Batter POV", "Side View"
             ])
             with sub_batter:
+                # clickable=False — placement is driven by the sliders above
                 fig_b = _build_tunnel_batter_view(tunnel_data,
                                                      sport=athlete_sport,
                                                      hand=athlete_hand,
-                                                     clickable=True)
-                event = st.plotly_chart(
+                                                     clickable=False)
+                st.plotly_chart(
                     fig_b,
                     use_container_width=True,
                     key="tunnel_batter_chart",
-                    on_select="rerun",
-                    selection_mode=("points",),
-                    config=CHART_CONFIG_INTERACTIVE,
+                    config=CHART_CONFIG,
                 )
-                # ---- Capture click ----
-                try:
-                    if event and getattr(event, "selection", None):
-                        pts = event.selection.get("points", [])
-                        if pts:
-                            cd = pts[0].get("customdata")
-                            new_x, new_z = None, None
-                            if isinstance(cd, (list, tuple)) and len(cd) >= 2:
-                                new_x, new_z = float(cd[0]), float(cd[1])
-                            elif "x" in pts[0] and "y" in pts[0]:
-                                new_x, new_z = float(pts[0]["x"]), float(pts[0]["y"])
-                            if new_x is not None and new_z is not None:
-                                if (abs(new_x - plate_x) > 0.04 or
-                                    abs(new_z - plate_z) > 0.04):
-                                    st.session_state["tunnel_plate_x"] = new_x
-                                    st.session_state["tunnel_plate_z"] = new_z
-                                    st.rerun()
-                except Exception:
-                    pass
                 st.caption(
                     "Catcher's view — what the batter sees. Both flight paths "
                     "start from the same release, share the **commit window** "
                     "(gold dashed circle), then visibly diverge in the final 22 ft. "
-                    "**Click anywhere** to move the starting pitch and watch the "
-                    "tunnel re-compute."
+                    "Use the sliders above to move the starting pitch."
                 )
             with sub_side:
                 fig_s = _build_tunnel_side_view(tunnel_data, sport=athlete_sport)
