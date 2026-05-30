@@ -8520,31 +8520,11 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            spray_event = st.plotly_chart(
-                spray_fig,
-                use_container_width=True,
-                key="hitting_spray_chart",
-                on_select="rerun",
-                selection_mode=("points",),
-                config=CHART_CONFIG_INTERACTIVE,
-            )
-            # ----- Pull a clicked swing number from the chart event -----
-            chart_clicked = None
-            try:
-                if spray_event and getattr(spray_event, "selection", None):
-                    pts = spray_event.selection.get("points", [])
-                    if pts:
-                        cd = pts[0].get("customdata")
-                        if isinstance(cd, (int, float)):
-                            chart_clicked = int(cd)
-                        elif isinstance(cd, (list, tuple)) and len(cd):
-                            chart_clicked = int(cd[0])
-            except Exception:
-                chart_clicked = None
+            render_static_chart(spray_fig, key="hitting_spray_chart",
+                                  height_px=620)
 
         with detail_col:
-            # Picker — works as fallback on mobile and as a direct selector.
-            # Pre-fills with the most recent CLICK if there was one.
+            # Picker is now the sole selection mechanism (chart is a PNG).
             swing_options = {
                 int(r["Swing_Num"]):
                     f"Swing #{int(r['Swing_Num'])} — "
@@ -8552,14 +8532,10 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                 for _, r in df.iterrows()
             }
             keys = list(swing_options.keys())
-            # If a click just happened, override the dropdown's default
-            if chart_clicked is not None and chart_clicked in keys:
-                st.session_state["hitting_swing_picker"] = chart_clicked
-                st.session_state["hitting_selected_swing"] = chart_clicked
             prior = st.session_state.get("hitting_selected_swing")
             default_idx = keys.index(prior) if prior in keys else 0
             selected_swing_num = st.selectbox(
-                "Pick a swing (or click a dot on the spray chart)",
+                "Pick a swing",
                 keys,
                 format_func=lambda k: swing_options[k],
                 index=default_idx,
@@ -8595,31 +8571,8 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                 history_df = pd.DataFrame()
 
         zone_fig = _build_hit_quality_zone_heatmap_figure(df, history_df=history_df)
-        zone_event = st.plotly_chart(
-            zone_fig,
-            use_container_width=True,
-            key="hitting_zone_chart",
-            on_select="rerun",
-            selection_mode=("points",),
-            config=CHART_CONFIG_INTERACTIVE,
-        )
-        # Sync chart click into the spray-side picker (zone click overrides).
-        try:
-            if zone_event and getattr(zone_event, "selection", None):
-                pts = zone_event.selection.get("points", [])
-                if pts:
-                    cd = pts[0].get("customdata")
-                    clicked = None
-                    if isinstance(cd, (int, float)):
-                        clicked = int(cd)
-                    elif isinstance(cd, (list, tuple)) and len(cd):
-                        clicked = int(cd[0])
-                    if clicked is not None and clicked != st.session_state.get("hitting_selected_swing"):
-                        st.session_state["hitting_swing_picker"] = clicked
-                        st.session_state["hitting_selected_swing"] = clicked
-                        st.rerun()
-        except Exception:
-            pass
+        render_static_chart(zone_fig, key="hitting_zone_chart",
+                              height_px=700)
 
         st.divider()
         # =====================================================
@@ -11342,29 +11295,7 @@ def main():
         st.subheader("Strike Zone Map")
         if df["Strike_Zone_Side"].notna().any():
             sz_fig = _build_strike_zone_figure(df)
-            sz_event = st.plotly_chart(
-                sz_fig,
-                use_container_width=True,
-                key="strike_zone_chart",
-                on_select="rerun",
-                selection_mode=("points",),
-                config=CHART_CONFIG_INTERACTIVE,
-            )
-            # ----- If a click happened, sync to the dropdown -----
-            try:
-                if sz_event and getattr(sz_event, "selection", None):
-                    pts = sz_event.selection.get("points", [])
-                    if pts:
-                        cd = pts[0].get("customdata")
-                        clicked = None
-                        if isinstance(cd, (int, float)):
-                            clicked = int(cd)
-                        elif isinstance(cd, (list, tuple)) and len(cd):
-                            clicked = int(cd[0])
-                        if clicked is not None:
-                            st.session_state["strike_zone_pitch_picker"] = clicked
-            except Exception:
-                pass
+            render_static_chart(sz_fig, key="strike_zone_chart", height_px=550)
 
             st.caption(
                 "Green-outlined dots = positive outliers (above-average pitches). "
@@ -11383,7 +11314,7 @@ def main():
             }
             keys = list(pitch_options.keys())
             selected_pitch_num = st.selectbox(
-                "Pick a pitch (or click a dot on the chart)",
+                "Pick a pitch to inspect",
                 keys,
                 format_func=lambda k: pitch_options[k],
                 index=0,
