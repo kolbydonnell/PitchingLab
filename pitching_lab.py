@@ -7405,6 +7405,35 @@ CHART_PALETTE = {
 }
 
 
+def render_static_chart(fig, *, key: str | None = None,
+                          height_px: int = 500,
+                          width_px: int | None = None,
+                          caption: str | None = None):
+    """Render a Plotly figure as a static PNG image.
+
+    iOS Safari has a long-standing bug where rotating the device causes
+    Plotly charts to shrink each cycle. The root cause is Plotly's resize
+    handling fighting with Streamlit's container width detection. The
+    only 100% reliable fix is to render the chart as a static PNG — an
+    actual image element on the page has no resize behavior at all.
+
+    Falls back to st.plotly_chart if kaleido isn't installed.
+    """
+    try:
+        import io as _io
+        img_bytes = fig.to_image(format="png", width=width_px or 1100,
+                                   height=height_px, scale=2)
+        st.image(_io.BytesIO(img_bytes), use_container_width=True)
+        if caption:
+            st.caption(caption)
+    except Exception as e:
+        # kaleido missing or render failed — fall back to plotly_chart
+        st.plotly_chart(fig, use_container_width=True,
+                          key=key, config=CHART_CONFIG)
+        if caption:
+            st.caption(caption)
+
+
 def _apply_chart_theme(fig, *, preserve_bg: bool = False):
     """Apply the Diamond Sports Lab design system to a plotly figure.
 
@@ -8633,7 +8662,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
             fig.update_traces(marker=dict(size=14, line=dict(width=1, color="black")),
                                 textposition="top center")
             fig.update_layout(height=480, legend_title_text="")
-            st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+            render_static_chart(fig)
         else:
             st.info("No balls in play this session.")
 
@@ -8925,7 +8954,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_bs.update_traces(line=dict(color="#1a2150", width=3),
                                               marker=dict(size=10, color="#d4a634"))
                         fig_bs.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_bs, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_bs)
                     with t2:
                         fig_ev = px.line(trend_df, x="session_date",
                                           y=["avg_exit_velo", "peak_exit_velo"],
@@ -8936,7 +8965,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                                           title="Exit Velocity (Avg + Peak)")
                         fig_ev.update_traces(line=dict(width=3))
                         fig_ev.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_ev, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_ev)
 
                     # ----- Trend chart row 2: contact quality -----
                     st.subheader("Contact Quality Over Time")
@@ -8950,7 +8979,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_brl.update_traces(line=dict(color="#7f1d1d", width=3),
                                                marker=dict(size=10, color="#fca5a5"))
                         fig_brl.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_brl, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_brl)
                     with t4:
                         fig_wf = px.line(trend_df, x="session_date", y="whiff_pct",
                                           markers=True,
@@ -8964,7 +8993,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                                           annotation_text="HS average ≈ 22%",
                                           annotation_position="top right")
                         fig_wf.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_wf, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_wf)
 
                     # ----- Trend chart row 3: on-plane + workload -----
                     st.subheader("Bat Path & Workload Over Time")
@@ -8978,7 +9007,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_op.update_traces(line=dict(color="#16a34a", width=3),
                                               marker=dict(size=10, color="#86efac"))
                         fig_op.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_op, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_op)
                     with t6:
                         fig_w = px.line(trend_df, x="session_date", y="total_swings",
                                          markers=True,
@@ -8988,7 +9017,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         fig_w.update_traces(line=dict(color="#d4a634", width=3),
                                              marker=dict(size=10, color="#fde68a"))
                         fig_w.update_layout(height=300, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_w, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_w)
                 elif len(trend_df) == 1:
                     st.info("Log 2+ hitting sessions to see trend charts here.")
 
@@ -11305,7 +11334,7 @@ def main():
         fig.update_traces(marker=dict(size=14, line=dict(width=1, color="black")),
                           textposition="top center")
         fig.update_layout(height=480)
-        st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+        render_static_chart(fig)
 
         # =====================================================
         # STRIKE ZONE SCATTER (clickable → per-pitch detail panel below)
@@ -11607,7 +11636,7 @@ def main():
                         fig_v.update_traces(line=dict(color="#1a2150", width=3),
                                              marker=dict(size=10, color="#d4a634"))
                         fig_v.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_v, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_v)
                     with tcol2:
                         fig_s = px.line(trend_df, x="session_date", y="max_stress",
                                          markers=True,
@@ -11621,7 +11650,7 @@ def main():
                                          annotation_text=f"Danger ≥ {DANGER_VALGUS_NM} Nm",
                                          annotation_position="top right")
                         fig_s.update_layout(height=320, margin=dict(t=40, b=20))
-                        st.plotly_chart(fig_s, use_container_width=True, config=CHART_CONFIG)
+                        render_static_chart(fig_s)
 
                     fig_p = px.line(trend_df, x="session_date", y="pitch_count",
                                      markers=True,
@@ -11631,7 +11660,7 @@ def main():
                     fig_p.update_traces(line=dict(color="#16a34a", width=3),
                                          marker=dict(size=10, color="#86efac"))
                     fig_p.update_layout(height=260, margin=dict(t=40, b=20))
-                    st.plotly_chart(fig_p, use_container_width=True, config=CHART_CONFIG)
+                    render_static_chart(fig_p)
                 elif len(trend_df) == 1:
                     st.info("Log 2+ real sessions to see trend charts.")
 
@@ -11780,12 +11809,7 @@ def main():
                                                      sport=athlete_sport,
                                                      hand=athlete_hand,
                                                      clickable=False)
-                st.plotly_chart(
-                    fig_b,
-                    use_container_width=True,
-                    key="tunnel_batter_chart",
-                    config=CHART_CONFIG,
-                )
+                render_static_chart(fig_b, key="tunnel_batter_chart")
                 st.caption(
                     "Catcher's view — what the batter sees. Both flight paths "
                     "start from the same release, share the **commit window** "
@@ -11794,8 +11818,7 @@ def main():
                 )
             with sub_side:
                 fig_s = _build_tunnel_side_view(tunnel_data, sport=athlete_sport)
-                st.plotly_chart(fig_s, use_container_width=True,
-                                 key="tunnel_side_chart", config=CHART_CONFIG)
+                render_static_chart(fig_s, key="tunnel_side_chart")
                 st.caption(
                     "Side view — classic baseball-trajectory diagram. Pitcher on "
                     "the left, catcher on the right. The two flight paths leave "

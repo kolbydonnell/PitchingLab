@@ -6,6 +6,7 @@
 streamlit>=1.36.0
 pandas>=2.2.0
 plotly>=5.22.0
+kaleido>=0.2.1    # renders Plotly figs as static PNGs (mobile rotation fix)
 pillow>=11.0      # imaging — Python 3.14 wheels start here
 reportlab>=4.0
 matplotlib>=3.9
