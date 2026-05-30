@@ -7105,36 +7105,48 @@ button, input, select, textarea {
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior: contain;
 }
-/* ===== Lock chart dimensions to defeat the iOS rotation shrink bug =====
-   Plotly writes inline width/height on its SVGs when rendered. On iOS,
-   each viewport-change event compounds and the inline widths get smaller
-   each time. We override the inline widths with !important and force
-   the SVG to fill its parent container, ignoring whatever pixel value
-   Plotly happens to have written. */
+/* ===== ROTATION-SAFE LAYOUT — use viewport-relative units =====
+   iOS Safari shrinks page content each rotation because it recalculates
+   the layout container width based on the viewport but doesn't reset
+   it cleanly. Using `vw` (viewport width) instead of `%` (parent width)
+   means dimensions reset to the new viewport on every rotation — no
+   compounding feedback loop. */
+
+/* Lock the page's main block to the viewport width, not the parent. */
+.stApp, .main, .block-container {
+    max-width: 100vw !important;
+    width: 100vw !important;
+    overflow-x: hidden !important;
+}
+
+/* Static chart images — lock to viewport-relative width so they reset
+   on every rotation instead of compounding. */
+.stImage img, [data-testid="stImage"] img {
+    width: 100% !important;
+    min-width: min(95vw, 100%) !important;
+    max-width: 100vw !important;
+    height: auto !important;
+    display: block !important;
+}
+.stImage, [data-testid="stImage"] {
+    width: 100% !important;
+}
+
+/* Plotly chart containers (the few that remain) — same approach */
 .stPlotlyChart {
     min-height: 500px !important;
     width: 100% !important;
+    max-width: 100vw !important;
     contain: layout;
     position: relative;
 }
-.stPlotlyChart > div, .stPlotlyChart .js-plotly-plot {
-    min-height: 500px !important;
-    width: 100% !important;
-    height: 100% !important;
-}
-/* Defeat Plotly's inline width/height attrs that get smaller each rotation */
-.stPlotlyChart .main-svg,
-.stPlotlyChart svg.main-svg {
-    width: 100% !important;
-    min-width: 100% !important;
-    max-width: 100% !important;
-}
-/* The plot-container div Plotly wraps everything in — same lock */
-.stPlotlyChart .plot-container,
-.stPlotlyChart .plotly,
+.stPlotlyChart > div, .stPlotlyChart .js-plotly-plot,
+.stPlotlyChart .main-svg, .stPlotlyChart svg.main-svg,
+.stPlotlyChart .plot-container, .stPlotlyChart .plotly,
 .stPlotlyChart .svg-container {
     width: 100% !important;
     min-width: 100% !important;
+    max-width: 100% !important;
 }
 /* The pan-grab overlay — invisible, intercepts swipes. Turn it off. */
 .js-plotly-plot .nsewdrag,
@@ -10628,34 +10640,37 @@ def main():
 
     # ===== iOS Safari rotation lock =====
     # Streamlit's default viewport meta tag lets iOS recompute scale on
-    # every rotation, which compounds and shrinks Plotly charts each time.
-    # Override with maximum-scale=1.0 + user-scalable=no so the viewport
-    # stays fixed regardless of rotation, AND force a Plotly redraw after
-    # rotation events so the SVG snaps back to full container width.
+    # every rotation, which compounds and shrinks the layout each time.
+    # We aggressively re-install a locked viewport on EVERY rotation event,
+    # AND force the page to reflow at the new viewport width.
     st.markdown(
         """
         <script>
-        // Replace Streamlit's auto-generated viewport meta tag with one
-        // that locks the scale and prevents user zoom — both of which
-        // were the source of the rotation-shrinkage on iPhone.
         (function() {
-            const existing = document.querySelector('meta[name="viewport"]');
-            const content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
-            if (existing) { existing.setAttribute('content', content); }
-            else {
-                const meta = document.createElement('meta');
-                meta.name = 'viewport';
-                meta.content = content;
-                document.head.appendChild(meta);
+            const LOCKED_VIEWPORT = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover';
+            function lockViewport() {
+                let meta = document.querySelector('meta[name="viewport"]');
+                if (meta) { meta.setAttribute('content', LOCKED_VIEWPORT); }
+                else {
+                    meta = document.createElement('meta');
+                    meta.name = 'viewport';
+                    meta.content = LOCKED_VIEWPORT;
+                    document.head.appendChild(meta);
+                }
             }
-            // On rotation, force every Plotly chart to redraw to its
-            // current container's full width. Without this, the chart
-            // keeps the inline width attribute from BEFORE the rotation,
-            // which is now smaller than the new viewport.
+            // Lock on initial load
+            lockViewport();
+            // Re-lock on every conceivable event Streamlit / iOS might fire
+            ['load', 'pageshow', 'orientationchange', 'resize',
+             'focus', 'visibilitychange'].forEach(evt => {
+                window.addEventListener(evt, lockViewport);
+            });
+            // Periodic re-lock in case Streamlit re-renders the head
+            setInterval(lockViewport, 1000);
+            // Snap Plotly charts to current container width after rotation
             function snapPlotly() {
                 try {
-                    const charts = document.querySelectorAll('.js-plotly-plot');
-                    charts.forEach(c => {
+                    document.querySelectorAll('.js-plotly-plot').forEach(c => {
                         if (window.Plotly && window.Plotly.Plots) {
                             try { window.Plotly.Plots.resize(c); } catch(e) {}
                         }
@@ -10663,12 +10678,9 @@ def main():
                 } catch(e) {}
             }
             window.addEventListener('orientationchange', () => {
-                setTimeout(snapPlotly, 300);
-                setTimeout(snapPlotly, 600);
-            });
-            window.addEventListener('resize', () => {
-                clearTimeout(window.__plotly_snap_timer);
-                window.__plotly_snap_timer = setTimeout(snapPlotly, 200);
+                lockViewport();
+                setTimeout(() => { lockViewport(); snapPlotly(); }, 300);
+                setTimeout(() => { lockViewport(); snapPlotly(); }, 700);
             });
         })();
         </script>
