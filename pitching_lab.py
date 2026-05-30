@@ -7105,20 +7105,36 @@ button, input, select, textarea {
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior: contain;
 }
-/* Chart container dimensions are locked — no shrinkage on rotation. */
+/* ===== Lock chart dimensions to defeat the iOS rotation shrink bug =====
+   Plotly writes inline width/height on its SVGs when rendered. On iOS,
+   each viewport-change event compounds and the inline widths get smaller
+   each time. We override the inline widths with !important and force
+   the SVG to fill its parent container, ignoring whatever pixel value
+   Plotly happens to have written. */
 .stPlotlyChart {
-    min-height: 400px !important;
+    min-height: 500px !important;
     width: 100% !important;
     contain: layout;
+    position: relative;
 }
 .stPlotlyChart > div, .stPlotlyChart .js-plotly-plot {
-    min-height: 400px !important;
+    min-height: 500px !important;
     width: 100% !important;
+    height: 100% !important;
 }
-/* iOS Safari sometimes scales the SVG below its container — pin both
-   to the parent's full width so they can't independently shrink. */
-.stPlotlyChart .main-svg {
+/* Defeat Plotly's inline width/height attrs that get smaller each rotation */
+.stPlotlyChart .main-svg,
+.stPlotlyChart svg.main-svg {
     width: 100% !important;
+    min-width: 100% !important;
+    max-width: 100% !important;
+}
+/* The plot-container div Plotly wraps everything in — same lock */
+.stPlotlyChart .plot-container,
+.stPlotlyChart .plotly,
+.stPlotlyChart .svg-container {
+    width: 100% !important;
+    min-width: 100% !important;
 }
 /* The pan-grab overlay — invisible, intercepts swipes. Turn it off. */
 .js-plotly-plot .nsewdrag,
@@ -10627,6 +10643,56 @@ def main():
         initial_sidebar_state="expanded",
     )
     _inject_global_styles()
+
+    # ===== iOS Safari rotation lock =====
+    # Streamlit's default viewport meta tag lets iOS recompute scale on
+    # every rotation, which compounds and shrinks Plotly charts each time.
+    # Override with maximum-scale=1.0 + user-scalable=no so the viewport
+    # stays fixed regardless of rotation, AND force a Plotly redraw after
+    # rotation events so the SVG snaps back to full container width.
+    st.markdown(
+        """
+        <script>
+        // Replace Streamlit's auto-generated viewport meta tag with one
+        // that locks the scale and prevents user zoom — both of which
+        // were the source of the rotation-shrinkage on iPhone.
+        (function() {
+            const existing = document.querySelector('meta[name="viewport"]');
+            const content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
+            if (existing) { existing.setAttribute('content', content); }
+            else {
+                const meta = document.createElement('meta');
+                meta.name = 'viewport';
+                meta.content = content;
+                document.head.appendChild(meta);
+            }
+            // On rotation, force every Plotly chart to redraw to its
+            // current container's full width. Without this, the chart
+            // keeps the inline width attribute from BEFORE the rotation,
+            // which is now smaller than the new viewport.
+            function snapPlotly() {
+                try {
+                    const charts = document.querySelectorAll('.js-plotly-plot');
+                    charts.forEach(c => {
+                        if (window.Plotly && window.Plotly.Plots) {
+                            try { window.Plotly.Plots.resize(c); } catch(e) {}
+                        }
+                    });
+                } catch(e) {}
+            }
+            window.addEventListener('orientationchange', () => {
+                setTimeout(snapPlotly, 300);
+                setTimeout(snapPlotly, 600);
+            });
+            window.addEventListener('resize', () => {
+                clearTimeout(window.__plotly_snap_timer);
+                window.__plotly_snap_timer = setTimeout(snapPlotly, 200);
+            });
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Apply pending "Start Sample Session" intent BEFORE the toggle widget
     # renders below. Setting widget state after instantiation is forbidden.
