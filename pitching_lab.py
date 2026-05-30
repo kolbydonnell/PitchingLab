@@ -7089,18 +7089,36 @@ button, input, select, textarea {
 .modebar-container, .modebar, .modebar-group { display: none !important; }
 .plotly .modebar { display: none !important; }
 
-/* ===== Mobile scroll lockdown for Plotly charts =====
+/* ===== Mobile scroll lockdown + dimension lock for Plotly charts =====
    Plotly draws an invisible "pan-grab" rectangle (.nsewdrag class) that
    captures touch/drag events for panning. On mobile, that hijacks the
    page scroll. We disable pointer-events on JUST that pan layer so
    swipes fall through to the page, while taps on the actual data dots
-   still register their on_select event. */
+   still register their on_select event.
+   We also LOCK chart dimensions so iOS Safari can't shrink them when
+   the user rotates the phone — every viewport change used to trigger
+   a recalculation that ate ~15% of the chart's height. */
 .stPlotlyChart, .js-plotly-plot, .plotly, .plot-container, .svg-container,
 .main-svg, .draglayer {
     touch-action: pan-y !important;
     -webkit-user-select: none;
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior: contain;
+}
+/* Chart container dimensions are locked — no shrinkage on rotation. */
+.stPlotlyChart {
+    min-height: 400px !important;
+    width: 100% !important;
+    contain: layout;
+}
+.stPlotlyChart > div, .stPlotlyChart .js-plotly-plot {
+    min-height: 400px !important;
+    width: 100% !important;
+}
+/* iOS Safari sometimes scales the SVG below its container — pin both
+   to the parent's full width so they can't independently shrink. */
+.stPlotlyChart .main-svg {
+    width: 100% !important;
 }
 /* The pan-grab overlay — invisible, intercepts swipes. Turn it off. */
 .js-plotly-plot .nsewdrag,
@@ -7323,12 +7341,11 @@ def _inject_global_styles():
 CHART_CONFIG = {
     # Default config for non-interactive charts — staticPlot: True freezes
     # the chart completely. No drag, no pan, no zoom, no double-tap-reset.
-    # Tap events still bubble up to Streamlit, but the chart itself can't be
-    # moved off the page or zoomed in. This is the right default for any
-    # chart that doesn't use st.plotly_chart(..., on_select=...).
+    # responsive: False prevents the iOS shrink-on-rotation bug where each
+    # orientation flip would recalculate dimensions and shrink the chart.
     "staticPlot":         True,
     "displayModeBar":     False,
-    "responsive":         True,
+    "responsive":         False,
     "scrollZoom":         False,
     "doubleClick":        False,
     "showAxisDragHandles":False,
@@ -7344,7 +7361,7 @@ CHART_CONFIG = {
 CHART_CONFIG_INTERACTIVE = {
     "staticPlot":         False,
     "displayModeBar":     False,
-    "responsive":         True,
+    "responsive":         False,
     "scrollZoom":         False,
     "doubleClick":        False,
     "showAxisDragHandles":False,
