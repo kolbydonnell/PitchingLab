@@ -15,27 +15,18 @@ pypdf>=4.0
 # =====================================================================
 # Live Capture (Beta) — phone/tablet camera tracking
 # =====================================================================
-# These are DISABLED for Streamlit Cloud because `av` (PyAV) needs
-# system-level FFmpeg libraries that the default Cloud container doesn't
-# ship. The rest of the app (Pitching Lab, Hitting Lab, Tunneling,
-# Reports, PDFs) deploys cleanly without them. The Live Capture tab in
-# the cloud version will show a "package missing" message — that's
-# expected.
-#
-# For LOCAL use (your Mac), uncomment these four lines, run
-#   pip3 install -r requirements.txt --upgrade
-# and Live Capture works the same as before.
-#
-# To re-enable Live Capture on a hosted version of the app, deploy to a
-# host that supports custom Dockerfiles (Render, Railway, fly.io —
-# each has a free tier).
-#
-# streamlit-webrtc>=0.47.0
-# opencv-python-headless>=4.10.0
-# av>=12.0
-# numpy>=1.26
+# These ARE installed on Streamlit Cloud too — they install cleanly via
+# pip wheels (av has prebuilt FFmpeg bindings since v12). Make sure your
+# `packages.txt` includes ffmpeg if you ever see PyAV runtime errors on
+# the deployed version.
+streamlit-webrtc>=0.47.0
+opencv-python-headless>=4.10.0
+av>=12.0
+numpy>=1.26
 
 # OPTIONAL — pose extraction via MediaPipe.
-# MediaPipe ships wheels for Python 3.9-3.12. If you enable Live Capture
-# above and you're on Python 3.9-3.12, you can also uncomment this line:
+# MediaPipe ships wheels for Python 3.9-3.12. Streamlit Cloud defaults to
+# 3.13/3.14 which doesn't have MediaPipe wheels yet, so it's commented
+# out for cloud deploy. Locally on Python 3.12 you can uncomment to
+# enable skeleton overlay + biomech from pose.
 # mediapipe>=0.10.14
