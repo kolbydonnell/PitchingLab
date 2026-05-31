@@ -9286,7 +9286,8 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
 
 def detect_ball_in_frame(frame_bgr,
                           ball_radius_px_range: tuple[int, int] = (4, 30),
-                          mask_brightness_min: int = 200) -> "tuple[int, int] | None":
+                          mask_brightness_min: int = 200,
+                          motion_blur_tolerant: bool = True) -> "tuple[int, int] | None":
     """Find a single baseball in a BGR image. Returns (x_px, y_px) or None.
 
     Strategy:
@@ -9323,22 +9324,27 @@ def detect_ball_in_frame(frame_bgr,
         area = cv2.contourArea(c)
         if area <= 0:
             continue
-        # Circularity: 1.0 = perfect circle. We require ≥0.78 to filter
-        # out rectangles, streaks, and other non-ball bright blobs
-        # (a baseball clears 0.85 easily; we leave headroom for motion
-        # blur on fast pitches).
+        # Circularity: 1.0 = perfect circle. A static ball clears 0.85;
+        # a motion-blurred ball at 90 mph in a single frame can drop to
+        # ~0.55 because the blur streaks the bright pixels. We trade
+        # some rectangle-rejection precision for motion-blur tolerance
+        # because real pitches always blur.
         perim = cv2.arcLength(c, True)
         if perim == 0:
             continue
         circularity = 4.0 * 3.14159 * area / (perim * perim)
-        if circularity < 0.78:
+        min_circ = 0.55 if motion_blur_tolerant else 0.78
+        if circularity < min_circ:
             continue
         # Fill ratio — what fraction of the min-enclosing circle is
         # actually filled by the contour. A real ball fills ~95% of its
-        # bounding circle; a rectangle fills ~64%; an L-shape much less.
+        # bounding circle; a rectangle fills ~64%. With motion-blur
+        # tolerance ON we drop this too because elongated blurs have
+        # poor fill ratios within the min-enclosing circle.
         circle_area = 3.14159 * r * r
         fill_ratio = area / circle_area if circle_area > 0 else 0
-        if fill_ratio < 0.7:
+        min_fill = 0.45 if motion_blur_tolerant else 0.7
+        if fill_ratio < min_fill:
             continue
         # Score weights circularity heavily, then favors larger radius
         # for tie-breaking among multiple ball-like candidates.
@@ -9738,13 +9744,13 @@ def run_live_capture_tab(active_athlete_id: int | None,
                 "border-left:4px solid #0ea5e9;border-radius:8px;padding:12px 16px;'>"
                 "<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
                 "color:#0369a1;text-transform:uppercase;margin-bottom:4px;'>"
-                "Setup checklist</div>"
+                "Quick start</div>"
                 "<div style='font-size:13px;color:#1f2937;line-height:1.55;'>"
-                "1. Phone/tablet on tripod, 15-30 ft from the pitcher.<br>"
-                "2. Side-view angle works best for Phase 1 (catches stride + arm).<br>"
-                "3. Tap <b>START</b> below, allow camera access.<br>"
-                "4. After each pitch, tap <b>📌 Snap Pitch</b> at release.<br>"
-                "5. Tap <b>💾 Save Session</b> when done — biomech goes into history."
+                "1. Set up the camera per the guide below.<br>"
+                "2. Calibrate the plate position (one-time per setup).<br>"
+                "3. Tap <b>START</b> below the calibration row.<br>"
+                "4. After each pitch, tap <b>Snap Pitch</b> at release.<br>"
+                "5. Tap <b>Save Session</b> when done — data goes into history."
                 "</div></div>"
             ),
             unsafe_allow_html=True,
@@ -9758,11 +9764,212 @@ def run_live_capture_tab(active_athlete_id: int | None,
         show_skeleton = st.checkbox("Overlay skeleton on video", value=True,
                                       key="livecap_show_skeleton")
 
+    # ===== CAMERA SETUP GUIDE =====
+    with st.expander("**Where to put the camera** — full setup guide", expanded=True):
+        st.markdown(
+            _flat_html(
+                "<div style='font-size:13px;color:#cbd5e1;line-height:1.65;'>"
+                "<b style='color:#f1f5f9;'>What you need:</b> a phone or tablet, "
+                "a tripod (or any stable surface — a bag of helmets on a 5-gal "
+                "bucket works), and ~3 minutes of setup time."
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown("")  # spacer
+
+        opt1, opt2 = st.columns(2)
+        with opt1:
+            st.markdown(
+                _flat_html(
+                    "<div style='background:#1e293b;border:1px solid #334155;"
+                    "border-left:4px solid #3b82f6;border-radius:8px;padding:16px 18px;'>"
+                    "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+                    "color:#3b82f6;text-transform:uppercase;margin-bottom:6px;'>"
+                    "Option A · Behind catcher (recommended)</div>"
+                    "<div style='font-size:14px;font-weight:700;color:#f1f5f9;margin-bottom:8px;'>"
+                    "Best for ball-flight metrics</div>"
+                    "<div style='font-size:13px;color:#cbd5e1;line-height:1.6;'>"
+                    "<b style='color:#f1f5f9;'>Where:</b> directly behind the catcher, "
+                    "facing the pitcher. About <b>10–15 ft behind home plate</b>. The catcher's "
+                    "head should be in the bottom-center of the frame; the pitcher should "
+                    "appear small in the upper-center.<br><br>"
+                    "<b style='color:#f1f5f9;'>Height:</b> tripod at <b>~4 ft</b> — about "
+                    "the height of the catcher's shoulders when crouched. Don't put it on "
+                    "the ground; you need to see the strike-zone plane.<br><br>"
+                    "<b style='color:#f1f5f9;'>Angle:</b> pan slightly DOWN so the strike "
+                    "zone fills the middle-third of the frame.<br><br>"
+                    "<b style='color:#f1f5f9;'>Strengths:</b> elite velo, plate location, "
+                    "vert + horiz break, spin estimate.<br>"
+                    "<b style='color:#f1f5f9;'>Weakness:</b> can't see stride, less detail "
+                    "on arm slot (pose biomech will work but the pitcher is small)."
+                    "</div></div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        with opt2:
+            st.markdown(
+                _flat_html(
+                    "<div style='background:#1e293b;border:1px solid #334155;"
+                    "border-left:4px solid #d4a634;border-radius:8px;padding:16px 18px;'>"
+                    "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+                    "color:#d4a634;text-transform:uppercase;margin-bottom:6px;'>"
+                    "Option B · Side view (3rd-base side for RHP)</div>"
+                    "<div style='font-size:14px;font-weight:700;color:#f1f5f9;margin-bottom:8px;'>"
+                    "Best for mechanics + biomech</div>"
+                    "<div style='font-size:13px;color:#cbd5e1;line-height:1.6;'>"
+                    "<b style='color:#f1f5f9;'>Where:</b> on the open side of the pitcher "
+                    "(<b>3rd-base side for RHP</b>, 1st-base side for LHP). About "
+                    "<b>15–25 ft away</b>, perpendicular to the rubber-to-plate line.<br><br>"
+                    "<b style='color:#f1f5f9;'>Height:</b> tripod at <b>~4 ft</b>. The "
+                    "pitcher's whole body — head to plant foot — should fit in the frame "
+                    "with about 1 ft of headroom above and below.<br><br>"
+                    "<b style='color:#f1f5f9;'>Angle:</b> level, perpendicular to the "
+                    "pitcher's line. NOT angled toward home plate.<br><br>"
+                    "<b style='color:#f1f5f9;'>Strengths:</b> hip-shoulder separation, "
+                    "stride length, lead-knee flex, arm slot, elbow stress estimate.<br>"
+                    "<b style='color:#f1f5f9;'>Weakness:</b> ball-flight metrics (velo, "
+                    "break, plate location) are less accurate — the ball is moving away "
+                    "from the camera at an oblique angle."
+                    "</div></div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("")  # spacer
+        # Universal setup tips
+        st.markdown(
+            _flat_html(
+                "<div style='background:#1e293b;border:1px solid #334155;"
+                "border-left:4px solid #22c55e;border-radius:8px;padding:14px 18px;"
+                "margin-top:8px;'>"
+                "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+                "color:#22c55e;text-transform:uppercase;margin-bottom:6px;'>"
+                "Universal rules</div>"
+                "<div style='font-size:13px;color:#cbd5e1;line-height:1.65;'>"
+                "<b style='color:#f1f5f9;'>1. Stable tripod.</b> If the phone shakes, "
+                "the ball detector picks up noise. A handheld phone is the #1 cause "
+                "of bad capture sessions.<br>"
+                "<b style='color:#f1f5f9;'>2. Background matters.</b> A dark backdrop "
+                "(a net, a fence with foliage behind it) makes the white ball POP. "
+                "Avoid pointing the camera at the sky or a white wall — the ball "
+                "blends in.<br>"
+                "<b style='color:#f1f5f9;'>3. Set the phone to 60 fps if it supports it.</b> "
+                "Higher frame rate = more samples per pitch = better trajectory fit. "
+                "On iPhone: Camera Settings → Record Video → 1080p at 60 fps.<br>"
+                "<b style='color:#f1f5f9;'>4. Don't zoom in.</b> Use the full wide angle. "
+                "Zoom crops resolution and breaks the calibration math.<br>"
+                "<b style='color:#f1f5f9;'>5. Disable iPhone auto-lock.</b> "
+                "Settings → Display & Brightness → Auto-Lock → Never. Otherwise Safari "
+                "pauses the video when the screen turns off."
+                "</div></div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("")  # spacer
+        st.markdown(
+            _flat_html(
+                "<div style='background:#1e293b;border:1px solid #334155;"
+                "border-left:4px solid #dc2626;border-radius:8px;padding:14px 18px;'>"
+                "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+                "color:#ef4444;text-transform:uppercase;margin-bottom:6px;'>"
+                "Common mistakes to avoid</div>"
+                "<div style='font-size:13px;color:#cbd5e1;line-height:1.65;'>"
+                "• <b>Camera too far away</b> — if the ball is &lt;6 pixels wide in the "
+                "frame, the detector misses it. Move closer if the ball-radius slider "
+                "max is below 8 px after your test pitch.<br>"
+                "• <b>Camera too close</b> — if the pitcher and the ball don't both fit "
+                "in the frame, you have to choose between biomech OR ball flight.<br>"
+                "• <b>Direct sunlight glare on the lens</b> — washes out the contrast and "
+                "the ball becomes undetectable.<br>"
+                "• <b>Recording vertically when filming side-view</b> — you'll cut off "
+                "the pitcher's stride. Use landscape for side view."
+                "</div></div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
     # --- Initialize per-session capture state ---
     if "livecap_snapped_pitches" not in st.session_state:
         st.session_state["livecap_snapped_pitches"] = []
     if "livecap_last_frame_metrics" not in st.session_state:
         st.session_state["livecap_last_frame_metrics"] = {}
+
+    # ===== PRE-FLIGHT SELF-TEST =====
+    # Runs through every dependency + capability so the user knows what
+    # WILL work and what won't BEFORE they get to the field. Critical for
+    # the weekend test — better to find a missing dep in your kitchen than
+    # standing behind home plate.
+    st.divider()
+    with st.expander("**Pre-flight self-test** — run before going to the field",
+                      expanded=False):
+        st.caption(
+            "Confirms every piece of the live-capture pipeline can actually run "
+            "before you go to the field. If any row shows ✗ or ⚠, address it now "
+            "rather than in the parking lot."
+        )
+        checks = []
+        # WebRTC / Streamlit
+        checks.append(("streamlit-webrtc", True, "Camera streaming"))
+        # OpenCV
+        try:
+            import cv2 as _cv2
+            checks.append(("OpenCV " + _cv2.__version__, True, "Ball detection"))
+        except Exception as e:
+            checks.append((f"OpenCV — MISSING: {e}", False, "Ball detection"))
+        # av
+        try:
+            import av as _av
+            checks.append((f"av (PyAV)", True, "Video frame I/O"))
+        except Exception as e:
+            checks.append((f"av — MISSING: {e}", False, "Video frame I/O"))
+        # MediaPipe (pose)
+        try:
+            import mediapipe as _mp
+            checks.append((f"MediaPipe Pose", True,
+                            "Skeleton overlay + biomech (hip-shoulder, arm slot)"))
+        except Exception:
+            checks.append((f"MediaPipe — not installed", False,
+                            "Skeleton overlay + biomech — INSTALL Python 3.12 "
+                            "to enable (ball tracking still works without it)"))
+        # numpy
+        try:
+            import numpy as _np
+            checks.append((f"NumPy " + _np.__version__, True, "Math backbone"))
+        except Exception as e:
+            checks.append((f"NumPy — MISSING: {e}", False, "Math backbone"))
+
+        rows = []
+        for label, ok, purpose in checks:
+            badge = ("<span style='color:#22c55e;font-weight:700;'>✓</span>" if ok
+                     else "<span style='color:#d4a634;font-weight:700;'>⚠</span>")
+            rows.append(
+                f"<tr>"
+                f"<td style='padding:6px 12px;'>{badge}</td>"
+                f"<td style='padding:6px 12px;font-weight:600;color:#f1f5f9;'>{label}</td>"
+                f"<td style='padding:6px 12px;color:#94a3b8;'>{purpose}</td>"
+                f"</tr>"
+            )
+        all_ok = all(ok for _, ok, _ in checks)
+        summary = ("<b style='color:#22c55e;'>All systems go — capture pipeline ready.</b>"
+                   if all_ok else
+                   "<b style='color:#d4a634;'>Capture pipeline will run with limited features.</b>"
+                   " Ball tracking, velocity, plate location, break, and spin estimates"
+                   " will all work even without MediaPipe. The pose-based biomech"
+                   " (hip-shoulder separation, arm slot, lead-knee flex) requires"
+                   " MediaPipe which needs Python 3.9-3.12.")
+        st.markdown(
+            _flat_html(
+                f"<table style='width:100%;border-collapse:collapse;"
+                f"background:#1e293b;border-radius:8px;overflow:hidden;'>"
+                f"{''.join(rows)}"
+                f"</table>"
+                f"<div style='font-size:13px;color:#cbd5e1;margin-top:10px;'>"
+                f"{summary}</div>"
+            ),
+            unsafe_allow_html=True,
+        )
 
     # ===== Calibration UI: mark home plate so pixels can map to feet =====
     st.divider()
@@ -10163,9 +10370,137 @@ def run_live_capture_tab(active_athlete_id: int | None,
         )
         st.markdown(_flat_html(feedback_html), unsafe_allow_html=True)
 
-    # ===== Snapped pitches table + save to history =====
+    # ===== MECHANICS ANALYSIS — per-pitch biomech critique =====
+    # Color-coded breakdown of every captured pitch's pose metrics with
+    # specific cue + drill recommendation for each flagged value. This
+    # is what gives the snapshot meaningful coaching value beyond raw
+    # numbers — the user can read it like a coach's report.
     snapped = st.session_state.get("livecap_snapped_pitches", [])
     if snapped:
+        st.divider()
+        st.subheader("Mechanics Analysis")
+        st.caption(
+            "Per-pitch breakdown of biomechanics + ball flight. Each metric "
+            "is color-coded against level-typical ranges and flagged metrics "
+            "carry a specific coaching cue + drill suggestion."
+        )
+
+        def _critique_value(name: str, value, ranges: dict):
+            """Return (color, status, cue) for a metric vs. its baselines.
+            ranges = {"good": (lo, hi), "warn": (lo, hi), "cue": "..."}
+            """
+            if value is None:
+                return "#94a3b8", "—", "no data captured for this pitch"
+            good = ranges.get("good")
+            if good and good[0] <= value <= good[1]:
+                return "#22c55e", "ON TARGET", ranges.get("good_cue", "keep this pattern.")
+            return "#d4a634", "FLAGGED", ranges.get("cue", "outside the target range.")
+
+        # Define what "good" looks like for each metric
+        BIOMECH_RANGES = {
+            "hip_shoulder_sep_deg": {
+                "good": (42, 55),
+                "cue": "Hip-shoulder separation under 42° = limited rubber-band torque. "
+                       "Drill: Hershiser drill, 3×4, 3 days/week.",
+                "good_cue": "Strong separation generates rubber-band torque for velocity.",
+            },
+            "arm_slot_deg": {
+                "good": (-50, -20),
+                "cue": "Arm slot outside typical 3/4-to-over-top range. Drill: mirror "
+                       "work for arm-path consistency, 10 reps before each bullpen.",
+                "good_cue": "Consistent arm slot in the productive range.",
+            },
+            "lead_knee_flex_deg": {
+                "good": (145, 180),
+                "cue": "Lead knee collapsing under load. Drill: wall drill, 4×6, "
+                       "every other day.",
+                "good_cue": "Strong front-leg block — energy transferring up the chain.",
+            },
+            "elbow_stress_nm_est": {
+                "good": (30, 55),
+                "cue": "Elevated estimated elbow stress. Consider cooldown work today "
+                       "+ reduced volume next session.",
+                "good_cue": "Stress in the safe-to-moderate range.",
+            },
+            "velocity_mph": {
+                "good": (78, 105),
+                "cue": "Velocity outside typical HS-to-college range for this athlete.",
+                "good_cue": "In-range velocity.",
+            },
+        }
+        DISPLAY_NAMES = {
+            "hip_shoulder_sep_deg": "Hip-Shoulder Sep (°)",
+            "arm_slot_deg":         "Arm Slot (°)",
+            "lead_knee_flex_deg":   "Lead Knee Flex (°)",
+            "elbow_stress_nm_est":  "Elbow Stress (Nm, est.)",
+            "velocity_mph":         "Velocity (mph)",
+            "vert_break_in":        "Vert Break (in)",
+            "horiz_break_in":       "Horiz Break (in)",
+            "useful_spin_rpm":      "Useful Spin (RPM)",
+            "tilt_clock":           "Tilt Clock",
+            "spin_efficiency_pct":  "Spin Efficiency (%)",
+            "plate_x_ft":           "Plate Side (ft)",
+            "plate_z_ft":           "Plate Height (ft)",
+        }
+
+        # Per-pitch expander with critique
+        for p in snapped:
+            num = p.get("pitch_num", "?")
+            v = p.get("velocity_mph")
+            v_str = f"{v} mph" if v else "(no velo)"
+            with st.expander(f"Pitch #{num} — {v_str}", expanded=(num == 1)):
+                # All metrics in two columns
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Pose Biomech**")
+                    for key in ["hip_shoulder_sep_deg", "arm_slot_deg",
+                                "lead_knee_flex_deg", "elbow_stress_nm_est"]:
+                        val = p.get(key)
+                        name = DISPLAY_NAMES.get(key, key)
+                        ranges = BIOMECH_RANGES.get(key, {})
+                        color, status, cue = _critique_value(key, val, ranges)
+                        val_str = f"{val}" if val is not None else "—"
+                        st.markdown(
+                            _flat_html(
+                                f"<div style='background:#1e293b;border-left:3px solid {color};"
+                                f"padding:10px 14px;margin:6px 0;border-radius:0 6px 6px 0;'>"
+                                f"<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                                f"color:#94a3b8;text-transform:uppercase;'>{name}</div>"
+                                f"<div style='font-size:20px;font-weight:700;color:#f1f5f9;"
+                                f"margin:3px 0;'>{val_str} "
+                                f"<span style='font-size:11px;color:{color};margin-left:6px;'>"
+                                f"{status}</span></div>"
+                                f"<div style='font-size:12px;color:#cbd5e1;font-style:italic;'>"
+                                f"{cue}</div>"
+                                f"</div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                with c2:
+                    st.markdown("**Ball Flight**")
+                    for key in ["velocity_mph", "vert_break_in", "horiz_break_in",
+                                "useful_spin_rpm", "tilt_clock", "spin_efficiency_pct",
+                                "plate_x_ft", "plate_z_ft"]:
+                        val = p.get(key)
+                        name = DISPLAY_NAMES.get(key, key)
+                        ranges = BIOMECH_RANGES.get(key, {})
+                        color, status, cue = _critique_value(key, val, ranges) \
+                            if key in BIOMECH_RANGES else ("#94a3b8", "", "")
+                        val_str = f"{val}" if val is not None else "—"
+                        st.markdown(
+                            _flat_html(
+                                f"<div style='background:#1e293b;border-left:3px solid {color};"
+                                f"padding:8px 12px;margin:4px 0;border-radius:0 4px 4px 0;'>"
+                                f"<div style='font-size:11px;letter-spacing:0.08em;font-weight:700;"
+                                f"color:#94a3b8;text-transform:uppercase;'>{name}</div>"
+                                f"<div style='font-size:17px;font-weight:700;color:#f1f5f9;'>"
+                                f"{val_str}</div>"
+                                f"</div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
+
+        st.divider()
         st.subheader(f"Snapped Pitches ({len(snapped)})")
         snap_df = pd.DataFrame(snapped)
         st.dataframe(snap_df, use_container_width=True, hide_index=True)
