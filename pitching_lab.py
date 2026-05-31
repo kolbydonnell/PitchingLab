@@ -9665,6 +9665,436 @@ def fit_pitch_trajectory(positions: "list[tuple[float, int, int]]",
 # Heavy deps (streamlit-webrtc, mediapipe, opencv, av) are imported INSIDE
 # the function so the rest of the app keeps running if they're not installed.
 # =============================================================================
+# =============================================================================
+# CALIBRATION PRESETS — natural-language setup that auto-fills pixel coords
+# =============================================================================
+# Picking "iPhone 1080p · 15 ft behind catcher" populates plate_cx / plate_cy
+# / plate_w / ball_radius automatically so a non-technical user doesn't ever
+# have to think about pixels. Advanced users can override via the Advanced
+# expander.
+#
+# Numbers are sanity-checked against typical iPhone shots from common
+# tripod distances. They get you in the ballpark — the user can tweak the
+# Advanced expander if anything looks off in the first capture.
+CALIBRATION_PRESETS = {
+    "iPhone 1080p · 10 ft behind catcher": {
+        "plate_cx_px": 960, "plate_cy_px": 800, "plate_w_px": 160,
+        "ball_rmin_px": 8,  "ball_rmax_px": 26,
+    },
+    "iPhone 1080p · 15 ft behind catcher": {
+        "plate_cx_px": 960, "plate_cy_px": 900, "plate_w_px": 110,
+        "ball_rmin_px": 6,  "ball_rmax_px": 22,
+    },
+    "iPhone 1080p · 25 ft behind catcher": {
+        "plate_cx_px": 960, "plate_cy_px": 980, "plate_w_px": 70,
+        "ball_rmin_px": 4,  "ball_rmax_px": 16,
+    },
+    "iPhone 1080p · side view, 20 ft away": {
+        "plate_cx_px": 1500, "plate_cy_px": 900, "plate_w_px": 90,
+        "ball_rmin_px": 5,  "ball_rmax_px": 18,
+    },
+    "iPad 1080p · 15 ft behind catcher": {
+        "plate_cx_px": 960, "plate_cy_px": 880, "plate_w_px": 130,
+        "ball_rmin_px": 7,  "ball_rmax_px": 24,
+    },
+    "iPhone 720p · 15 ft behind catcher": {
+        "plate_cx_px": 640, "plate_cy_px": 600, "plate_w_px": 75,
+        "ball_rmin_px": 4,  "ball_rmax_px": 16,
+    },
+    "Custom (manual)": None,   # signals: show advanced sliders
+}
+
+
+def render_calibration_with_presets(state_prefix: str,
+                                       default_preset: str = "iPhone 1080p · 15 ft behind catcher"
+                                       ) -> dict:
+    """Show preset picker → auto-fill pixel coords → optional Advanced tweaks.
+
+    state_prefix: e.g. "livecap_" or "upload_" — namespaces the session-state
+                  keys so Live and Upload modes don't collide.
+
+    Returns the final calibration dict (plate_cx, plate_cy, plate_w,
+    ball_rmin, ball_rmax) — same keys as before.
+    """
+    preset_key = f"{state_prefix}preset"
+    if preset_key not in st.session_state:
+        st.session_state[preset_key] = default_preset
+
+    preset_name = st.selectbox(
+        "Camera setup (pick the closest match)",
+        list(CALIBRATION_PRESETS.keys()),
+        index=list(CALIBRATION_PRESETS.keys()).index(
+            st.session_state.get(preset_key, default_preset)),
+        key=f"{state_prefix}preset_picker",
+        help="Most coaches just pick a preset and never touch the pixel "
+             "values. Tap Advanced below only if the ball isn't being "
+             "detected after your first capture.",
+    )
+    st.session_state[preset_key] = preset_name
+
+    preset_vals = CALIBRATION_PRESETS.get(preset_name)
+    custom_mode = preset_vals is None
+
+    # Initialize / refresh state from preset (unless custom)
+    if not custom_mode:
+        for k, v in preset_vals.items():
+            st.session_state[f"{state_prefix}{k}"] = v
+
+    # Advanced expander — only path to manual numbers
+    with st.expander("Advanced — manual pixel calibration", expanded=custom_mode):
+        st.caption(
+            "Pixel coordinates of the home plate in your video frame. "
+            "The plate width gives the pixel-to-feet scale. Default values "
+            "above come from the preset — only adjust here if your video "
+            "is shot differently."
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            plate_cx = st.number_input(
+                "Plate center X (px)", min_value=0, max_value=4000,
+                value=int(st.session_state.get(f"{state_prefix}plate_cx_px", 960)),
+                step=10, key=f"{state_prefix}plate_cx_widget",
+            )
+        with c2:
+            plate_cy = st.number_input(
+                "Plate center Y (px)", min_value=0, max_value=4000,
+                value=int(st.session_state.get(f"{state_prefix}plate_cy_px", 900)),
+                step=10, key=f"{state_prefix}plate_cy_widget",
+            )
+        with c3:
+            plate_w = st.number_input(
+                "Plate width (px)", min_value=10, max_value=600,
+                value=int(st.session_state.get(f"{state_prefix}plate_w_px", 110)),
+                step=5, key=f"{state_prefix}plate_w_widget",
+            )
+        c4, c5 = st.columns(2)
+        with c4:
+            ball_rmin = st.number_input(
+                "Ball radius min (px)", min_value=2, max_value=40,
+                value=int(st.session_state.get(f"{state_prefix}ball_rmin_px", 6)),
+                step=1, key=f"{state_prefix}ball_rmin_widget",
+            )
+        with c5:
+            ball_rmax = st.number_input(
+                "Ball radius max (px)", min_value=4, max_value=80,
+                value=int(st.session_state.get(f"{state_prefix}ball_rmax_px", 22)),
+                step=1, key=f"{state_prefix}ball_rmax_widget",
+            )
+
+    # Persist to session state for next-render initial value AND for the
+    # video processor / live capture to pick up
+    st.session_state[f"{state_prefix}plate_cx_px"] = plate_cx
+    st.session_state[f"{state_prefix}plate_cy_px"] = plate_cy
+    st.session_state[f"{state_prefix}plate_w_px"]  = plate_w
+    st.session_state[f"{state_prefix}ball_rmin_px"] = ball_rmin
+    st.session_state[f"{state_prefix}ball_rmax_px"] = ball_rmax
+
+    return {
+        "plate_cx_px": plate_cx,
+        "plate_cy_px": plate_cy,
+        "plate_w_px":  plate_w,
+        "ball_rmin_px": ball_rmin,
+        "ball_rmax_px": ball_rmax,
+    }
+
+
+def process_uploaded_video(video_path: str,
+                             calibration: dict,
+                             sport: str = "Baseball",
+                             min_ball_radius: int = 6,
+                             max_ball_radius: int = 22,
+                             min_pitch_motion_px: float = 8.0,
+                             min_quiet_frames: int = 30,
+                             progress_cb=None) -> list[dict]:
+    """Run ball detection + pitch segmentation on a pre-recorded video.
+
+    The video is iterated frame-by-frame. Ball positions are collected
+    across the whole video. "Pitches" are segmented as contiguous bursts
+    of fast ball motion separated by quiet periods (no detection or near-
+    stationary motion). Each pitch's positions are then fit with the
+    same fit_pitch_trajectory math used by Live Capture.
+
+    Returns a list of pitch-dicts (one per detected pitch) with the same
+    keys as Live Capture's snapped pitches:
+        velocity_mph, plate_x_ft, plate_z_ft, vert_break_in,
+        horiz_break_in, useful_spin_rpm, tilt_clock,
+        spin_efficiency_pct, n_samples, flight_time_sec
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception as e:
+        raise RuntimeError(f"Cannot process video — OpenCV/NumPy not available: {e}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video file: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    # ----- Pass 1: detect ball in every frame -----
+    positions: list[tuple[float, int, int]] = []
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        pos = detect_ball_in_frame(
+            frame,
+            ball_radius_px_range=(min_ball_radius, max_ball_radius),
+            motion_blur_tolerant=True,
+        )
+        if pos:
+            t_sec = frame_idx / fps
+            positions.append((t_sec, pos[0], pos[1]))
+        frame_idx += 1
+        if progress_cb and frame_idx % 30 == 0 and total_frames > 0:
+            progress_cb(min(1.0, frame_idx / total_frames))
+    cap.release()
+    if progress_cb:
+        progress_cb(1.0)
+
+    if len(positions) < 5:
+        return []
+
+    # ----- Pass 2: segment positions into "pitches" -----
+    # A pitch is a burst of consecutive detections where the ball is
+    # moving fast and continuously. Pitches are separated by quiet periods
+    # (no detection or near-stationary motion lasting min_quiet_frames).
+    pitches: list[list[tuple[float, int, int]]] = []
+    current: list[tuple[float, int, int]] = []
+    for i in range(len(positions)):
+        t, x, y = positions[i]
+        if not current:
+            current.append((t, x, y))
+            continue
+        prev_t, prev_x, prev_y = current[-1]
+        gap_frames = (t - prev_t) * fps
+        if gap_frames > min_quiet_frames:
+            # Long gap → previous pitch ended
+            if len(current) >= 5:
+                pitches.append(current)
+            current = [(t, x, y)]
+        else:
+            current.append((t, x, y))
+    if len(current) >= 5:
+        pitches.append(current)
+
+    # Reject pitches where the ball didn't really move (false positives
+    # like a bright object that briefly registered)
+    pitches = [
+        p for p in pitches
+        if max(
+            ((p[i+1][1]-p[i][1])**2 + (p[i+1][2]-p[i][2])**2) ** 0.5
+            for i in range(len(p)-1)
+        ) >= min_pitch_motion_px
+    ]
+
+    # ----- Pass 3: fit each pitch's metrics -----
+    fitted = []
+    for i, pitch_positions in enumerate(pitches):
+        cal = dict(calibration)
+        cal["sport"] = sport
+        fit = fit_pitch_trajectory(pitch_positions, cal)
+        if fit is None:
+            continue
+        fit["pitch_num"]    = i + 1
+        fit["n_positions_seen"] = len(pitch_positions)
+        fitted.append(fit)
+    return fitted
+
+
+def _run_upload_video_mode(active_athlete_id: int | None,
+                             athlete_name: str,
+                             athlete_hand: str,
+                             athlete_sport: str = "Baseball"):
+    """Upload Video mode — film with phone's native camera, process later."""
+    st.markdown(
+        _flat_html(
+            "<div style='background:#f0f9ff;border:1px solid #bae6fd;"
+            "border-left:4px solid #0ea5e9;border-radius:8px;padding:14px 18px;"
+            "margin:8px 0 12px 0;'>"
+            "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            "color:#0369a1;text-transform:uppercase;margin-bottom:6px;'>"
+            "How upload mode works</div>"
+            "<div style='font-size:13px;color:#1f2937;line-height:1.6;'>"
+            "1. At the field, film the bullpen with your <b>phone's native "
+            "Camera app</b> (no Wi-Fi needed). Use 1080p, 60 fps if your phone "
+            "supports it. Camera should be on a tripod behind the catcher or "
+            "on the open side — same setup as Live mode.<br>"
+            "2. Later, when you have good Wi-Fi, AirDrop the video file to your "
+            "laptop (or open this app on the device that has the video).<br>"
+            "3. Calibrate the plate position below (you can pause the video "
+            "in any player to read the pixel coordinates, or eyeball it).<br>"
+            "4. Upload the video file. The app will scan every frame, detect "
+            "the ball, and segment the recording into individual pitches.<br>"
+            "5. Review the detected pitches and tap <b>Save to History</b> "
+            "to add them to the athlete's record."
+            "</div></div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # ===== Calibration — preset-driven =====
+    st.markdown("**Step 1 — Calibration** (pick the closest match to your setup)")
+    cal = render_calibration_with_presets(state_prefix="upload_")
+    plate_cx = cal["plate_cx_px"]
+    plate_cy = cal["plate_cy_px"]
+    plate_w  = cal["plate_w_px"]
+    ball_min = cal["ball_rmin_px"]
+    ball_max = cal["ball_rmax_px"]
+
+    st.divider()
+    st.markdown("**Step 2 — Upload the video file**")
+    uploaded = st.file_uploader(
+        "Drop a .mp4 / .mov / .m4v file here",
+        type=["mp4", "mov", "m4v", "avi"],
+        key="upload_video_file",
+        help="iPhone-shot 1080p video at 30-240 fps. Native camera app output works directly.",
+    )
+
+    if uploaded is None:
+        st.info("No video uploaded yet. Upload a bullpen file above to process it.")
+        return
+
+    # Verify CV deps before processing
+    try:
+        import cv2
+        import numpy as np
+    except Exception as e:
+        st.error(f"OpenCV/NumPy missing — can't process video. ({e})")
+        return
+
+    # Persist the uploaded file to /tmp so cv2.VideoCapture can open it.
+    import tempfile, os
+    tmp_path = os.path.join(tempfile.gettempdir(), uploaded.name)
+    with open(tmp_path, "wb") as f:
+        f.write(uploaded.read())
+    st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
+
+    # Process the video — show progress
+    if st.button("Process video", type="primary", use_container_width=True,
+                  key="upload_process_btn"):
+        progress = st.progress(0.0, text="Scanning frames for ball detections...")
+        def _cb(frac):
+            progress.progress(min(1.0, frac), text=f"Scanning frames... {int(frac*100)}%")
+        calibration = {
+            "plate_center_x_px": int(plate_cx),
+            "plate_center_y_px": int(plate_cy),
+            "plate_width_px":    int(plate_w),
+            "sport":             athlete_sport,
+        }
+        try:
+            with st.spinner("Detecting ball + fitting pitches..."):
+                pitches = process_uploaded_video(
+                    tmp_path,
+                    calibration,
+                    sport=athlete_sport,
+                    min_ball_radius=int(ball_min),
+                    max_ball_radius=int(ball_max),
+                    progress_cb=_cb,
+                )
+            progress.empty()
+            st.session_state["upload_pitches"] = pitches
+            if pitches:
+                st.success(f"Found {len(pitches)} pitch(es) in the video.")
+            else:
+                st.warning(
+                    "No pitches detected. Try lowering the ball-radius min "
+                    "(make it smaller) and re-process. Or the camera might be "
+                    "too far from the pitcher — the ball is smaller than "
+                    f"{ball_min} px in your video."
+                )
+        except Exception as e:
+            progress.empty()
+            st.error(f"Processing failed: {e}")
+
+    # ===== Show detected pitches =====
+    pitches = st.session_state.get("upload_pitches", [])
+    if not pitches:
+        return
+
+    st.divider()
+    st.subheader(f"Detected Pitches ({len(pitches)})")
+    st.caption(
+        "Review what the detector found. Each row is one pitch. "
+        "If any look wrong, deselect them before saving."
+    )
+
+    # Compact table of all pitches with checkboxes
+    keep = []
+    for p in pitches:
+        c1, c2, c3, c4, c5 = st.columns([1, 1.5, 1.5, 1.5, 1.5])
+        with c1:
+            include = st.checkbox(
+                f"Pitch {p['pitch_num']}", value=True,
+                key=f"upload_keep_{p['pitch_num']}",
+            )
+            if include:
+                keep.append(p)
+        c2.metric("Velocity",
+                   f"{p['velocity_mph']} mph" if p.get('velocity_mph') else "—")
+        c3.metric("Plate",
+                   f"({p['plate_x_ft']:+.2f}, {p['plate_z_ft']:.2f}) ft"
+                   if p.get('plate_x_ft') is not None else "—")
+        c4.metric("Break",
+                   f"V{p['vert_break_in']:+.0f}\" / H{p['horiz_break_in']:+.0f}\""
+                   if p.get('vert_break_in') is not None else "—")
+        c5.metric("Spin",
+                   f"{p['useful_spin_rpm']} RPM" if p.get('useful_spin_rpm') else "—")
+
+    # Save selected pitches to history
+    st.divider()
+    if active_athlete_id is None:
+        st.info("Pick a pitcher from the sidebar to enable saving to history.")
+        return
+    if st.button(f"Save {len(keep)} pitch(es) to history",
+                  type="primary", use_container_width=True,
+                  key="upload_save_btn"):
+        from datetime import datetime as _dt
+        rows = []
+        base_time = _dt.utcnow()
+        for i, p in enumerate(keep):
+            rows.append({
+                "Pitch_Num":              i + 1,
+                "Timestamp":              base_time,
+                "Pitch_Type":             "Unknown",
+                "Velocity_mph":           p.get("velocity_mph"),
+                "Total_Spin_rpm":         p.get("useful_spin_rpm"),
+                "Spin_Efficiency_pct":    p.get("spin_efficiency_pct"),
+                "Vert_Break_in":          p.get("vert_break_in"),
+                "Horiz_Break_in":         p.get("horiz_break_in"),
+                "Strike_Zone_Side":       p.get("plate_x_ft"),
+                "Strike_Zone_Height":     p.get("plate_z_ft"),
+                "Extension_ft":           None,
+                "Peak_Valgus_Nm":         None,
+                "AC_Ratio":               None,
+                "FootPlant_Trunk_Rot":    None,
+                "Peak_Hip_Shoulder_Sep":  None,
+                "Release_Lead_Knee_Ext":  None,
+                "Arm_Slot_deg":           None,
+                "Peak_Trunk_Angular_Vel": None,
+                "Pulse_Present":          False,
+                "Pulse_Match_Method":     None,
+                "PPAI_Present":           True,
+                "PPAI_Match_Method":      "video_upload",
+                "Alignment_Confidence":   1.0,
+                "Healed":                 False,
+                "Healed_Notes":           "Uploaded video — ball-flight only",
+                "Outlier_Type":           None,
+            })
+        cap_df = pd.DataFrame(rows)
+        try:
+            new_id = save_session(active_athlete_id, cap_df,
+                                    session_type="real",
+                                    session_kind="pitching")
+            st.success(f"Saved as session #{new_id}. Open the History tab "
+                        "to see it trended alongside other sessions.")
+            st.session_state["upload_pitches"] = []
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+
+
 def run_live_capture_tab(active_athlete_id: int | None,
                           athlete_name: str,
                           athlete_hand: str,
@@ -9672,12 +10102,31 @@ def run_live_capture_tab(active_athlete_id: int | None,
     """Render the Live Capture (Beta) tab. Camera → MediaPipe → biomech."""
     st.subheader("Live Capture (Beta) — phone camera tracking")
     st.caption(
-        "Point a phone or tablet at the pitcher from the side or behind. "
-        "The app extracts body landmarks live and computes the same biomech "
-        "metrics we get from ProPlayAI (release height, arm slot, hip-shoulder "
-        "separation, lead-knee flex, stride length). **No Pitch Logic, Pulse, "
-        "or ProPlayAI subscription needed for these metrics.**"
+        "Point a phone or tablet at the pitcher. The app extracts ball-flight "
+        "metrics (velocity, plate location, break, spin estimates) and pose "
+        "biomech (when MediaPipe is installed). **No Pitch Logic, Pulse, or "
+        "ProPlayAI subscription needed.**"
     )
+
+    # ===== INPUT MODE — Live or Upload =====
+    # Live mode is for real-time capture (phone over local Wi-Fi).
+    # Upload mode lets you film the bullpen with your phone's native camera,
+    # then process the recorded video LATER when you have good Wi-Fi.
+    capture_mode = st.radio(
+        "Capture mode",
+        ["Live (real-time camera)",
+         "Upload Video (film now, process later)"],
+        index=0,
+        horizontal=True,
+        key="livecap_mode",
+        help="Use Live for in-cage real-time feedback. Use Upload to film with "
+             "your phone's native camera app, then upload the file here later "
+             "when you're back on good Wi-Fi.",
+    )
+    if capture_mode.startswith("Upload"):
+        _run_upload_video_mode(active_athlete_id, athlete_name, athlete_hand,
+                                 athlete_sport)
+        return
 
     # --- Verify the live-capture stack is installed ---
     # REQUIRED for any live capture at all (ball tracking + spin work even
@@ -9971,43 +10420,15 @@ def run_live_capture_tab(active_athlete_id: int | None,
             unsafe_allow_html=True,
         )
 
-    # ===== Calibration UI: mark home plate so pixels can map to feet =====
+    # ===== Calibration UI — preset-driven =====
     st.divider()
-    st.markdown("**🎯 Step 1 — Calibration** (one-time per camera setup)")
-    cal_c1, cal_c2, cal_c3, cal_c4 = st.columns([1, 1, 1, 1])
-    with cal_c1:
-        plate_cx = st.number_input("Plate center X (px)", min_value=0, max_value=4000,
-                                      value=int(st.session_state.get("livecap_plate_cx", 640)),
-                                      step=10, key="livecap_plate_cx_input")
-    with cal_c2:
-        plate_cy = st.number_input("Plate center Y (px)", min_value=0, max_value=4000,
-                                      value=int(st.session_state.get("livecap_plate_cy", 600)),
-                                      step=10, key="livecap_plate_cy_input")
-    with cal_c3:
-        plate_w  = st.number_input("Plate width (px)", min_value=10, max_value=600,
-                                      value=int(st.session_state.get("livecap_plate_w", 80)),
-                                      step=5, key="livecap_plate_w_input",
-                                      help="Width of home plate in the camera image. "
-                                           "Real plate width = 17 inches; this gives the "
-                                           "pixel→feet conversion for ball tracking.")
-    with cal_c4:
-        ball_radius_lo = st.number_input("Ball radius min (px)", min_value=2, max_value=40,
-                                            value=int(st.session_state.get("livecap_ball_rmin", 6)),
-                                            step=1, key="livecap_ball_rmin_input")
-        ball_radius_hi = st.number_input("Ball radius max (px)", min_value=4, max_value=80,
-                                            value=int(st.session_state.get("livecap_ball_rmax", 22)),
-                                            step=1, key="livecap_ball_rmax_input")
-    st.session_state["livecap_plate_cx"] = plate_cx
-    st.session_state["livecap_plate_cy"] = plate_cy
-    st.session_state["livecap_plate_w"]  = plate_w
-    st.session_state["livecap_ball_rmin"] = ball_radius_lo
-    st.session_state["livecap_ball_rmax"] = ball_radius_hi
-    st.caption(
-        "Aim the phone, freeze a frame mentally, and enter the plate's pixel "
-        "coordinates here. The plate width gives us the pixel-to-feet scale "
-        "for the entire field. Ball-radius range narrows the detector to "
-        "your camera distance (typical: 6-22 px for a phone 30 ft from the plate)."
-    )
+    st.markdown("**Step 1 — Calibration** (pick the closest match to your setup)")
+    cal = render_calibration_with_presets(state_prefix="livecap_")
+    plate_cx       = cal["plate_cx_px"]
+    plate_cy       = cal["plate_cy_px"]
+    plate_w        = cal["plate_w_px"]
+    ball_radius_lo = cal["ball_rmin_px"]
+    ball_radius_hi = cal["ball_rmax_px"]
 
     st.divider()
     st.markdown("**🎬 Step 2 — Live capture**")
