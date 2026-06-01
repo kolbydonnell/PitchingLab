@@ -9900,8 +9900,201 @@ def process_uploaded_video(video_path: str,
             continue
         fit["pitch_num"]    = i + 1
         fit["n_positions_seen"] = len(pitch_positions)
+        # Time window of this pitch — used downstream for pose extraction
+        fit["t_start_sec"]  = float(pitch_positions[0][0])
+        fit["t_end_sec"]    = float(pitch_positions[-1][0])
         fitted.append(fit)
     return fitted
+
+
+# =============================================================================
+# POSE / MECHANICS HELPERS FOR RECORDED VIDEO
+# =============================================================================
+# These mirror the Live Capture pose pipeline but run on a pre-recorded file.
+# They share the same metric dict shape (hip_shoulder_sep_deg, arm_slot_deg,
+# lead_knee_flex_deg, elbow_stress_nm_est) so the existing Mechanics Analysis
+# section can light up for Upload Video pitches without any extra plumbing.
+#
+# MediaPipe is optional. If it's not installed (e.g. Python 3.13/3.14 on
+# Streamlit Cloud), these helpers return (None, None) cleanly and the caller
+# falls back to ball-only metrics.
+def _is_mediapipe_available() -> bool:
+    try:
+        import mediapipe  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _compute_pose_metrics(landmarks, img_h: int, img_w: int,
+                           handedness: str = "Right") -> dict:
+    """Standalone version of Live Capture's _compute_metrics.
+
+    handedness: "Right" (RHP) or "Left" (LHP). Flips the arm-slot side.
+    Returns the same key set as live mode so analyze_mechanics is happy.
+    """
+    import math as _m
+    try:
+        import mediapipe as _mp
+    except Exception:
+        return {}
+    L = _mp.solutions.pose.PoseLandmark
+
+    try:
+        lhip   = landmarks[L.LEFT_HIP.value]
+        rhip   = landmarks[L.RIGHT_HIP.value]
+        lshld  = landmarks[L.LEFT_SHOULDER.value]
+        rshld  = landmarks[L.RIGHT_SHOULDER.value]
+        lwrist = landmarks[L.LEFT_WRIST.value]
+        rwrist = landmarks[L.RIGHT_WRIST.value]
+        lknee  = landmarks[L.LEFT_KNEE.value]
+        rknee  = landmarks[L.RIGHT_KNEE.value]
+        lankle = landmarks[L.LEFT_ANKLE.value]
+        rankle = landmarks[L.RIGHT_ANKLE.value]
+
+        def line_angle(p1, p2):
+            return _m.degrees(_m.atan2(p2.y - p1.y, p2.x - p1.x))
+        hip_ang  = line_angle(lhip, rhip)
+        shld_ang = line_angle(lshld, rshld)
+        hs_sep   = abs((shld_ang - hip_ang + 180) % 360 - 180)
+
+        # Throwing side — RHP uses right shoulder/wrist; LHP flips.
+        if handedness.lower().startswith("l"):
+            slot_ang  = line_angle(lshld, lwrist)
+            lead_top, lead_mid, lead_bot = rhip, rknee, rankle
+        else:
+            slot_ang  = line_angle(rshld, rwrist)
+            lead_top, lead_mid, lead_bot = lhip, lknee, lankle
+
+        def joint_angle(p_top, p_mid, p_bot):
+            v1 = (p_top.x - p_mid.x, p_top.y - p_mid.y)
+            v2 = (p_bot.x - p_mid.x, p_bot.y - p_mid.y)
+            dot = v1[0]*v2[0] + v1[1]*v2[1]
+            mag1 = (v1[0]**2 + v1[1]**2) ** 0.5
+            mag2 = (v2[0]**2 + v2[1]**2) ** 0.5
+            if mag1 * mag2 == 0:
+                return None
+            cos_a = max(-1.0, min(1.0, dot / (mag1 * mag2)))
+            return _m.degrees(_m.acos(cos_a))
+        lead_knee = joint_angle(lead_top, lead_mid, lead_bot)
+
+        release_y_px = (rwrist.y if not handedness.lower().startswith("l")
+                                  else lwrist.y) * img_h
+        body_px = abs(lshld.y - lankle.y) * img_h
+
+        # Elbow stress estimate (same formula as Live Capture)
+        base_stress = 48.0
+        if hs_sep > 50:
+            base_stress += (hs_sep - 50) * 0.5
+        if lead_knee is not None and lead_knee < 145:
+            base_stress += (145 - lead_knee) * 0.4
+        if abs(slot_ang) > 30:
+            base_stress += (abs(slot_ang) - 30) * 0.3
+        elbow_stress_est = max(30.0, min(85.0, base_stress))
+
+        return {
+            "hip_shoulder_sep_deg": round(hs_sep, 1),
+            "arm_slot_deg":          round(slot_ang, 1),
+            "lead_knee_flex_deg":    round(lead_knee, 1) if lead_knee else None,
+            "release_y_pixel":       round(release_y_px, 1),
+            "body_height_pixel":     round(body_px, 1),
+            "elbow_stress_nm_est":   round(elbow_stress_est, 1),
+        }
+    except Exception:
+        return {}
+
+
+def extract_pose_from_video_segment(video_path: str,
+                                       t_start_sec: float,
+                                       t_end_sec: float,
+                                       handedness: str = "Right",
+                                       max_frames_to_scan: int = 60
+                                       ) -> tuple:
+    """Scan a slice of a recorded video, find the release frame, capture pose.
+
+    Strategy:
+      1. Open video, seek to t_start_sec.
+      2. Read up to max_frames_to_scan frames inside the window.
+      3. Run MediaPipe pose on each, pick the "release frame" = the frame
+         whose throwing-wrist is highest in image (smallest y) — that's
+         the apex of the arm action, a stable proxy for ball release on
+         most camera angles. (For side view we'd use forward-most x; for
+         now y works for behind-catcher framing.)
+      4. Draw skeleton on that frame and return (overlay_png_bytes, metrics).
+
+    Returns (None, None) if mediapipe is unavailable, video can't be read,
+    or no pose was detected. Caller should treat that as "no biomech for
+    this pitch" rather than an error.
+    """
+    if not _is_mediapipe_available():
+        return None, None
+    try:
+        import cv2
+        import numpy as np
+        import mediapipe as mp
+    except Exception:
+        return None, None
+
+    mp_pose    = mp.solutions.pose
+    mp_draw    = mp.solutions.drawing_utils
+    mp_styles  = mp.solutions.drawing_styles
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None, None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    start_frame = max(0, int(t_start_sec * fps))
+    end_frame   = max(start_frame + 1, int(t_end_sec * fps))
+    end_frame   = min(end_frame, start_frame + max_frames_to_scan)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    best_frame  = None
+    best_lm     = None
+    best_wrist_y = 2.0   # smaller = higher in image = release apex
+    L = mp_pose.PoseLandmark
+    pose = mp_pose.Pose(model_complexity=1, enable_segmentation=False,
+                         min_detection_confidence=0.5,
+                         min_tracking_confidence=0.5)
+    try:
+        for _ in range(end_frame - start_frame):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = pose.process(rgb)
+            if not res.pose_landmarks:
+                continue
+            lm = res.pose_landmarks.landmark
+            wrist_idx = (L.LEFT_WRIST.value
+                          if handedness.lower().startswith("l")
+                          else L.RIGHT_WRIST.value)
+            w_y = lm[wrist_idx].y
+            if w_y < best_wrist_y:
+                best_wrist_y = w_y
+                best_frame   = frame.copy()
+                best_lm      = res.pose_landmarks
+    finally:
+        pose.close()
+        cap.release()
+
+    if best_frame is None or best_lm is None:
+        return None, None
+
+    h, w = best_frame.shape[:2]
+    mp_draw.draw_landmarks(
+        best_frame, best_lm, mp_pose.POSE_CONNECTIONS,
+        landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style(),
+    )
+
+    metrics = _compute_pose_metrics(best_lm.landmark, h, w,
+                                       handedness=handedness)
+
+    # Encode as PNG bytes so we can hand it straight to st.image()
+    ok, png = cv2.imencode(".png", best_frame)
+    if not ok:
+        return None, metrics or None
+    return png.tobytes(), (metrics or None)
 
 
 def _run_upload_video_mode(active_athlete_id: int | None,
@@ -9927,9 +10120,13 @@ def _run_upload_video_mode(active_athlete_id: int | None,
             "3. Calibrate the plate position below (you can pause the video "
             "in any player to read the pixel coordinates, or eyeball it).<br>"
             "4. Upload the video file. The app will scan every frame, detect "
-            "the ball, and segment the recording into individual pitches.<br>"
-            "5. Review the detected pitches and tap <b>Save to History</b> "
-            "to add them to the athlete's record."
+            "the ball, segment the recording into individual pitches, and "
+            "(if MediaPipe is installed) extract a skeleton + biomech reading "
+            "from each pitch's release frame.<br>"
+            "5. Review the detected pitches — open the <b>Mechanics</b> "
+            "expander on any pitch to see the skeleton overlay and pose "
+            "metrics — then tap <b>Save to History</b> to add them to the "
+            "athlete's record."
             "</div></div>"
         ),
         unsafe_allow_html=True,
@@ -9995,6 +10192,35 @@ def _run_upload_video_mode(active_athlete_id: int | None,
                     progress_cb=_cb,
                 )
             progress.empty()
+
+            # ----- Pose / skeleton overlay pass (MediaPipe) -----
+            # Runs per pitch over the time window the ball tracker found.
+            # Skips silently if MediaPipe isn't installed — user sees a
+            # one-line nudge to install it via enable_full_pose.command.
+            if pitches:
+                if _is_mediapipe_available():
+                    pose_prog = st.progress(
+                        0.0, text="Extracting skeleton + biomech per pitch...")
+                    for idx, p in enumerate(pitches):
+                        png_bytes, metrics = extract_pose_from_video_segment(
+                            tmp_path,
+                            t_start_sec=p.get("t_start_sec", 0.0),
+                            t_end_sec=p.get("t_end_sec", 0.0) + 0.5,
+                            handedness=athlete_hand or "Right",
+                        )
+                        p["skeleton_png"]    = png_bytes
+                        p["pose_metrics"]    = metrics or {}
+                        pose_prog.progress((idx + 1) / max(1, len(pitches)),
+                                            text=f"Pose: pitch {idx+1}/{len(pitches)}")
+                    pose_prog.empty()
+                else:
+                    st.caption(
+                        "Skeleton overlay + biomech skipped — MediaPipe not "
+                        "installed. Run `enable_full_pose.command` (one-time, "
+                        "~3 min) to add pose extraction. Ball flight (velocity / "
+                        "break / spin) was still captured."
+                    )
+
             st.session_state["upload_pitches"] = pitches
             if pitches:
                 st.success(f"Found {len(pitches)} pitch(es) in the video.")
@@ -10021,7 +10247,7 @@ def _run_upload_video_mode(active_athlete_id: int | None,
         "If any look wrong, deselect them before saving."
     )
 
-    # Compact table of all pitches with checkboxes
+    # Compact table of all pitches with checkboxes + expandable skeleton overlay
     keep = []
     for p in pitches:
         c1, c2, c3, c4, c5 = st.columns([1, 1.5, 1.5, 1.5, 1.5])
@@ -10043,6 +10269,57 @@ def _run_upload_video_mode(active_athlete_id: int | None,
         c5.metric("Spin",
                    f"{p['useful_spin_rpm']} RPM" if p.get('useful_spin_rpm') else "—")
 
+        # ----- Skeleton overlay + biomech (collapsed by default) -----
+        skel_png = p.get("skeleton_png")
+        pose_m   = p.get("pose_metrics") or {}
+        if skel_png or pose_m:
+            with st.expander(f"Mechanics — Pitch {p['pitch_num']}",
+                              expanded=False):
+                ec1, ec2 = st.columns([1.2, 1.0])
+                with ec1:
+                    if skel_png:
+                        st.image(skel_png,
+                                  caption="Release frame with pose skeleton",
+                                  use_container_width=True)
+                    else:
+                        st.caption(
+                            "No skeleton captured for this pitch — pose "
+                            "detector couldn't lock on the pitcher in the "
+                            "release window. Often a framing or lighting "
+                            "issue; ball-flight metrics are still valid.")
+                with ec2:
+                    if pose_m:
+                        st.markdown("**Biomech (release frame)**")
+                        bm_rows = [
+                            ("Hip-Shoulder Sep",
+                              pose_m.get("hip_shoulder_sep_deg"), "°",
+                              "Elite 50-65° for baseball, 42-50° for softball"),
+                            ("Arm Slot",
+                              pose_m.get("arm_slot_deg"), "°",
+                              "Negative = above shoulder, positive = sidearm"),
+                            ("Lead Knee Flex",
+                              pose_m.get("lead_knee_flex_deg"), "°",
+                              "Posted >155° = strong block, <140° = collapse"),
+                            ("Elbow Stress (est.)",
+                              pose_m.get("elbow_stress_nm_est"), " Nm",
+                              "Estimated from pose — see Mechanics tab for grading"),
+                        ]
+                        for label, val, unit, hint in bm_rows:
+                            disp = f"{val}{unit}" if val is not None else "—"
+                            st.markdown(
+                                f"<div style='margin-bottom:8px;'>"
+                                f"<span style='color:#94a3b8;font-size:12px;'>"
+                                f"{label}</span><br>"
+                                f"<span style='font-size:18px;font-weight:600;"
+                                f"color:#f1f5f9;'>{disp}</span><br>"
+                                f"<span style='font-size:11px;color:#64748b;'>"
+                                f"{hint}</span></div>",
+                                unsafe_allow_html=True)
+                    else:
+                        st.caption(
+                            "No biomech values for this pitch — pose detector "
+                            "didn't find a confident frame in the throw window.")
+
     # Save selected pitches to history
     st.divider()
     if active_athlete_id is None:
@@ -10055,6 +10332,8 @@ def _run_upload_video_mode(active_athlete_id: int | None,
         rows = []
         base_time = _dt.utcnow()
         for i, p in enumerate(keep):
+            pm = p.get("pose_metrics") or {}
+            has_pose = bool(pm)
             rows.append({
                 "Pitch_Num":              i + 1,
                 "Timestamp":              base_time,
@@ -10067,12 +10346,12 @@ def _run_upload_video_mode(active_athlete_id: int | None,
                 "Strike_Zone_Side":       p.get("plate_x_ft"),
                 "Strike_Zone_Height":     p.get("plate_z_ft"),
                 "Extension_ft":           None,
-                "Peak_Valgus_Nm":         None,
+                "Peak_Valgus_Nm":         pm.get("elbow_stress_nm_est"),
                 "AC_Ratio":               None,
                 "FootPlant_Trunk_Rot":    None,
-                "Peak_Hip_Shoulder_Sep":  None,
-                "Release_Lead_Knee_Ext":  None,
-                "Arm_Slot_deg":           None,
+                "Peak_Hip_Shoulder_Sep":  pm.get("hip_shoulder_sep_deg"),
+                "Release_Lead_Knee_Ext":  pm.get("lead_knee_flex_deg"),
+                "Arm_Slot_deg":           pm.get("arm_slot_deg"),
                 "Peak_Trunk_Angular_Vel": None,
                 "Pulse_Present":          False,
                 "Pulse_Match_Method":     None,
@@ -10080,7 +10359,9 @@ def _run_upload_video_mode(active_athlete_id: int | None,
                 "PPAI_Match_Method":      "video_upload",
                 "Alignment_Confidence":   1.0,
                 "Healed":                 False,
-                "Healed_Notes":           "Uploaded video — ball-flight only",
+                "Healed_Notes":           ("Uploaded video — ball-flight + pose"
+                                            if has_pose
+                                            else "Uploaded video — ball-flight only"),
                 "Outlier_Type":           None,
             })
         cap_df = pd.DataFrame(rows)
