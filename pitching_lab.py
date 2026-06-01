@@ -10321,107 +10321,88 @@ def extract_pose_from_video_segment(video_path: str,
     return png.tobytes(), (metrics or None)
 
 
-def _run_upload_video_mode(active_athlete_id: int | None,
-                             athlete_name: str,
-                             athlete_hand: str,
-                             athlete_sport: str = "Baseball"):
-    """Upload Video mode — film with phone's native camera, process later."""
-    st.markdown(
-        _flat_html(
-            "<div style='background:#f0f9ff;border:1px solid #bae6fd;"
-            "border-left:4px solid #0ea5e9;border-radius:8px;padding:14px 18px;"
-            "margin:8px 0 12px 0;'>"
-            "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
-            "color:#0369a1;text-transform:uppercase;margin-bottom:6px;'>"
-            "How upload mode works</div>"
-            "<div style='font-size:13px;color:#1f2937;line-height:1.6;'>"
-            "1. At the field, film the bullpen with your <b>phone's native "
-            "Camera app</b> (no Wi-Fi needed). Use 1080p, 60 fps if your phone "
-            "supports it. Camera should be on a tripod behind the catcher or "
-            "on the open side — same setup as Live mode.<br>"
-            "2. Later, when you have good Wi-Fi, AirDrop the video file to your "
-            "laptop (or open this app on the device that has the video).<br>"
-            "3. Upload the video file in the app.<br>"
-            "4. Calibrate by tapping the LEFT then RIGHT edge of home plate "
-            "on the still that pops up. The app does the pixel math from "
-            "there — no manual numbers needed.<br>"
-            "5. Tap <b>Process</b>. The app scans every frame, detects the "
-            "ball, segments the recording into individual pitches, and "
-            "(if MediaPipe is installed) extracts a skeleton + biomech "
-            "reading from each pitch's release frame.<br>"
-            "6. Review the detected pitches — open the <b>Mechanics</b> "
-            "expander on any pitch to see the skeleton overlay and pose "
-            "metrics — then tap <b>Save to History</b> to add them to the "
-            "athlete's record."
-            "</div></div>"
-        ),
-        unsafe_allow_html=True,
-    )
+def _capture_one_camera_for_upload(label: str,
+                                      key_prefix: str,
+                                      athlete_hand: str,
+                                      athlete_sport: str) -> tuple:
+    """Render the upload + calibrate + process pipeline for ONE camera.
 
-    # ===== Step 1 — upload the file first =====
-    st.markdown("**Step 1 — Upload the video file**")
+    Returns (pitches_list, tmp_video_path). Either may be None when not
+    yet ready. Pitches list comes from session_state so it survives
+    Streamlit reruns (needed because click-calibration triggers reruns).
+
+    key_prefix namespaces all session_state and widget keys so two cameras
+    can live side by side without colliding.
+    """
+    import tempfile, os
+    st.markdown(f"### {label}")
+
+    # ===== Step 1 — upload =====
+    st.markdown("**Step 1 — Upload video**")
     uploaded = st.file_uploader(
         "Drop a .mp4 / .mov / .m4v file here",
         type=["mp4", "mov", "m4v", "avi"],
-        key="upload_video_file",
-        help="iPhone-shot 1080p video at 30-240 fps. Native camera app output works directly.",
+        key=f"{key_prefix}file",
+        help="iPhone 1080p, 30-240 fps. Native camera output works directly.",
     )
+    pitches_session_key = f"{key_prefix}pitches"
+    path_session_key    = f"{key_prefix}path"
 
     if uploaded is None:
-        st.info("No video uploaded yet. Upload a bullpen file above to process it.")
-        return
+        st.caption("No video uploaded yet.")
+        return st.session_state.get(pitches_session_key, []), \
+                st.session_state.get(path_session_key)
 
-    # Verify CV deps before processing
-    try:
-        import cv2
-        import numpy as np
-    except Exception as e:
-        st.error(f"OpenCV/NumPy missing — can't process video. ({e})")
-        return
-
-    # Persist the uploaded file to /tmp so cv2.VideoCapture can open it.
-    import tempfile, os
-    tmp_path = os.path.join(tempfile.gettempdir(), uploaded.name)
-    with open(tmp_path, "wb") as f:
-        f.write(uploaded.read())
+    # Persist file once per upload (avoid re-writing every rerun)
+    last_name_key = f"{key_prefix}last_filename"
+    tmp_path = os.path.join(tempfile.gettempdir(),
+                              f"{key_prefix}{uploaded.name}")
+    if st.session_state.get(last_name_key) != uploaded.name:
+        with open(tmp_path, "wb") as f:
+            f.write(uploaded.read())
+        st.session_state[last_name_key] = uploaded.name
+        st.session_state[path_session_key] = tmp_path
+        # Invalidate cached results for the previous video
+        st.session_state.pop(pitches_session_key, None)
+    tmp_path = st.session_state.get(path_session_key, tmp_path)
     st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
 
-    # ===== Step 2 — click-to-calibrate on a still from the video =====
+    # ===== Step 2 — calibrate =====
     st.divider()
-    st.markdown("**Step 2 — Calibrate the plate** (click two points)")
-    cal = render_click_calibration(
-        tmp_path,
-        state_prefix="upload_cc_",
-        sport=athlete_sport,
-    )
-
-    # Fallback (or refinement): expandable manual / preset picker
+    st.markdown("**Step 2 — Calibrate plate** (tap LEFT then RIGHT edge)")
+    cal = render_click_calibration(tmp_path,
+                                       state_prefix=f"{key_prefix}cc_",
+                                       sport=athlete_sport)
     with st.expander("Use preset or manual numbers instead",
                        expanded=(cal is None)):
         st.caption(
-            "Falling back here is fine if click-to-calibrate isn't loading "
-            "on your device (some older mobile browsers). Pick a preset or "
-            "type pixel coordinates by hand. Click-derived values above take "
-            "precedence if both are set."
-        )
-        fallback_cal = render_calibration_with_presets(state_prefix="upload_")
-
+            "Falling back here is fine if click-to-calibrate isn't loading. "
+            "Pick a preset or type pixel coordinates by hand. Click-derived "
+            "values above take precedence if both are set.")
+        fallback_cal = render_calibration_with_presets(
+            state_prefix=key_prefix)
     cal = cal or fallback_cal
     if cal is None:
         st.info("Calibrate the plate before processing.")
-        return
-    plate_cx = cal["plate_cx_px"]
-    plate_cy = cal["plate_cy_px"]
-    plate_w  = cal["plate_w_px"]
-    ball_min = cal["ball_rmin_px"]
-    ball_max = cal["ball_rmax_px"]
+        return st.session_state.get(pitches_session_key, []), tmp_path
 
-    # Process the video — show progress
+    plate_cx = cal["plate_cx_px"]; plate_cy = cal["plate_cy_px"]
+    plate_w  = cal["plate_w_px"]
+    ball_min = cal["ball_rmin_px"]; ball_max = cal["ball_rmax_px"]
+
+    # ===== Step 3 — process =====
     if st.button("Process video", type="primary", use_container_width=True,
-                  key="upload_process_btn"):
+                  key=f"{key_prefix}process_btn"):
+        try:
+            import cv2  # noqa: F401
+        except Exception as e:
+            st.error(f"OpenCV missing — can't process video. ({e})")
+            return st.session_state.get(pitches_session_key, []), tmp_path
+
         progress = st.progress(0.0, text="Scanning frames for ball detections...")
         def _cb(frac):
-            progress.progress(min(1.0, frac), text=f"Scanning frames... {int(frac*100)}%")
+            progress.progress(min(1.0, frac),
+                                text=f"Scanning frames... {int(frac*100)}%")
         calibration = {
             "plate_center_x_px": int(plate_cx),
             "plate_center_y_px": int(plate_cy),
@@ -10431,78 +10412,52 @@ def _run_upload_video_mode(active_athlete_id: int | None,
         try:
             with st.spinner("Detecting ball + fitting pitches..."):
                 pitches = process_uploaded_video(
-                    tmp_path,
-                    calibration,
-                    sport=athlete_sport,
+                    tmp_path, calibration, sport=athlete_sport,
                     min_ball_radius=int(ball_min),
-                    max_ball_radius=int(ball_max),
-                    progress_cb=_cb,
-                )
+                    max_ball_radius=int(ball_max), progress_cb=_cb)
             progress.empty()
-
-            # ----- Pose / skeleton overlay pass (MediaPipe) -----
-            # Runs per pitch over the time window the ball tracker found.
-            # Skips silently if MediaPipe isn't installed — user sees a
-            # one-line nudge to install it via enable_full_pose.command.
+            # Pose pass
+            if pitches and _is_mediapipe_available():
+                pose_prog = st.progress(
+                    0.0, text="Extracting skeleton + biomech per pitch...")
+                for idx, p in enumerate(pitches):
+                    png_bytes, metrics = extract_pose_from_video_segment(
+                        tmp_path,
+                        t_start_sec=p.get("t_start_sec", 0.0),
+                        t_end_sec=p.get("t_end_sec", 0.0) + 0.5,
+                        handedness=athlete_hand or "Right")
+                    p["skeleton_png"] = png_bytes
+                    p["pose_metrics"] = metrics or {}
+                    pose_prog.progress((idx + 1) / max(1, len(pitches)),
+                                        text=f"Pose: pitch {idx+1}/{len(pitches)}")
+                pose_prog.empty()
+            elif pitches:
+                st.caption(
+                    "Skeleton overlay + biomech skipped — MediaPipe not "
+                    "available. Ball flight metrics were captured.")
+            st.session_state[pitches_session_key] = pitches
             if pitches:
-                if _is_mediapipe_available():
-                    pose_prog = st.progress(
-                        0.0, text="Extracting skeleton + biomech per pitch...")
-                    for idx, p in enumerate(pitches):
-                        png_bytes, metrics = extract_pose_from_video_segment(
-                            tmp_path,
-                            t_start_sec=p.get("t_start_sec", 0.0),
-                            t_end_sec=p.get("t_end_sec", 0.0) + 0.5,
-                            handedness=athlete_hand or "Right",
-                        )
-                        p["skeleton_png"]    = png_bytes
-                        p["pose_metrics"]    = metrics or {}
-                        pose_prog.progress((idx + 1) / max(1, len(pitches)),
-                                            text=f"Pose: pitch {idx+1}/{len(pitches)}")
-                    pose_prog.empty()
-                else:
-                    st.caption(
-                        "Skeleton overlay + biomech skipped — MediaPipe not "
-                        "installed. Run `enable_full_pose.command` (one-time, "
-                        "~3 min) to add pose extraction. Ball flight (velocity / "
-                        "break / spin) was still captured."
-                    )
-
-            st.session_state["upload_pitches"] = pitches
-            if pitches:
-                st.success(f"Found {len(pitches)} pitch(es) in the video.")
+                st.success(f"Found {len(pitches)} pitch(es) in this video.")
             else:
                 st.warning(
-                    "No pitches detected. Try lowering the ball-radius min "
-                    "(make it smaller) and re-process. Or the camera might be "
-                    "too far from the pitcher — the ball is smaller than "
-                    f"{ball_min} px in your video."
-                )
+                    f"No pitches detected. Try lowering ball radius min "
+                    f"(< {ball_min} px) and re-process.")
         except Exception as e:
             progress.empty()
             st.error(f"Processing failed: {e}")
+    return st.session_state.get(pitches_session_key, []), tmp_path
 
-    # ===== Show detected pitches =====
-    pitches = st.session_state.get("upload_pitches", [])
-    if not pitches:
-        return
 
-    st.divider()
-    st.subheader(f"Detected Pitches ({len(pitches)})")
-    st.caption(
-        "Review what the detector found. Each row is one pitch. "
-        "If any look wrong, deselect them before saving."
-    )
-
-    # Compact table of all pitches with checkboxes + expandable skeleton overlay
+def _render_pitch_review_table(pitches: list, key_prefix: str) -> list:
+    """Render the checkbox table + skeleton expanders for a list of pitches.
+    Returns the list of pitches the user kept checked."""
     keep = []
     for p in pitches:
         c1, c2, c3, c4, c5 = st.columns([1, 1.5, 1.5, 1.5, 1.5])
         with c1:
             include = st.checkbox(
                 f"Pitch {p['pitch_num']}", value=True,
-                key=f"upload_keep_{p['pitch_num']}",
-            )
+                key=f"{key_prefix}keep_{p['pitch_num']}")
             if include:
                 keep.append(p)
         c2.metric("Velocity",
@@ -10516,7 +10471,6 @@ def _run_upload_video_mode(active_athlete_id: int | None,
         c5.metric("Spin",
                    f"{p['useful_spin_rpm']} RPM" if p.get('useful_spin_rpm') else "—")
 
-        # ----- Skeleton overlay + biomech (collapsed by default) -----
         skel_png = p.get("skeleton_png")
         pose_m   = p.get("pose_metrics") or {}
         if skel_png or pose_m:
@@ -10531,9 +10485,7 @@ def _run_upload_video_mode(active_athlete_id: int | None,
                     else:
                         st.caption(
                             "No skeleton captured for this pitch — pose "
-                            "detector couldn't lock on the pitcher in the "
-                            "release window. Often a framing or lighting "
-                            "issue; ball-flight metrics are still valid.")
+                            "detector couldn't lock in the release window.")
                 with ec2:
                     if pose_m:
                         st.markdown("**Biomech (release frame)**")
@@ -10549,7 +10501,7 @@ def _run_upload_video_mode(active_athlete_id: int | None,
                               "Posted >155° = strong block, <140° = collapse"),
                             ("Elbow Stress (est.)",
                               pose_m.get("elbow_stress_nm_est"), " Nm",
-                              "Estimated from pose — see Mechanics tab for grading"),
+                              "Estimated from pose"),
                         ]
                         for label, val, unit, hint in bm_rows:
                             disp = f"{val}{unit}" if val is not None else "—"
@@ -10566,8 +10518,193 @@ def _run_upload_video_mode(active_athlete_id: int | None,
                         st.caption(
                             "No biomech values for this pitch — pose detector "
                             "didn't find a confident frame in the throw window.")
+    return keep
 
-    # Save selected pitches to history
+
+def _fuse_pitch_pair(mech_pitch: dict, flight_pitch: dict) -> dict:
+    """Combine a mechanics-camera pitch and a ball-flight camera pitch
+    into one record. Ball flight wins for trajectory metrics (plate, break,
+    spin), mechanics camera wins for pose + skeleton."""
+    fused = dict(flight_pitch)   # Start with ball-flight side
+    mech_pose = mech_pitch.get("pose_metrics") or {}
+    if mech_pose:
+        fused["pose_metrics"] = mech_pose
+    if mech_pitch.get("skeleton_png"):
+        fused["skeleton_png"] = mech_pitch["skeleton_png"]
+    # Velocity: side view is more accurate (lateral pixel motion).
+    # Prefer the mechanics camera's velocity if it's clearly the side view.
+    if mech_pitch.get("velocity_mph") is not None:
+        fused["velocity_mph_mech"] = mech_pitch["velocity_mph"]
+    return fused
+
+
+def _save_pitches_to_history(pitches: list,
+                                active_athlete_id: int,
+                                source_label: str = "video_upload"):
+    """Write a session row per pitch to history. Returns new session id."""
+    from datetime import datetime as _dt
+    rows = []
+    base_time = _dt.utcnow()
+    for i, p in enumerate(pitches):
+        pm = p.get("pose_metrics") or {}
+        has_pose = bool(pm)
+        rows.append({
+            "Pitch_Num":              i + 1,
+            "Timestamp":              base_time,
+            "Pitch_Type":             "Unknown",
+            "Velocity_mph":           p.get("velocity_mph"),
+            "Total_Spin_rpm":         p.get("useful_spin_rpm"),
+            "Spin_Efficiency_pct":    p.get("spin_efficiency_pct"),
+            "Vert_Break_in":          p.get("vert_break_in"),
+            "Horiz_Break_in":         p.get("horiz_break_in"),
+            "Strike_Zone_Side":       p.get("plate_x_ft"),
+            "Strike_Zone_Height":     p.get("plate_z_ft"),
+            "Extension_ft":           None,
+            "Peak_Valgus_Nm":         pm.get("elbow_stress_nm_est"),
+            "AC_Ratio":               None,
+            "FootPlant_Trunk_Rot":    None,
+            "Peak_Hip_Shoulder_Sep":  pm.get("hip_shoulder_sep_deg"),
+            "Release_Lead_Knee_Ext":  pm.get("lead_knee_flex_deg"),
+            "Arm_Slot_deg":           pm.get("arm_slot_deg"),
+            "Peak_Trunk_Angular_Vel": None,
+            "Pulse_Present":          False,
+            "Pulse_Match_Method":     None,
+            "PPAI_Present":           True,
+            "PPAI_Match_Method":      source_label,
+            "Alignment_Confidence":   1.0,
+            "Healed":                 False,
+            "Healed_Notes":           (
+                f"Uploaded video ({source_label}) — "
+                f"{'ball-flight + pose' if has_pose else 'ball-flight only'}"),
+            "Outlier_Type":           None,
+        })
+    cap_df = pd.DataFrame(rows)
+    return save_session(active_athlete_id, cap_df,
+                          session_type="real", session_kind="pitching")
+
+
+def _render_two_camera_pairing_ui(mech_pitches: list,
+                                     flight_pitches: list) -> list:
+    """Side-by-side pitch pairing UI. Returns list of fused pitch dicts
+    in the chosen order. User can manually re-pair if counts differ."""
+    n_mech, n_flight = len(mech_pitches), len(flight_pitches)
+    st.markdown("### Pair pitches across cameras")
+    if n_mech == n_flight:
+        st.caption(
+            f"Both cameras detected {n_mech} pitches. Pairing in order "
+            f"(pitch 1 of mechanics camera with pitch 1 of ball-flight "
+            f"camera, etc.). Override with the dropdowns if needed.")
+    else:
+        st.warning(
+            f"Camera counts differ — mechanics: {n_mech}, ball-flight: "
+            f"{n_flight}. One camera may have missed a throw or detected a "
+            f"false positive. Manually pair below (set to 'Skip' to drop a "
+            f"pitch entirely).")
+
+    # Build dropdown options
+    mech_opts   = ["Skip"] + [f"M-Pitch {p['pitch_num']}" for p in mech_pitches]
+    flight_opts = ["Skip"] + [f"F-Pitch {p['pitch_num']}" for p in flight_pitches]
+    n_rows = max(n_mech, n_flight)
+    fused_list = []
+    for i in range(n_rows):
+        col_m, col_arrow, col_f = st.columns([1.4, 0.3, 1.4])
+        with col_m:
+            default_m_idx = (i + 1) if i < n_mech else 0
+            pick_m = st.selectbox(
+                f"Mechanics #{i+1}", mech_opts, index=default_m_idx,
+                key=f"two_cam_mech_pick_{i}")
+        with col_arrow:
+            st.markdown(
+                "<div style='text-align:center;color:#94a3b8;"
+                "font-size:24px;line-height:2;'>⇄</div>",
+                unsafe_allow_html=True)
+        with col_f:
+            default_f_idx = (i + 1) if i < n_flight else 0
+            pick_f = st.selectbox(
+                f"Ball-flight #{i+1}", flight_opts, index=default_f_idx,
+                key=f"two_cam_flight_pick_{i}")
+        m_i = mech_opts.index(pick_m) - 1
+        f_i = flight_opts.index(pick_f) - 1
+        if m_i >= 0 and f_i >= 0:
+            fused = _fuse_pitch_pair(mech_pitches[m_i],
+                                       flight_pitches[f_i])
+            fused["pitch_num"] = i + 1
+            fused_list.append(fused)
+        elif m_i >= 0:
+            # Mech only — preserve pose, no ball flight
+            mech_only = dict(mech_pitches[m_i])
+            mech_only["pitch_num"] = i + 1
+            fused_list.append(mech_only)
+        elif f_i >= 0:
+            # Flight only — ball metrics, no pose
+            flight_only = dict(flight_pitches[f_i])
+            flight_only["pitch_num"] = i + 1
+            fused_list.append(flight_only)
+        # else both Skip → drop entirely
+    return fused_list
+
+
+def _run_upload_video_mode(active_athlete_id: int | None,
+                             athlete_name: str,
+                             athlete_hand: str,
+                             athlete_sport: str = "Baseball"):
+    """Upload Video mode — film with phone's native camera, process later.
+
+    Two flows live here:
+      - Single camera (default): upload one video, calibrate, process, save.
+      - Two cameras: upload two videos (mechanics + ball-flight angles),
+        process each, manually pair pitches, save fused records where each
+        pitch carries the BEST metrics from each angle.
+    """
+    st.markdown(
+        _flat_html(
+            "<div style='background:#f0f9ff;border:1px solid #bae6fd;"
+            "border-left:4px solid #0ea5e9;border-radius:8px;padding:14px 18px;"
+            "margin:8px 0 12px 0;'>"
+            "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            "color:#0369a1;text-transform:uppercase;margin-bottom:6px;'>"
+            "How upload mode works</div>"
+            "<div style='font-size:13px;color:#1f2937;line-height:1.6;'>"
+            "<b>One camera (default):</b> film the bullpen from one angle, "
+            "upload it, tap the plate edges to calibrate, then process. "
+            "Works in 3-5 min.<br>"
+            "<b>Two cameras (optional):</b> use the side-view phone for "
+            "<i>mechanics</i> AND a second behind-catcher phone for "
+            "<i>ball-flight</i>. Upload both, process both, then pair "
+            "pitches. Each saved pitch ends up with the BEST data from "
+            "each angle: pose biomech from the side view, plate "
+            "location + break + spin from behind the catcher."
+            "</div></div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # Camera-mode picker
+    mode = st.radio(
+        "Camera setup",
+        ["Single camera",
+         "Two cameras — mechanics + ball-flight"],
+        horizontal=True,
+        key="upload_mode",
+    )
+
+    if mode.startswith("Two cameras"):
+        _run_upload_video_two_camera(active_athlete_id, athlete_hand,
+                                        athlete_sport)
+        return
+
+    # ===== Single-camera flow =====
+    pitches, _tmp_path = _capture_one_camera_for_upload(
+        label="Bullpen video", key_prefix="upload_",
+        athlete_hand=athlete_hand, athlete_sport=athlete_sport)
+
+    if not pitches:
+        return
+    st.divider()
+    st.subheader(f"Detected Pitches ({len(pitches)})")
+    st.caption("Review what the detector found. Deselect any that look wrong.")
+    keep = _render_pitch_review_table(pitches, key_prefix="upload_")
+
     st.divider()
     if active_athlete_id is None:
         st.info("Pick a pitcher from the sidebar to enable saving to history.")
@@ -10575,50 +10712,82 @@ def _run_upload_video_mode(active_athlete_id: int | None,
     if st.button(f"Save {len(keep)} pitch(es) to history",
                   type="primary", use_container_width=True,
                   key="upload_save_btn"):
-        from datetime import datetime as _dt
-        rows = []
-        base_time = _dt.utcnow()
-        for i, p in enumerate(keep):
-            pm = p.get("pose_metrics") or {}
-            has_pose = bool(pm)
-            rows.append({
-                "Pitch_Num":              i + 1,
-                "Timestamp":              base_time,
-                "Pitch_Type":             "Unknown",
-                "Velocity_mph":           p.get("velocity_mph"),
-                "Total_Spin_rpm":         p.get("useful_spin_rpm"),
-                "Spin_Efficiency_pct":    p.get("spin_efficiency_pct"),
-                "Vert_Break_in":          p.get("vert_break_in"),
-                "Horiz_Break_in":         p.get("horiz_break_in"),
-                "Strike_Zone_Side":       p.get("plate_x_ft"),
-                "Strike_Zone_Height":     p.get("plate_z_ft"),
-                "Extension_ft":           None,
-                "Peak_Valgus_Nm":         pm.get("elbow_stress_nm_est"),
-                "AC_Ratio":               None,
-                "FootPlant_Trunk_Rot":    None,
-                "Peak_Hip_Shoulder_Sep":  pm.get("hip_shoulder_sep_deg"),
-                "Release_Lead_Knee_Ext":  pm.get("lead_knee_flex_deg"),
-                "Arm_Slot_deg":           pm.get("arm_slot_deg"),
-                "Peak_Trunk_Angular_Vel": None,
-                "Pulse_Present":          False,
-                "Pulse_Match_Method":     None,
-                "PPAI_Present":           True,
-                "PPAI_Match_Method":      "video_upload",
-                "Alignment_Confidence":   1.0,
-                "Healed":                 False,
-                "Healed_Notes":           ("Uploaded video — ball-flight + pose"
-                                            if has_pose
-                                            else "Uploaded video — ball-flight only"),
-                "Outlier_Type":           None,
-            })
-        cap_df = pd.DataFrame(rows)
         try:
-            new_id = save_session(active_athlete_id, cap_df,
-                                    session_type="real",
-                                    session_kind="pitching")
-            st.success(f"Saved as session #{new_id}. Open the History tab "
-                        "to see it trended alongside other sessions.")
+            new_id = _save_pitches_to_history(keep, active_athlete_id,
+                                                  source_label="video_upload")
+            st.success(f"Saved as session #{new_id}. Open the History tab to "
+                        "see it trended alongside other sessions.")
             st.session_state["upload_pitches"] = []
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+
+
+def _run_upload_video_two_camera(active_athlete_id: int | None,
+                                    athlete_hand: str,
+                                    athlete_sport: str):
+    """Two-camera flow: side-by-side capture, pair, fuse, save."""
+    st.divider()
+    st.markdown(
+        "<div style='background:#1e293b;border:1px solid #334155;"
+        "border-radius:10px;padding:14px 18px;margin:6px 0 14px 0;'>"
+        "<div style='font-size:13px;color:#cbd5e1;line-height:1.6;'>"
+        "<b>Camera 1 — Mechanics (side view):</b> tripod 20 ft on the "
+        "open side (3rd-base side for RHP, 1st-base for LHP), "
+        "perpendicular to the flight path. Captures the cleanest skeleton "
+        "and arm slot.<br>"
+        "<b>Camera 2 — Ball-flight (behind catcher):</b> tripod 10-15 ft "
+        "behind the plate on the centerline. Captures plate location, "
+        "break direction, and spin most accurately."
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    col_l, col_r = st.columns(2, gap="large")
+    with col_l:
+        mech_pitches, _ = _capture_one_camera_for_upload(
+            label="Camera 1 · Mechanics (side view)",
+            key_prefix="upload_mech_",
+            athlete_hand=athlete_hand, athlete_sport=athlete_sport)
+    with col_r:
+        flight_pitches, _ = _capture_one_camera_for_upload(
+            label="Camera 2 · Ball-flight (behind catcher)",
+            key_prefix="upload_flight_",
+            athlete_hand=athlete_hand, athlete_sport=athlete_sport)
+
+    if not (mech_pitches and flight_pitches):
+        st.info("Process both videos to pair pitches.")
+        return
+
+    st.divider()
+    fused_list = _render_two_camera_pairing_ui(mech_pitches, flight_pitches)
+    if not fused_list:
+        st.info("No paired pitches — set at least one row to non-Skip on both sides.")
+        return
+
+    st.divider()
+    st.subheader(f"Fused Pitches ({len(fused_list)})")
+    st.caption(
+        "Each row is one pitch with the BEST data from each camera — pose "
+        "from mechanics, ball-flight from behind catcher. Open Mechanics to "
+        "verify the skeleton overlay.")
+    keep = _render_pitch_review_table(fused_list, key_prefix="upload_fused_")
+
+    st.divider()
+    if active_athlete_id is None:
+        st.info("Pick a pitcher from the sidebar to enable saving to history.")
+        return
+    if st.button(f"Save {len(keep)} fused pitch(es) to history",
+                  type="primary", use_container_width=True,
+                  key="upload_save_two_cam_btn"):
+        try:
+            new_id = _save_pitches_to_history(
+                keep, active_athlete_id,
+                source_label="video_upload_two_cam")
+            st.success(
+                f"Saved as session #{new_id}. Each pitch carries pose from "
+                "the side view AND ball-flight from behind the catcher.")
+            for k in ("upload_mech_pitches", "upload_flight_pitches"):
+                st.session_state[k] = []
         except Exception as e:
             st.error(f"Could not save: {e}")
 
