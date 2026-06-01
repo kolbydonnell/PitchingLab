@@ -22,6 +22,8 @@ numpy>=1.26
 streamlit-image-coordinates>=0.1.6   # click-to-calibrate plate
 
 # Pose extraction via MediaPipe — drives skeleton overlay + biomech in
-# Live Capture and Upload Video. Wheels available for Python 3.9-3.12, so
-# Streamlit Cloud must run 3.12 (pinned in runtime.txt).
-mediapipe>=0.10.14
+# Live Capture and Upload Video. Wheels available for Python 3.9-3.12.
+# IMPORTANT: Streamlit Cloud app Settings → Python version MUST be 3.12.
+# Pin a specific version so pip can't fall back to a broken stub if
+# wheel resolution gets confused.
+mediapipe==0.10.18
