@@ -10133,8 +10133,18 @@ def process_uploaded_video(video_path: str,
 # Streamlit Cloud), these helpers return (None, None) cleanly and the caller
 # falls back to ball-only metrics.
 def _is_mediapipe_available() -> bool:
+    """True only if mediapipe imports AND exposes the legacy solutions API.
+
+    On Streamlit Cloud, if Python is the wrong version, pip sometimes
+    installs a stub mediapipe package that imports without errors but is
+    missing the `solutions` submodule. Treat that case as unavailable so
+    the rest of the app gracefully degrades instead of crashing.
+    """
     try:
-        import mediapipe  # noqa: F401
+        import mediapipe as _mp  # noqa: F401
+        # Real builds expose mediapipe.solutions.pose; stubs don't.
+        _ = _mp.solutions.pose            # type: ignore[attr-defined]
+        _ = _mp.solutions.drawing_utils   # type: ignore[attr-defined]
         return True
     except Exception:
         return False
@@ -10678,9 +10688,15 @@ def run_live_capture_tab(active_athlete_id: int | None,
     POSE_AVAILABLE = False
     try:
         import mediapipe as mp  # noqa: F811
+        # Some Streamlit Cloud / Python combos install a stub mediapipe
+        # without the legacy solutions API — detect that explicitly so
+        # the app degrades gracefully instead of AttributeError-crashing.
+        _ = mp.solutions.pose           # type: ignore[attr-defined]
+        _ = mp.solutions.drawing_utils  # type: ignore[attr-defined]
         POSE_AVAILABLE = True
     except Exception:
         mp = None
+        POSE_AVAILABLE = False
 
     # --- Imports for the working path ---
     import av
@@ -10695,11 +10711,11 @@ def run_live_capture_tab(active_athlete_id: int | None,
     else:
         # Friendly notice — capture still works, just without pose overlay
         st.info(
-            "🦴 **Pose extraction is OFF** (MediaPipe not installed for your Python "
-            "version). **Ball tracking + velocity + break + spin still work.** "
-            "To turn pose ON, install Python 3.12 alongside your current version "
-            "(`brew install python@3.12`) and uncomment the `mediapipe` line in "
-            "`requirements.txt`."
+            "**Pose extraction is OFF** — MediaPipe isn't fully available for "
+            "this Python version. **Ball tracking + velocity + break + spin "
+            "still work.** To turn pose ON, the deploy needs Python 3.12 "
+            "(set in Streamlit Cloud → app Settings → Python version). "
+            "Locally, run `enable_full_pose.command`."
         )
 
     # --- Sidebar/UI for capture settings ---
@@ -11548,13 +11564,18 @@ def run_hitting_live_capture(active_athlete_id: int | None,
         )
         return
 
-    # --- OPTIONAL pose dep ---
+    # --- OPTIONAL pose dep (stub-aware) ---
     POSE_AVAILABLE = False
     try:
         import mediapipe as mp  # noqa
+        # Some Streamlit Cloud / Python combos install a stub mediapipe
+        # without the legacy solutions API — detect that explicitly.
+        _ = mp.solutions.pose           # type: ignore[attr-defined]
+        _ = mp.solutions.drawing_utils  # type: ignore[attr-defined]
         POSE_AVAILABLE = True
     except Exception:
         mp = None
+        POSE_AVAILABLE = False
     import av, cv2, numpy as np
     from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
     if POSE_AVAILABLE:
@@ -11563,10 +11584,10 @@ def run_hitting_live_capture(active_athlete_id: int | None,
         mp_styles = mp.solutions.drawing_styles
     else:
         st.info(
-            "**Pose extraction is OFF** (MediaPipe not installed for your "
-            "Python version). **Ball tracking + exit velo + launch angle "
-            "still work.** Install Python 3.12 alongside your current "
-            "version to enable swing-mechanics extraction."
+            "**Pose extraction is OFF** — MediaPipe isn't fully available for "
+            "this Python version. **Ball tracking + exit velo + launch "
+            "angle still work.** The deploy needs Python 3.12 to enable "
+            "swing-mechanics extraction."
         )
 
     # --- Calibration row ---
