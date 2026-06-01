@@ -5755,15 +5755,799 @@ def init_db():
         if "session_kind" not in scols:
             c.execute("ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'pitching'")
 
+        # ===== USERS + ORGS tables (login system + role scoping) =====
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                salt          TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                role          TEXT NOT NULL DEFAULT 'coach',
+                org_id        INTEGER,
+                linked_athlete_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS organizations (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                owner_username TEXT NOT NULL,
+                invite_code TEXT,
+                created_at  TEXT NOT NULL
+            );
+        """)
+        # Migration: scope every athlete to a user. Existing pre-login
+        # athletes get tagged as '__legacy__' so they don't leak across
+        # the new login boundary.
+        if "created_by" not in cols:
+            c.execute(
+                "ALTER TABLE athletes ADD COLUMN created_by "
+                "TEXT NOT NULL DEFAULT '__legacy__'")
+        # Org scoping on athletes + per-athlete invite code (for players
+        # to join via)
+        if "org_id" not in cols:
+            c.execute("ALTER TABLE athletes ADD COLUMN org_id INTEGER")
+        if "invite_code" not in cols:
+            c.execute("ALTER TABLE athletes ADD COLUMN invite_code TEXT")
+        # Sub-team within an org + profile pic (base64 thumbnail — small
+        # enough to live in SQLite, survives Streamlit Cloud redeploys
+        # unlike disk-backed uploads)
+        if "team_id" not in cols:
+            c.execute("ALTER TABLE athletes ADD COLUMN team_id INTEGER")
+        if "profile_pic_b64" not in cols:
+            c.execute("ALTER TABLE athletes ADD COLUMN profile_pic_b64 TEXT")
 
-def list_athletes(include_archived: bool = False) -> list[dict]:
+        # Teams table — org-scoped sub-groups (Varsity / JV / 14U / 16U etc)
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS teams (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_id      INTEGER NOT NULL,
+                name        TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_teams_org ON teams(org_id);
+        """)
+        # Migration: add role columns to pre-existing users table (if
+        # the SQLite ALTER above didn't apply because the CREATE TABLE
+        # didn't run on a brand-new DB this session)
+        ucols = [r[1] for r in c.execute(
+            "PRAGMA table_info(users)").fetchall()]
+        if "role" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'coach'")
+        if "org_id" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN org_id INTEGER")
+        if "linked_athlete_id" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN linked_athlete_id INTEGER")
+        # ----- Subscription / billing columns -----
+        # On users (for solo individual athletes). On orgs (for org plans).
+        for col, ddl in [
+            ("subscription_status",
+              "ALTER TABLE users ADD COLUMN subscription_status TEXT NOT NULL DEFAULT 'trial'"),
+            ("subscription_tier",
+              "ALTER TABLE users ADD COLUMN subscription_tier TEXT"),
+            ("subscription_renews_at",
+              "ALTER TABLE users ADD COLUMN subscription_renews_at TEXT"),
+            ("trial_sessions_used",
+              "ALTER TABLE users ADD COLUMN trial_sessions_used INTEGER NOT NULL DEFAULT 0"),
+            ("trial_pitches_used",
+              "ALTER TABLE users ADD COLUMN trial_pitches_used INTEGER NOT NULL DEFAULT 0"),
+            ("stripe_customer_id",
+              "ALTER TABLE users ADD COLUMN stripe_customer_id TEXT"),
+            ("stripe_subscription_id",
+              "ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT"),
+        ]:
+            if col not in ucols:
+                c.execute(ddl)
+        ocols = [r[1] for r in c.execute(
+            "PRAGMA table_info(organizations)").fetchall()]
+        for col, ddl in [
+            ("subscription_status",
+              "ALTER TABLE organizations ADD COLUMN subscription_status TEXT NOT NULL DEFAULT 'trial'"),
+            ("subscription_tier",
+              "ALTER TABLE organizations ADD COLUMN subscription_tier TEXT"),
+            ("subscription_renews_at",
+              "ALTER TABLE organizations ADD COLUMN subscription_renews_at TEXT"),
+            ("trial_sessions_used",
+              "ALTER TABLE organizations ADD COLUMN trial_sessions_used INTEGER NOT NULL DEFAULT 0"),
+            ("trial_pitches_used",
+              "ALTER TABLE organizations ADD COLUMN trial_pitches_used INTEGER NOT NULL DEFAULT 0"),
+            ("stripe_customer_id",
+              "ALTER TABLE organizations ADD COLUMN stripe_customer_id TEXT"),
+            ("stripe_subscription_id",
+              "ALTER TABLE organizations ADD COLUMN stripe_subscription_id TEXT"),
+            ("athlete_cap",
+              "ALTER TABLE organizations ADD COLUMN athlete_cap INTEGER"),
+        ]:
+            if col not in ocols:
+                c.execute(ddl)
+
+
+# =============================================================================
+# AUTH HELPERS
+# =============================================================================
+# Username + password stored locally in the SQLite db. Hashing is
+# pbkdf2_hmac (sha256, 200k iterations) with a per-user random salt — safe
+# enough for a single-machine app. NOT meant to defend a public web API;
+# if you ever go internet-facing, swap to bcrypt and rate-limit attempts.
+def _hash_password(password: str, salt: bytes) -> str:
+    import hashlib
+    h = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                              salt, 200_000)
+    return h.hex()
+
+
+def _generate_invite_code(length: int = 6) -> str:
+    """Short, easy-to-type, no-look-alike chars (no 0/O, 1/I/l)."""
+    import secrets
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _validate_username_password(username: str, password: str) -> tuple:
+    """Shared validation. Returns (ok, msg_or_clean_username)."""
+    username = (username or "").strip().lower()
+    if not username or len(username) < 3:
+        return False, "Username must be at least 3 characters."
+    if not password or len(password) < 6:
+        return False, "Password must be at least 6 characters."
+    if not username.replace("_", "").replace("-", "").isalnum():
+        return False, "Username can only contain letters, numbers, _ and -."
+    return True, username
+
+
+def register_user(username: str, password: str,
+                    role: str = "coach",
+                    org_id: int | None = None,
+                    linked_athlete_id: int | None = None) -> tuple:
+    """Generic user-insert. Returns (success, message). Most callers should
+    use register_coach() or register_athlete() instead."""
+    import os
+    ok, msg = _validate_username_password(username, password)
+    if not ok:
+        return False, msg
+    username = msg
+    init_db()
+    from datetime import datetime as _dt
+    with _db_conn() as c:
+        if c.execute("SELECT 1 FROM users WHERE username = ?",
+                      (username,)).fetchone():
+            return False, "That username is already taken."
+        salt = os.urandom(16)
+        c.execute(
+            "INSERT INTO users (username, password_hash, salt, created_at, "
+            "role, org_id, linked_athlete_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (username, _hash_password(password, salt), salt.hex(),
+             _dt.utcnow().isoformat(), role, org_id, linked_athlete_id))
+    return True, f"Account '{username}' created."
+
+
+def create_organization(name: str, owner_username: str) -> int:
+    """Create a new org owned by a coach. Returns new org id."""
+    from datetime import datetime as _dt
+    init_db()
+    invite_code = _generate_invite_code(8)
+    with _db_conn() as c:
+        cur = c.execute(
+            "INSERT INTO organizations (name, owner_username, invite_code, "
+            "created_at) VALUES (?, ?, ?, ?)",
+            ((name or "").strip(), owner_username, invite_code,
+             _dt.utcnow().isoformat()))
+        return cur.lastrowid
+
+
+def register_coach(username: str, password: str, org_name: str) -> tuple:
+    """Create a coach account + a new organization owned by them.
+    Returns (success, message_or_username)."""
+    if not org_name or not org_name.strip():
+        return False, "Organization name is required."
+    ok, msg = register_user(username, password, role="coach")
+    if not ok:
+        return False, msg
+    canonical_username = msg.split("'")[1] if "'" in msg else username.strip().lower()
+    org_id = create_organization(org_name, canonical_username)
+    # Attach org_id to the new coach user
+    with _db_conn() as c:
+        c.execute("UPDATE users SET org_id = ? WHERE username = ?",
+                    (org_id, canonical_username))
+    return True, canonical_username
+
+
+def get_athlete_by_invite_code(code: str) -> dict | None:
+    """Look up an athlete by their invite code (case-insensitive)."""
+    if not code:
+        return None
     init_db()
     with _db_conn() as c:
-        q = "SELECT * FROM athletes"
+        row = c.execute(
+            "SELECT * FROM athletes WHERE UPPER(invite_code) = UPPER(?) "
+            "AND archived = 0",
+            (code.strip(),)).fetchone()
+    return dict(row) if row else None
+
+
+# =============================================================================
+# ADMIN ACCOUNT (operator-only — can view ANY org, any user, any athlete)
+# =============================================================================
+# Bootstrap pattern: a secret code lives in .streamlit/secrets.toml under
+# admin_bootstrap_code. Anyone who knows the code can promote a username
+# to admin. Without the code there's no admin UI exposed, no way to
+# self-promote, no risk in a public deploy.
+def _admin_bootstrap_code() -> str | None:
+    try:
+        v = st.secrets.get("admin_bootstrap_code", None)
+    except Exception:
+        v = None
+    return v
+
+
+def is_current_user_admin() -> bool:
+    rec = current_user_record()
+    return bool(rec and rec.get("role") == "admin")
+
+
+def promote_user_to_admin(username: str, code: str) -> tuple:
+    """Promote an existing user to admin role. Requires the secret bootstrap
+    code to match .streamlit/secrets.toml.
+
+    Returns (success, message).
+    """
+    expected = _admin_bootstrap_code()
+    if not expected:
+        return False, ("Admin promotion isn't enabled. Set "
+                       "`admin_bootstrap_code` in `.streamlit/secrets.toml` "
+                       "first.")
+    if (code or "").strip() != expected:
+        return False, "Wrong admin bootstrap code."
+    rec = get_user_record(username)
+    if rec is None:
+        return False, "No such user."
+    init_db()
+    with _db_conn() as c:
+        c.execute("UPDATE users SET role = 'admin' WHERE username = ?",
+                    (username,))
+    return True, f"{username} promoted to admin."
+
+
+def admin_list_all_orgs() -> list[dict]:
+    init_db()
+    with _db_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM organizations ORDER BY created_at DESC").fetchall()]
+
+
+def admin_list_all_users() -> list[dict]:
+    init_db()
+    with _db_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id, username, role, org_id, subscription_status, "
+            "subscription_tier, trial_sessions_used, trial_pitches_used, "
+            "stripe_customer_id, created_at FROM users "
+            "ORDER BY created_at DESC").fetchall()]
+
+
+def admin_list_all_athletes() -> list[dict]:
+    """Admin variant of list_athletes — no filtering."""
+    init_db()
+    with _db_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM athletes ORDER BY created_at DESC").fetchall()]
+
+
+def admin_impersonate_athlete(athlete_id: int):
+    """Drop directly into a specific athlete's profile, bypassing org scope."""
+    st.session_state["selected_athlete_id"] = athlete_id
+    st.session_state["admin_impersonating"] = True
+
+
+def register_athlete(username: str, password: str,
+                      invite_code: str | None = None,
+                      name: str = "",
+                      hand: str = "Right",
+                      sport: str = "Baseball",
+                      grad_class: str = "",
+                      level: str = "HS-Varsity") -> tuple:
+    """Register a player account.
+    Two paths:
+      - invite_code provided  → link to the coach-created athlete with
+        that code; user joins that athlete's org.
+      - invite_code None      → create a brand-new solo athlete record
+        owned by this user, no org.
+    Returns (success, message_or_username).
+    """
+    if invite_code:
+        athlete = get_athlete_by_invite_code(invite_code)
+        if athlete is None:
+            return False, "Invalid invite code. Double-check with your coach."
+        ok, msg = register_user(username, password, role="athlete",
+                                  org_id=athlete.get("org_id"),
+                                  linked_athlete_id=athlete["id"])
+        if not ok:
+            return False, msg
+        return True, msg
+    # Solo path — must provide a name to create the athlete record
+    if not name or not name.strip():
+        return False, "Enter your name so the app can create your athlete profile."
+    ok, msg = register_user(username, password, role="athlete")
+    if not ok:
+        return False, msg
+    canonical = (username or "").strip().lower()
+    # Solo athlete: created_by = the user themself; no org.
+    new_athlete_id = add_athlete(name.strip(), hand=hand, sport=sport,
+                                    grad_class=grad_class.strip(),
+                                    level=level,
+                                    created_by=canonical)
+    with _db_conn() as c:
+        c.execute("UPDATE users SET linked_athlete_id = ? WHERE username = ?",
+                    (new_athlete_id, canonical))
+    return True, msg
+
+
+def verify_user(username: str, password: str) -> tuple:
+    """Returns (success, message). On success, message = the canonical
+    username (lowercased) the caller should store in session_state."""
+    username = (username or "").strip().lower()
+    if not username or not password:
+        return False, "Enter a username and password."
+    init_db()
+    with _db_conn() as c:
+        row = c.execute(
+            "SELECT password_hash, salt FROM users WHERE username = ?",
+            (username,)).fetchone()
+    if row is None:
+        return False, "No account with that username."
+    salt = bytes.fromhex(row["salt"])
+    if _hash_password(password, salt) != row["password_hash"]:
+        return False, "Wrong password."
+    return True, username
+
+
+def current_username():
+    """Returns the username stored in session_state, or None.
+
+    Safe to call from tests / scripts that run without a Streamlit session:
+    returns None if session_state isn't available."""
+    try:
+        return st.session_state.get("auth_user")
+    except Exception:
+        return None
+
+
+def get_user_record(username: str | None) -> dict | None:
+    """Fetch full user row (incl. role, org_id, linked_athlete_id)."""
+    if not username:
+        return None
+    init_db()
+    with _db_conn() as c:
+        row = c.execute("SELECT * FROM users WHERE username = ?",
+                         (username,)).fetchone()
+    return dict(row) if row else None
+
+
+def current_user_record() -> dict | None:
+    """Wrapper: full record for the user in session_state."""
+    return get_user_record(current_username())
+
+
+def current_role() -> str | None:
+    """'coach' | 'athlete' | None."""
+    rec = current_user_record()
+    return rec.get("role") if rec else None
+
+
+def current_org_id() -> int | None:
+    rec = current_user_record()
+    return rec.get("org_id") if rec else None
+
+
+def current_linked_athlete_id() -> int | None:
+    rec = current_user_record()
+    return rec.get("linked_athlete_id") if rec else None
+
+
+def get_org_record(org_id: int | None) -> dict | None:
+    if not org_id:
+        return None
+    init_db()
+    with _db_conn() as c:
+        row = c.execute("SELECT * FROM organizations WHERE id = ?",
+                         (org_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def is_demo_mode_active() -> bool:
+    """When the user is browsing demo athletes, this is True.
+    Returns False outside a Streamlit session."""
+    try:
+        return bool(st.session_state.get("auth_demo_mode"))
+    except Exception:
+        return False
+
+
+# =============================================================================
+# SUBSCRIPTION TIERS + BILLING
+# =============================================================================
+# Pricing is centralized here so it can be changed without hunting through
+# the UI. Annual prices show the ~30% discount in the card.
+# stripe_price_id_* values are filled once Stripe products are created in
+# the Stripe dashboard and the IDs are pasted in via .streamlit/secrets.toml.
+TRIAL_SESSIONS_CAP = 2     # at this many saved sessions, trial ends
+TRIAL_PITCHES_CAP  = 15    # OR at this many pitches captured, trial ends
+
+SUBSCRIPTION_TIERS = {
+    "individual": {
+        "label":         "Individual Athlete",
+        "blurb":         "One athlete profile · full app · for parents/solo players",
+        "athlete_cap":   1,
+        "monthly_usd":   14.99,
+        "annual_usd":    129,
+        "monthly_stripe_price_id": None,   # filled from secrets
+        "annual_stripe_price_id":  None,
+    },
+    "single_team": {
+        "label":         "Single Team",
+        "blurb":         "Up to 20 athletes · one HS or travel team",
+        "athlete_cap":   20,
+        "monthly_usd":   49,
+        "annual_usd":    399,
+        "monthly_stripe_price_id": None,
+        "annual_stripe_price_id":  None,
+    },
+    "club": {
+        "label":         "Club",
+        "blurb":         "Up to 50 athletes · multi-team travel-ball clubs",
+        "athlete_cap":   50,
+        "monthly_usd":   99,
+        "annual_usd":    799,
+        "monthly_stripe_price_id": None,
+        "annual_stripe_price_id":  None,
+    },
+    "large_org": {
+        "label":         "Large Organization",
+        "blurb":         "Up to 150 athletes · big HS programs + large clubs",
+        "athlete_cap":   150,
+        "monthly_usd":   179,
+        "annual_usd":    1499,
+        "monthly_stripe_price_id": None,
+        "annual_stripe_price_id":  None,
+    },
+}
+
+
+def _stripe_secrets() -> dict:
+    """Pull Stripe config from .streamlit/secrets.toml. Returns {} if not
+    configured (so the rest of the app can still run + show a 'subscribe'
+    button that lands on a 'billing not yet enabled' notice)."""
+    try:
+        cfg = dict(st.secrets.get("stripe", {}))
+    except Exception:
+        return {}
+    return cfg
+
+
+def stripe_is_configured() -> bool:
+    cfg = _stripe_secrets()
+    return bool(cfg.get("secret_key"))
+
+
+def get_billing_entity(user: dict | None = None) -> tuple:
+    """Return (kind, record) where kind is 'org' or 'user'.
+
+    - Coach role with org → ('org', org_record). The org pays.
+    - Athlete role linked to org → still ('org', org_record).
+    - Solo athlete (no org) → ('user', user_record). They pay individually.
+    - No login → ('none', None).
+    """
+    if user is None:
+        user = current_user_record()
+    if user is None:
+        return "none", None
+    if user.get("org_id"):
+        org = get_org_record(user["org_id"])
+        if org is not None:
+            return "org", org
+    return "user", user
+
+
+def billing_status() -> dict:
+    """Return the current entity's billing snapshot.
+
+    Keys:
+        kind, entity_id, status, tier, sessions_used, pitches_used,
+        can_capture (bool), block_reason (str | None), trial_remaining_sessions,
+        trial_remaining_pitches, sample_data (bool — demo-mode is always OK).
+
+    IMPORTANT: While Stripe isn't configured (set up later), every call
+    returns can_capture=True so the trial gating is a no-op. Coaches and
+    athletes can use the app freely. Once Stripe is wired up, this lifts
+    automatically.
+    """
+    if not stripe_is_configured():
+        kind, rec = get_billing_entity()
+        return {
+            "kind": kind, "entity_id": (rec or {}).get("id"),
+            "status": "billing_disabled", "tier": None,
+            "sessions_used": 0, "pitches_used": 0,
+            "can_capture": True, "block_reason": None,
+            "trial_remaining_sessions": None,
+            "trial_remaining_pitches": None,
+            "sample_data": False,
+        }
+    if is_demo_mode_active():
+        return {
+            "kind": "demo", "entity_id": None, "status": "demo",
+            "tier": None, "sessions_used": 0, "pitches_used": 0,
+            "can_capture": True, "block_reason": None,
+            "trial_remaining_sessions": None,
+            "trial_remaining_pitches": None,
+            "sample_data": True,
+        }
+    kind, rec = get_billing_entity()
+    if rec is None:
+        return {
+            "kind": "none", "entity_id": None, "status": "logged_out",
+            "tier": None, "sessions_used": 0, "pitches_used": 0,
+            "can_capture": False,
+            "block_reason": "Not logged in.",
+            "trial_remaining_sessions": None,
+            "trial_remaining_pitches": None,
+            "sample_data": False,
+        }
+    status = rec.get("subscription_status", "trial")
+    tier   = rec.get("subscription_tier")
+    sess   = int(rec.get("trial_sessions_used", 0) or 0)
+    pitch  = int(rec.get("trial_pitches_used", 0) or 0)
+    if status == "active":
+        return {
+            "kind": kind, "entity_id": rec.get("id"),
+            "status": status, "tier": tier,
+            "sessions_used": sess, "pitches_used": pitch,
+            "can_capture": True, "block_reason": None,
+            "trial_remaining_sessions": None,
+            "trial_remaining_pitches": None,
+            "sample_data": False,
+        }
+    # Trial / past_due / canceled / expired — apply trial caps
+    rem_sess  = max(0, TRIAL_SESSIONS_CAP - sess)
+    rem_pitch = max(0, TRIAL_PITCHES_CAP  - pitch)
+    can = (status == "trial" and rem_sess > 0 and rem_pitch > 0)
+    block = None
+    if not can:
+        if status == "trial":
+            block = ("Trial limit reached "
+                     f"({sess}/{TRIAL_SESSIONS_CAP} sessions, "
+                     f"{pitch}/{TRIAL_PITCHES_CAP} pitches). "
+                     "Subscribe to keep capturing.")
+        elif status == "past_due":
+            block = "Payment past due — please update your card."
+        elif status in ("canceled", "expired"):
+            block = "Subscription ended — resubscribe to capture more pitches."
+        else:
+            block = "Subscription required."
+    return {
+        "kind": kind, "entity_id": rec.get("id"),
+        "status": status, "tier": tier,
+        "sessions_used": sess, "pitches_used": pitch,
+        "can_capture": can, "block_reason": block,
+        "trial_remaining_sessions": rem_sess,
+        "trial_remaining_pitches":  rem_pitch,
+        "sample_data": False,
+    }
+
+
+def increment_trial_counters(sessions_delta: int = 0,
+                                pitches_delta: int = 0) -> None:
+    """Bump the trial counters on whichever entity owns the subscription.
+    No-op if the user is already on an active paid plan, or in demo mode."""
+    if is_demo_mode_active():
+        return
+    kind, rec = get_billing_entity()
+    if rec is None or rec.get("subscription_status") == "active":
+        return
+    table = "organizations" if kind == "org" else "users"
+    init_db()
+    with _db_conn() as c:
+        c.execute(
+            f"UPDATE {table} SET trial_sessions_used = "
+            f"COALESCE(trial_sessions_used, 0) + ?, "
+            f"trial_pitches_used = COALESCE(trial_pitches_used, 0) + ? "
+            f"WHERE id = ?",
+            (int(sessions_delta), int(pitches_delta), rec["id"]))
+
+
+def set_subscription(entity_kind: str, entity_id: int, *,
+                       tier: str,
+                       status: str = "active",
+                       renews_at: str | None = None,
+                       stripe_customer_id: str | None = None,
+                       stripe_subscription_id: str | None = None):
+    """Update billing fields on a user or org. Called by Stripe webhook
+    or by manual admin actions."""
+    table = "organizations" if entity_kind == "org" else "users"
+    init_db()
+    sets = ["subscription_status = ?", "subscription_tier = ?"]
+    params: list = [status, tier]
+    if renews_at is not None:
+        sets.append("subscription_renews_at = ?")
+        params.append(renews_at)
+    if stripe_customer_id is not None:
+        sets.append("stripe_customer_id = ?")
+        params.append(stripe_customer_id)
+    if stripe_subscription_id is not None:
+        sets.append("stripe_subscription_id = ?")
+        params.append(stripe_subscription_id)
+    if entity_kind == "org" and tier in SUBSCRIPTION_TIERS:
+        sets.append("athlete_cap = ?")
+        params.append(SUBSCRIPTION_TIERS[tier]["athlete_cap"])
+    params.append(entity_id)
+    with _db_conn() as c:
+        c.execute(f"UPDATE {table} SET {', '.join(sets)} WHERE id = ?",
+                    params)
+
+
+def render_trial_status_banner():
+    """Sidebar banner showing trial progress + Subscribe button.
+    No-op when billing isn't enabled yet (Stripe not configured)."""
+    if not stripe_is_configured():
+        return
+    bs = billing_status()
+    if bs["status"] == "active" or bs["sample_data"]:
+        return
+    if bs["status"] == "logged_out":
+        return
+    sess = bs["sessions_used"]
+    pitch = bs["pitches_used"]
+    rem_sess = bs["trial_remaining_sessions"]
+    rem_pitch = bs["trial_remaining_pitches"]
+    color = "#22c55e"
+    label = "Free trial"
+    if not bs["can_capture"]:
+        color = "#ef4444"
+        label = "Trial ended"
+    elif (rem_sess or 0) <= 1 or (rem_pitch or 0) <= 5:
+        color = "#d4a634"
+        label = "Trial — almost up"
+    st.markdown(
+        f"<div style='background:#1e293b;border-left:4px solid {color};"
+        f"border-radius:8px;padding:10px 14px;margin:8px 0;'>"
+        f"<div style='font-size:10px;letter-spacing:0.10em;font-weight:700;"
+        f"color:{color};text-transform:uppercase;'>{label}</div>"
+        f"<div style='color:#cbd5e1;font-size:12px;margin-top:4px;'>"
+        f"{sess}/{TRIAL_SESSIONS_CAP} sessions · "
+        f"{pitch}/{TRIAL_PITCHES_CAP} pitches used</div>"
+        f"</div>",
+        unsafe_allow_html=True)
+    if st.button("Subscribe", key="trial_subscribe_btn",
+                  use_container_width=True, type="primary"):
+        st.session_state["show_billing_modal"] = True
+        st.rerun()
+
+
+def render_billing_modal_if_requested():
+    """Full pricing card + (eventually) Stripe Checkout launch. Stub for
+    now — shows the tiers and prices, click-to-subscribe redirects to
+    Stripe only when configured."""
+    if not st.session_state.get("show_billing_modal"):
+        return
+    st.markdown("---")
+    st.subheader("Choose a plan")
+    st.caption(
+        "All plans start with a 14-day trial limited to "
+        f"{TRIAL_SESSIONS_CAP} sessions or {TRIAL_PITCHES_CAP} pitches. "
+        "Upgrade anytime — keep your captured data either way. Cancel "
+        "anytime from the Billing tab.")
+    cycle = st.radio("Billing cycle", ["Annual (save ~30%)", "Monthly"],
+                       horizontal=True, key="billing_cycle")
+    is_annual = cycle.startswith("Annual")
+    cols = st.columns(len(SUBSCRIPTION_TIERS))
+    for i, (key, t) in enumerate(SUBSCRIPTION_TIERS.items()):
+        price = t["annual_usd"] if is_annual else t["monthly_usd"]
+        unit = "/yr" if is_annual else "/mo"
+        with cols[i]:
+            st.markdown(
+                f"<div style='background:#1e293b;border:1px solid #334155;"
+                f"border-radius:12px;padding:18px 16px;height:100%;'>"
+                f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+                f"color:#94a3b8;text-transform:uppercase;'>{t['label']}</div>"
+                f"<div style='font-size:30px;font-weight:800;color:#f1f5f9;"
+                f"margin:8px 0 2px 0;'>${price:.0f}<span style='font-size:14px;"
+                f"font-weight:500;color:#94a3b8;'>{unit}</span></div>"
+                f"<div style='font-size:12px;color:#cbd5e1;line-height:1.5;"
+                f"min-height:48px;'>{t['blurb']}</div>"
+                f"<div style='font-size:11px;color:#64748b;margin-top:6px;'>"
+                f"Up to {t['athlete_cap']} athlete"
+                f"{'s' if t['athlete_cap'] > 1 else ''}</div>"
+                f"</div>",
+                unsafe_allow_html=True)
+            if st.button(f"Choose {t['label']}",
+                          key=f"choose_{key}_{cycle}",
+                          use_container_width=True):
+                if stripe_is_configured():
+                    st.session_state["pending_checkout_tier"]  = key
+                    st.session_state["pending_checkout_annual"] = is_annual
+                    st.info("Stripe Checkout integration coming online — "
+                            "you'll be redirected to enter card details.")
+                else:
+                    st.warning(
+                        "Billing isn't fully turned on yet. The price tiers "
+                        "are locked in, but card processing needs the Stripe "
+                        "account to be created and the API keys to be pasted "
+                        "into `.streamlit/secrets.toml`. Once that's done "
+                        "this button completes the subscription.")
+    if st.button("Close", key="close_billing_modal",
+                  use_container_width=True):
+        st.session_state["show_billing_modal"] = False
+        st.rerun()
+
+
+def list_athletes(include_archived: bool = False,
+                    user_scope: str | None = "auto",
+                    ) -> list[dict]:
+    """List athletes filtered to the active user.
+
+    Scoping rules (when user_scope='auto'):
+        - Demo mode on → athletes with created_by='__demo__'.
+        - Coach     → all athletes where org_id = coach's org, OR
+                      athletes the coach created (covers solo coaches with
+                      no org_id set during migration).
+        - Athlete   → only the athlete linked to this user account.
+        - Logged out (tests) → all athletes (no filter).
+
+    user_scope override:
+        - explicit string: return only athletes with that created_by tag
+          (legacy compatibility for the demo-loader / sample seeding).
+        - None: no filter (admin / test usage).
+    """
+    init_db()
+    explicit_created_by = None
+    if user_scope == "auto":
+        if is_demo_mode_active():
+            tier = current_demo_tier() or "individual"
+            spec = DEMO_TIERS.get(tier, DEMO_TIERS["individual"])
+            explicit_created_by = spec["tag"]
+        else:
+            user = current_user_record()
+            if user is None:
+                user_scope = None
+            elif user.get("role") == "admin":
+                # Admin sees everything (no filter)
+                user_scope = None
+            elif user.get("role") == "athlete":
+                # Athletes see exactly their linked athlete
+                with _db_conn() as c:
+                    q = "SELECT * FROM athletes WHERE id = ?"
+                    if not include_archived:
+                        q += " AND archived = 0"
+                    rows = c.execute(
+                        q, (user.get("linked_athlete_id"),)).fetchall()
+                return [dict(r) for r in rows]
+            else:
+                # Coach — scope by org_id (or fall back to created_by)
+                org_id = user.get("org_id")
+                with _db_conn() as c:
+                    q = "SELECT * FROM athletes WHERE 1=1"
+                    params: list = []
+                    if org_id:
+                        q += " AND (org_id = ? OR created_by = ?)"
+                        params.extend([org_id, user.get("username")])
+                    else:
+                        q += " AND created_by = ?"
+                        params.append(user.get("username"))
+                    if not include_archived:
+                        q += " AND archived = 0"
+                    q += " ORDER BY name"
+                    return [dict(r) for r in c.execute(q, params).fetchall()]
+    elif isinstance(user_scope, str):
+        explicit_created_by = user_scope
+
+    with _db_conn() as c:
+        q = "SELECT * FROM athletes WHERE 1=1"
+        params: list = []
+        if explicit_created_by is not None:
+            q += " AND created_by = ?"
+            params.append(explicit_created_by)
         if not include_archived:
-            q += " WHERE archived = 0"
+            q += " AND archived = 0"
         q += " ORDER BY name"
-        return [dict(r) for r in c.execute(q).fetchall()]
+        return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
 # Athlete-level dropdown options. Maps to the "level" field on videos
@@ -5783,16 +6567,404 @@ LEVEL_TO_VIDEO_BUCKET = {
 
 def add_athlete(name: str, hand: str = "Right", sport: str = "Baseball",
                 grad_class: str = "", notes: str = "",
-                level: str = "HS-Varsity") -> int:
+                level: str = "HS-Varsity",
+                created_by: str | None = None,
+                org_id: int | None = "auto",
+                team_id: int | None = None) -> int:
+    """Insert a new athlete. team_id is an optional sub-team within an org."""
     init_db()
     from datetime import datetime as _dt
+    if created_by is None:
+        created_by = current_username() or "__legacy__"
+    if org_id == "auto":
+        org_id = current_org_id()
+    invite_code = _generate_invite_code(6)
     with _db_conn() as c:
         cur = c.execute(
-            "INSERT INTO athletes (name, hand, sport, level, grad_class, notes, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (name, hand, sport, level, grad_class, notes, _dt.utcnow().isoformat()),
+            "INSERT INTO athletes (name, hand, sport, level, grad_class, "
+            "notes, created_at, created_by, org_id, invite_code, team_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, hand, sport, level, grad_class, notes,
+             _dt.utcnow().isoformat(), created_by, org_id, invite_code,
+             team_id),
         )
         return cur.lastrowid
+
+
+def count_active_athletes_for_user() -> int:
+    """How many ACTIVE (non-archived) athletes the current user / org owns.
+    Used to enforce subscription tier athlete_cap."""
+    return len(list_athletes(include_archived=False))
+
+
+def get_athlete_cap_for_user() -> int | None:
+    """Return the athlete_cap of the current user/org's subscription tier,
+    or None if unlimited / no tier (e.g. solo athlete = cap 1)."""
+    kind, rec = get_billing_entity()
+    if rec is None:
+        return None
+    # Solo athletes: capped at 1 (their own profile)
+    if kind == "user":
+        return 1
+    tier_key = rec.get("subscription_tier")
+    if not tier_key:
+        # Free trial defaults to single_team-like cap of 20 so coaches can
+        # actually evaluate the team feel — we don't gate cap during trial.
+        return SUBSCRIPTION_TIERS["single_team"]["athlete_cap"]
+    tier = SUBSCRIPTION_TIERS.get(tier_key, {})
+    return tier.get("athlete_cap")
+
+
+def can_add_athlete() -> tuple:
+    """Returns (allowed, reason_if_not). Coach roles only — athletes
+    cannot add athletes period."""
+    rec = current_user_record() or {}
+    role = rec.get("role")
+    if role == "admin":
+        return True, None
+    if role == "athlete":
+        return False, "Athlete accounts can't add more athletes."
+    cap = get_athlete_cap_for_user()
+    if cap is None:
+        return True, None
+    current = count_active_athletes_for_user()
+    if current >= cap:
+        return False, (
+            f"Roster full ({current}/{cap}). Archive a graduated athlete "
+            f"to free up a slot, or upgrade your plan for a bigger roster.")
+    return True, None
+
+
+# =============================================================================
+# TIERED DEMO MODE
+# =============================================================================
+# Demo athletes get tagged with a per-tier sentinel in created_by so each
+# tier has its own isolated demo set. Landing screen lets the visitor
+# pick "What does this look like for an Individual / Team / Org?" — each
+# picks a different cohort that shows off that tier's actual features.
+#
+# Org demo: 3 teams (Varsity / JV / Freshman) × ~10 athletes each.
+# Team demo: 1 team × 12 athletes.
+# Individual demo: 1 athlete, no team.
+DEMO_TIERS = {
+    "individual": {
+        "label":           "Individual Athlete",
+        "tag":             "__demo_individual__",
+        "blurb":           "What one solo player sees: their own profile, "
+                            "their own data, no team scope.",
+        "athlete_count":   1,
+        "team_specs":      [],   # no teams
+    },
+    "single_team": {
+        "label":           "Single Team",
+        "tag":             "__demo_team__",
+        "blurb":           "What a HS or travel-team coach sees: roster of "
+                            "12, one team grouping, add athletes freely.",
+        "athlete_count":   12,
+        "team_specs":      ["Roster"],
+    },
+    "club": {
+        "label":           "Club (multi-team)",
+        "tag":             "__demo_club__",
+        "blurb":           "What a travel-ball club sees: athletes split "
+                            "across two age groups.",
+        "athlete_count":   24,
+        "team_specs":      ["14U Travel", "16U Travel"],
+    },
+    "large_org": {
+        "label":           "Large Organization",
+        "tag":             "__demo_org__",
+        "blurb":           "What a HS program sees: athletes split across "
+                            "Varsity, JV, and Freshman.",
+        "athlete_count":   33,
+        "team_specs":      ["Varsity", "JV", "Freshman"],
+    },
+}
+
+# Pool of realistic baseball + softball names for seeding
+_DEMO_NAME_POOL = [
+    ("Marcus Williams",  "Right", "Baseball"),
+    ("Sara Johnson",     "Right", "Softball"),
+    ("Tyler Rodriguez",  "Right", "Baseball"),
+    ("Diego Hernandez",  "Left",  "Baseball"),
+    ("Jaden Park",       "Right", "Baseball"),
+    ("Mason Caldwell",   "Right", "Baseball"),
+    ("Alex Nguyen",      "Left",  "Baseball"),
+    ("Brody Martinez",   "Right", "Baseball"),
+    ("Chase Foster",     "Right", "Baseball"),
+    ("Owen Mitchell",    "Right", "Baseball"),
+    ("Logan Pierce",     "Left",  "Baseball"),
+    ("Ethan Reyes",      "Right", "Baseball"),
+    ("Connor O'Brien",   "Right", "Baseball"),
+    ("Dylan Tate",       "Right", "Baseball"),
+    ("Wyatt Hollis",     "Right", "Baseball"),
+    ("Caleb Whitman",    "Left",  "Baseball"),
+    ("Ryan Sokolov",     "Right", "Baseball"),
+    ("Jameson Cole",     "Right", "Baseball"),
+    ("Hayden Brooks",    "Right", "Baseball"),
+    ("Isaiah Bennett",   "Right", "Baseball"),
+    ("Emma Watanabe",    "Right", "Softball"),
+    ("Olivia Reed",      "Right", "Softball"),
+    ("Ava Castro",       "Left",  "Softball"),
+    ("Mia Sullivan",     "Right", "Softball"),
+    ("Sophia Pena",      "Right", "Softball"),
+    ("Lily Carter",      "Right", "Softball"),
+    ("Hannah Diaz",      "Left",  "Softball"),
+    ("Grace Whitfield",  "Right", "Softball"),
+    ("Maya Chen",        "Right", "Softball"),
+    ("Zoe Patterson",    "Right", "Softball"),
+    ("Brianna Lowe",     "Right", "Softball"),
+    ("Riley Holt",       "Right", "Softball"),
+    ("Naomi Sanchez",    "Right", "Softball"),
+]
+
+
+def _seed_demo_tier(tier_key: str):
+    """Create the demo athletes (and teams, if applicable) for one tier.
+    Idempotent — re-running it doesn't duplicate."""
+    spec = DEMO_TIERS.get(tier_key)
+    if spec is None:
+        return
+    tag = spec["tag"]
+    init_db()
+    with _db_conn() as c:
+        existing = c.execute(
+            "SELECT COUNT(*) FROM athletes WHERE created_by = ?",
+            (tag,)).fetchone()[0]
+    if existing >= spec["athlete_count"]:
+        return  # already seeded
+
+    # Demo-tier athletes don't live in any real org. Teams here are virtual
+    # — we encode them via athlete.team_id pointing at virtual team rows
+    # we create now under a synthetic "org_id" derived from negation of
+    # the tier slot (negative IDs won't collide with real orgs).
+    team_ids: dict = {}
+    if spec["team_specs"]:
+        synthetic_org_id = -abs(hash(tag)) % 100000  # stable + unique-ish
+        for team_name in spec["team_specs"]:
+            tid = create_team(synthetic_org_id, f"{team_name} (demo)")
+            team_ids[team_name] = tid
+
+    # Distribute the demo athletes across the team buckets evenly. For
+    # the individual tier, no teams → all athletes get team_id=None.
+    pool = list(_DEMO_NAME_POOL)
+    needed = spec["athlete_count"]
+    while len(pool) < needed:
+        pool += _DEMO_NAME_POOL   # repeat if we ask for more than the pool
+    chosen = pool[:needed]
+    team_names_cycle = spec["team_specs"] or [None]
+    for i, (name, hand, sport) in enumerate(chosen):
+        team_name = team_names_cycle[i % len(team_names_cycle)] if team_names_cycle != [None] else None
+        team_id = team_ids.get(team_name) if team_name else None
+        # Add a (demo) suffix so they're obviously fake
+        add_athlete(f"{name} (demo)", hand=hand, sport=sport,
+                    grad_class=str(2026 + (i % 4)),
+                    level="HS-Varsity",
+                    notes=f"Demo athlete for {spec['label']} tier.",
+                    created_by=tag, org_id=None, team_id=team_id)
+
+
+def get_demo_teams(tier_key: str) -> list[dict]:
+    """Return the demo teams for a given tier (so the landing screen can
+    group athletes by team in the demo view)."""
+    spec = DEMO_TIERS.get(tier_key)
+    if spec is None or not spec["team_specs"]:
+        return []
+    synthetic_org_id = -abs(hash(spec["tag"])) % 100000
+    return list_teams_for_org(synthetic_org_id)
+
+
+def current_demo_tier() -> str | None:
+    """The tier the visitor picked on the landing demo selector."""
+    return st.session_state.get("auth_demo_tier")
+
+
+def seed_demo_athletes_if_empty():
+    """Kept for backwards compat. Seeds the Individual tier as a fallback
+    if no demo data exists at all so the legacy demo path still has
+    something to show."""
+    init_db()
+    with _db_conn() as c:
+        any_demo = c.execute(
+            "SELECT 1 FROM athletes WHERE created_by LIKE '__demo%' LIMIT 1"
+        ).fetchone()
+    if not any_demo:
+        _seed_demo_tier("individual")
+
+
+# =============================================================================
+# TEAMS (sub-groups inside an organization)
+# =============================================================================
+def list_teams_for_org(org_id: int | None) -> list[dict]:
+    if not org_id:
+        return []
+    init_db()
+    with _db_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM teams WHERE org_id = ? ORDER BY name",
+            (org_id,)).fetchall()]
+
+
+def create_team(org_id: int, name: str) -> int:
+    from datetime import datetime as _dt
+    init_db()
+    with _db_conn() as c:
+        cur = c.execute(
+            "INSERT INTO teams (org_id, name, created_at) VALUES (?, ?, ?)",
+            (org_id, (name or "").strip(), _dt.utcnow().isoformat()))
+        return cur.lastrowid
+
+
+def delete_team(team_id: int):
+    """Delete a team. Athletes assigned to it fall back to unassigned
+    (team_id = NULL) — we don't cascade delete athletes."""
+    init_db()
+    with _db_conn() as c:
+        c.execute("UPDATE athletes SET team_id = NULL WHERE team_id = ?",
+                    (team_id,))
+        c.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+
+
+def assign_athlete_to_team(athlete_id: int, team_id: int | None):
+    init_db()
+    with _db_conn() as c:
+        c.execute("UPDATE athletes SET team_id = ? WHERE id = ?",
+                    (team_id, athlete_id))
+
+
+# =============================================================================
+# PROFILE PICTURES
+# =============================================================================
+# Stored as base64 PNG/JPEG bytes in the athletes.profile_pic_b64 column.
+# Keeps the data in SQLite (survives Streamlit Cloud redeploys) and is
+# small enough to be fast — we resize to <= 240×240 before storing.
+def set_athlete_profile_pic(athlete_id: int, raw_bytes: bytes) -> tuple:
+    """Resize raw image bytes to a 240px-max square thumbnail and store
+    base64 on the athlete row. Returns (ok, message)."""
+    try:
+        from PIL import Image
+        import io, base64
+    except Exception as e:
+        return False, f"Image library missing: {e}"
+    try:
+        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        # Center-crop to square, then resize
+        w, h = img.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top  = (h - side) // 2
+        img = img.crop((left, top, left + side, top + side))
+        img = img.resize((240, 240), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        return False, f"Couldn't process image: {e}"
+    init_db()
+    with _db_conn() as c:
+        c.execute("UPDATE athletes SET profile_pic_b64 = ? WHERE id = ?",
+                    (b64, athlete_id))
+    return True, "Profile picture updated."
+
+
+def clear_athlete_profile_pic(athlete_id: int):
+    init_db()
+    with _db_conn() as c:
+        c.execute("UPDATE athletes SET profile_pic_b64 = NULL WHERE id = ?",
+                    (athlete_id,))
+
+
+def athlete_avatar_html(athlete: dict, size_px: int = 64) -> str:
+    """Render the athlete's profile pic OR an initial-circle fallback as
+    inline HTML/CSS. Returns the HTML string."""
+    b64 = athlete.get("profile_pic_b64")
+    if b64:
+        return (
+            f"<div style='width:{size_px}px;height:{size_px}px;border-radius:50%;"
+            f"overflow:hidden;flex-shrink:0;border:2px solid #334155;"
+            f"background:#1e293b;display:inline-flex;align-items:center;"
+            f"justify-content:center;'>"
+            f"<img src='data:image/jpeg;base64,{b64}' "
+            f"style='width:100%;height:100%;object-fit:cover;'/></div>")
+    # Initial-letter fallback in brand blue
+    initial = (athlete.get("name") or "?")[0].upper()
+    return (
+        f"<div style='width:{size_px}px;height:{size_px}px;border-radius:50%;"
+        f"background:linear-gradient(135deg,#1e3a8a,#3b82f6);"
+        f"display:inline-flex;align-items:center;justify-content:center;"
+        f"flex-shrink:0;border:2px solid #334155;color:#f1f5f9;"
+        f"font-size:{int(size_px * 0.42)}px;font-weight:700;'>{initial}</div>")
+
+
+# =============================================================================
+# FORMER-PLAYER CONVERSION
+# =============================================================================
+# When a coach archives an athlete that has a linked player user, the
+# player should be offered the chance to keep their data by converting
+# to a solo Individual account. We surface this on the player's next
+# login if their linked athlete is archived OR their org was deleted.
+def get_user_linked_to_athlete(athlete_id: int) -> dict | None:
+    """Returns the user record (if any) whose linked_athlete_id matches."""
+    init_db()
+    with _db_conn() as c:
+        row = c.execute(
+            "SELECT * FROM users WHERE linked_athlete_id = ? LIMIT 1",
+            (athlete_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def convert_player_to_solo(username: str) -> tuple:
+    """Detach a player account from their org → makes them a solo athlete.
+    The linked athlete record is unarchived, dropped from org_id, and the
+    user becomes the created_by/owner. Returns (ok, message)."""
+    init_db()
+    rec = get_user_record(username)
+    if rec is None:
+        return False, "No such user."
+    if rec.get("role") != "athlete":
+        return False, "Only athlete accounts can convert."
+    ath_id = rec.get("linked_athlete_id")
+    if not ath_id:
+        return False, "No linked athlete to convert."
+    with _db_conn() as c:
+        # Unarchive + detach from org. Mark them as their own owner.
+        c.execute(
+            "UPDATE athletes SET archived = 0, org_id = NULL, "
+            "created_by = ?, team_id = NULL WHERE id = ?",
+            (username, ath_id))
+        # User loses org membership; trial counters reset so they get a
+        # fresh chance to evaluate before subscribing as an individual.
+        c.execute(
+            "UPDATE users SET org_id = NULL, "
+            "subscription_status = 'trial', subscription_tier = NULL, "
+            "trial_sessions_used = 0, trial_pitches_used = 0 "
+            "WHERE username = ?",
+            (username,))
+    return True, ("Account converted to Individual. Your data is intact "
+                   "— upgrade anytime from the sidebar.")
+
+
+def needs_player_conversion_prompt() -> dict | None:
+    """If the current user is a player whose linked athlete is archived
+    (or whose org was deleted), return the athlete record so the caller
+    can show the conversion prompt. Otherwise None."""
+    rec = current_user_record()
+    if rec is None or rec.get("role") != "athlete":
+        return None
+    ath_id = rec.get("linked_athlete_id")
+    if not ath_id:
+        return None
+    init_db()
+    with _db_conn() as c:
+        ath = c.execute(
+            "SELECT * FROM athletes WHERE id = ?", (ath_id,)).fetchone()
+    if ath is None:
+        # Athlete deleted entirely — same prompt makes sense
+        return {"id": ath_id, "name": "(deleted)", "archived": True}
+    ath = dict(ath)
+    if ath.get("archived"):
+        return ath
+    return None
 
 
 def update_athlete(athlete_id: int, **fields):
@@ -9889,6 +11061,226 @@ def _derive_calibration_from_two_points(left_pt: tuple,
     }
 
 
+# =============================================================================
+# AUTO-DETECT PLATE — CV-based zero-click calibration
+# =============================================================================
+# Strategy: home plate is a white pentagon against a darker (usually dirt or
+# matting) background. We threshold the still for "white-ish" pixels in the
+# lower 2/3 of the frame, find contours, and score candidates by:
+#   - Area inside a plausible band (not too small, not too big)
+#   - Aspect ratio between 1.2 and 4.0 (plate is wider than tall when shot
+#     from behind catcher)
+#   - 4-7 polygon vertices (pentagon ± noise)
+#   - Distance from horizontal center (plate is usually framed centrally)
+#
+# Tested mentally against: behind-catcher iPhone video on a real field, indoor
+# turf cage with painted plate, side-view shot. Wins on 1+2, struggles on 3
+# (side-view plate is foreshortened — aspect ratio doesn't fit), which is
+# why the single-tap fallback exists.
+def auto_detect_plate(image_bytes: bytes) -> tuple | None:
+    """Try to find home plate. Returns (cx_px, cy_px, w_px) in the
+    ORIGINAL frame coordinates, or None if no confident candidate."""
+    try:
+        import cv2, numpy as np
+    except Exception:
+        return None
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    # Search lower 2/3 of frame — plate almost never lives in the top third
+    roi_y0 = h // 3
+    roi = img[roi_y0:, :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    # White-ish: low saturation, high value. Loose bounds to catch dirty plates
+    mask = cv2.inRange(hsv, (0, 0, 170), (180, 70, 255))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_score = 0.0
+    frame_area = w * h
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        # Plate occupies between 0.05% and 8% of the frame typically
+        if area < frame_area * 0.0005 or area > frame_area * 0.08:
+            continue
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        if cw < 30 or ch < 12:  # too small even for 720p far-away shot
+            continue
+        aspect = cw / max(1, ch)
+        if aspect < 1.2 or aspect > 4.0:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+        if len(approx) < 4 or len(approx) > 7:
+            continue
+        # Score: weight area, penalize off-center, reward fill ratio
+        fill_ratio = area / max(1, cw * ch)
+        if fill_ratio < 0.55:
+            continue
+        center_x_dist = abs((x + cw / 2) - w / 2) / w   # 0 = perfect center
+        score = area * (1.0 - 0.4 * center_x_dist) * fill_ratio
+        if score > best_score:
+            best_score = score
+            best = (int(x + cw / 2), int(y + ch / 2 + roi_y0), int(cw))
+    return best
+
+
+def _default_plate_width_for_resolution(orig_w: int) -> int:
+    """Sensible default plate-width in pixels for a single-tap fallback.
+    Scales linearly with resolution from the ~110px @ 1920px reference."""
+    return max(40, int(round(110 * (orig_w / 1920))))
+
+
+def render_smart_calibration(video_path: str,
+                                state_prefix: str,
+                                sport: str = "Baseball",
+                                display_width: int = 720) -> dict | None:
+    """Zero-click calibration with single-tap fallback.
+
+    Flow:
+      1. Extract a still from the video.
+      2. Run auto_detect_plate. If a confident match → lock and return.
+      3. Otherwise show the still and ask user to tap the CENTER of the
+         plate. Compute width from video resolution.
+      4. 'Re-try auto-detect' button kicks back to step 2.
+      5. The legacy preset / manual fallback lives in an Advanced expander.
+    """
+    if not _is_click_calibration_available():
+        st.caption(
+            "Calibration needs the `streamlit-image-coordinates` package. "
+            "Re-run `enable_live_capture.command` to install it.")
+        return None
+
+    from streamlit_image_coordinates import streamlit_image_coordinates
+
+    png, orig_w, orig_h = extract_calibration_still(video_path)
+    if png is None:
+        st.error("Couldn't extract a still from the video — file may be corrupted.")
+        return None
+
+    auto_key   = f"{state_prefix}auto_result"
+    manual_key = f"{state_prefix}manual_center"
+    retry_key  = f"{state_prefix}auto_retry"
+
+    # Run auto-detect on first render or after explicit retry
+    if auto_key not in st.session_state or st.session_state.pop(retry_key, False):
+        st.session_state[auto_key] = auto_detect_plate(png)
+
+    auto = st.session_state.get(auto_key)
+    manual_center = st.session_state.get(manual_key)
+
+    if auto:
+        plate_cx, plate_cy, plate_w = auto
+        st.markdown(
+            f"<div style='background:#1e293b;border-left:4px solid #22c55e;"
+            f"border-radius:8px;padding:12px 16px;margin:8px 0 14px 0;'>"
+            f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#22c55e;text-transform:uppercase;margin-bottom:4px;'>"
+            f"Auto-calibrated</div>"
+            f"<div style='color:#cbd5e1;font-size:14px;line-height:1.5;'>"
+            f"Home plate detected at ({plate_cx}, {plate_cy}) px, width "
+            f"{plate_w} px ≈ 17 inches. Tap <b>Process video</b> to start, "
+            f"or use the buttons below if the green outline below doesn't "
+            f"look right.</div></div>",
+            unsafe_allow_html=True)
+        # Draw overlay so the user can visually verify
+        try:
+            import cv2, numpy as np
+            arr = np.frombuffer(png, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            cv2.rectangle(img,
+                            (plate_cx - plate_w // 2, plate_cy - plate_w // 4),
+                            (plate_cx + plate_w // 2, plate_cy + plate_w // 4),
+                            (0, 230, 80), 3)
+            cv2.drawMarker(img, (plate_cx, plate_cy), (0, 230, 80),
+                              markerType=cv2.MARKER_CROSS,
+                              markerSize=20, thickness=2)
+            _ok, png_show = cv2.imencode(".png", img)
+            if _ok:
+                png = png_show.tobytes()
+        except Exception:
+            pass
+        st.image(png, use_container_width=True,
+                  caption="Detected plate (green box) — visually verify before processing.")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Re-try auto-detect", key=f"{state_prefix}retry_btn",
+                          use_container_width=True):
+                st.session_state[retry_key] = True
+                st.session_state.pop(auto_key, None)
+                st.rerun()
+        with b2:
+            if st.button("Looks wrong — let me tap the center",
+                          key=f"{state_prefix}override_btn",
+                          use_container_width=True):
+                st.session_state.pop(auto_key, None)
+                st.session_state["__force_manual_" + state_prefix] = True
+                st.rerun()
+        cal = _derive_calibration_from_two_points(
+            (plate_cx - plate_w // 2, plate_cy),
+            (plate_cx + plate_w // 2, plate_cy),
+            sport=sport)
+        for k, v in cal.items():
+            st.session_state[f"{state_prefix}{k}"] = v
+        return cal
+
+    # --- No auto match → single-tap manual ---
+    st.markdown(
+        f"<div style='background:#1e293b;border-left:4px solid #d4a634;"
+        f"border-radius:8px;padding:12px 16px;margin:8px 0 14px 0;'>"
+        f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+        f"color:#d4a634;text-transform:uppercase;margin-bottom:4px;'>"
+        f"One quick tap</div>"
+        f"<div style='color:#cbd5e1;font-size:14px;line-height:1.5;'>"
+        f"We couldn't auto-detect home plate. <b>Tap the CENTER of the "
+        f"plate</b> in the image below — that's all the app needs. Width is "
+        f"estimated from your video resolution.</div></div>",
+        unsafe_allow_html=True)
+    click = streamlit_image_coordinates(png, width=display_width,
+                                            key=f"{state_prefix}manual_img")
+    if click is not None:
+        scale_x = orig_w / display_width
+        disp_h = int(orig_h * display_width / max(1, orig_w))
+        scale_y = orig_h / max(1, disp_h)
+        st.session_state[manual_key] = (int(click["x"] * scale_x),
+                                          int(click["y"] * scale_y))
+        st.rerun()
+
+    if manual_center:
+        plate_cx, plate_cy = manual_center
+        plate_w = _default_plate_width_for_resolution(orig_w)
+        cal = _derive_calibration_from_two_points(
+            (plate_cx - plate_w // 2, plate_cy),
+            (plate_cx + plate_w // 2, plate_cy),
+            sport=sport)
+        st.markdown(
+            f"<div style='background:#0f172a;border:1px solid #334155;"
+            f"border-radius:10px;padding:14px 18px;margin:12px 0;'>"
+            f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#22c55e;text-transform:uppercase;margin-bottom:8px;'>"
+            f"Calibration ready</div>"
+            f"<div style='font-size:14px;color:#cbd5e1;line-height:1.7;'>"
+            f"Plate center: ({plate_cx}, {plate_cy}) px<br>"
+            f"Estimated width: {plate_w} px (from {orig_w}×{orig_h} video)<br>"
+            f"Ball radius window: {cal['ball_rmin_px']}–{cal['ball_rmax_px']} px"
+            f"</div></div>",
+            unsafe_allow_html=True)
+        for k, v in cal.items():
+            st.session_state[f"{state_prefix}{k}"] = v
+        if st.button("Tap again — that wasn't right",
+                      key=f"{state_prefix}manual_retap",
+                      use_container_width=True):
+            st.session_state.pop(manual_key, None)
+            st.rerun()
+        return cal
+    return None
+
+
 def render_click_calibration(video_path: str,
                                 state_prefix: str,
                                 sport: str = "Baseball",
@@ -10367,14 +11759,14 @@ def _capture_one_camera_for_upload(label: str,
     tmp_path = st.session_state.get(path_session_key, tmp_path)
     st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
 
-    # ===== Step 2 — calibrate =====
+    # ===== Step 2 — calibrate (auto with single-tap fallback) =====
     st.divider()
-    st.markdown("**Step 2 — Calibrate plate** (tap LEFT then RIGHT edge)")
-    cal = render_click_calibration(tmp_path,
+    st.markdown("**Step 2 — Calibrate** (automatic — confirm or one tap if needed)")
+    cal = render_smart_calibration(tmp_path,
                                        state_prefix=f"{key_prefix}cc_",
                                        sport=athlete_sport)
-    with st.expander("Use preset or manual numbers instead",
-                       expanded=(cal is None)):
+    with st.expander("Power-user: preset / manual numbers",
+                       expanded=False):
         st.caption(
             "Falling back here is fine if click-to-calibrate isn't loading. "
             "Pick a preset or type pixel coordinates by hand. Click-derived "
@@ -12093,6 +13485,752 @@ def run_hitting_live_capture(active_athlete_id: int | None,
         st.info("No swings snapped yet. Tap **Snap Swing** right after contact.")
 
 
+# =============================================================================
+# LOGIN + LANDING SCREEN
+# =============================================================================
+# Renders BEFORE the main app body. Gates the rest behind a username/password
+# login, then a landing screen where the user picks (or creates) an athlete
+# before any analytics screens load. Demo athletes are hidden until the user
+# clicks the "Try demo data" button.
+def _render_brand_header():
+    """Centered Diamond Sports Lab logo + name for the login/landing pages."""
+    logo_svg = (
+        "<svg width='64' height='64' viewBox='0 0 40 40' "
+        "xmlns='http://www.w3.org/2000/svg'>"
+        "<path d='M 20 4 L 36 20 L 20 36 L 4 20 Z' "
+        "fill='url(#brandgrad)' stroke='#3b82f6' stroke-width='1.5' />"
+        "<path d='M 20 12 L 28 20 L 20 28 L 12 20 Z' fill='none' "
+        "stroke='#d4a634' stroke-width='1.5' opacity='0.85' />"
+        "<circle cx='20' cy='20' r='2' fill='#d4a634' />"
+        "<defs><linearGradient id='brandgrad' x1='0%' y1='0%' x2='100%' y2='100%'>"
+        "<stop offset='0%' stop-color='#1e3a8a' />"
+        "<stop offset='100%' stop-color='#3b82f6' />"
+        "</linearGradient></defs></svg>"
+    )
+    st.markdown(
+        f"<div style='display:flex;flex-direction:column;align-items:center;"
+        f"padding:18px 0 10px 0;'>"
+        f"{logo_svg}"
+        f"<div style='font-size:26px;font-weight:800;color:#f1f5f9;"
+        f"letter-spacing:-0.01em;margin-top:8px;'>Diamond Sports Lab</div>"
+        f"<div style='font-size:12px;color:#94a3b8;letter-spacing:0.10em;"
+        f"text-transform:uppercase;font-weight:600;margin-top:4px;'>"
+        f"Coach Tools · Pitching + Hitting</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_login_screen() -> bool:
+    """Sign-in tab + Create-account tab.
+
+    Create-account has three sub-flows the user picks first:
+      - Coach (Organization)  → creates an org they admin
+      - Athlete (Solo)        → independent player account, owns their own data
+      - Athlete (Invite Code) → joins a coach's org via per-athlete code
+    """
+    _render_brand_header()
+    st.markdown(
+        "<div style='max-width:520px;margin:14px auto 0 auto;'>"
+        "<div style='color:#94a3b8;font-size:14px;text-align:center;line-height:1.6;'>"
+        "Sign in to your account, or create one if it's your first time. "
+        "Coaches manage an organization. Players can register on their own "
+        "or join a coach's org with an invite code."
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=False):
+        col_pad_l, col_form, col_pad_r = st.columns([1, 3, 1])
+        with col_form:
+            tab_in, tab_new = st.tabs(["Sign in", "Create account"])
+
+            with tab_in:
+                u = st.text_input("Username", key="login_u",
+                                    placeholder="e.g. coach_smith")
+                p = st.text_input("Password", type="password", key="login_p")
+                if st.button("Sign in", type="primary",
+                              use_container_width=True, key="login_btn"):
+                    ok, msg = verify_user(u, p)
+                    if ok:
+                        st.session_state["auth_user"] = msg
+                        st.session_state.pop("login_p", None)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                st.caption(
+                    "Forgot password? Recovery isn't built yet — passwords "
+                    "are stored locally. Create a new account if needed.")
+
+            with tab_new:
+                acct_type = st.radio(
+                    "What kind of account?",
+                    ["Coach (manage an organization)",
+                     "Athlete · I have an invite code from a coach",
+                     "Athlete · Sign up on my own (no coach)"],
+                    key="reg_acct_type",
+                    label_visibility="visible")
+
+                st.markdown("---")
+                nu  = st.text_input("Pick a username", key="reg_u",
+                                       placeholder="3+ chars, letters/numbers/_-")
+                np_ = st.text_input("Pick a password", type="password",
+                                       key="reg_p",
+                                       placeholder="6+ characters")
+                np2 = st.text_input("Confirm password", type="password",
+                                       key="reg_p2")
+
+                if acct_type.startswith("Coach"):
+                    org_name = st.text_input(
+                        "Organization name",
+                        key="reg_org_name",
+                        placeholder="e.g. Riverside HS Baseball")
+                    btn_label = "Create coach account"
+                elif acct_type.startswith("Athlete · I have"):
+                    inv = st.text_input(
+                        "Invite code from your coach",
+                        key="reg_invite_code",
+                        placeholder="6 letters/numbers, e.g. K7M2QX")
+                    btn_label = "Join organization"
+                else:
+                    st.caption(
+                        "We'll create a personal athlete profile owned by "
+                        "you. You can be invited to a coach's organization "
+                        "later if needed.")
+                    rcol1, rcol2 = st.columns(2)
+                    with rcol1:
+                        a_name = st.text_input("Your full name",
+                                                  key="reg_solo_name")
+                        a_hand = st.selectbox("Throwing/Batting hand",
+                                                ["Right", "Left"],
+                                                key="reg_solo_hand")
+                    with rcol2:
+                        a_sport = st.selectbox("Sport",
+                                                  ["Baseball", "Softball"],
+                                                  key="reg_solo_sport")
+                        a_grad = st.text_input("Grad class (optional)",
+                                                  key="reg_solo_grad",
+                                                  placeholder="e.g. 2027")
+                    btn_label = "Create athlete account"
+
+                if st.button(btn_label, type="primary",
+                              use_container_width=True, key="reg_btn"):
+                    if np_ != np2:
+                        st.error("Passwords don't match.")
+                    elif acct_type.startswith("Coach"):
+                        ok, msg = register_coach(nu, np_,
+                                                    st.session_state.get(
+                                                        "reg_org_name", ""))
+                        if ok:
+                            st.session_state["auth_user"] = msg
+                            st.session_state.pop("reg_p", None)
+                            st.session_state.pop("reg_p2", None)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    elif acct_type.startswith("Athlete · I have"):
+                        ok, msg = register_athlete(
+                            nu, np_,
+                            invite_code=st.session_state.get(
+                                "reg_invite_code", ""))
+                        if ok:
+                            _, canonical = verify_user(nu, np_)
+                            st.session_state["auth_user"] = canonical
+                            st.session_state.pop("reg_p", None)
+                            st.session_state.pop("reg_p2", None)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        ok, msg = register_athlete(
+                            nu, np_,
+                            name=st.session_state.get("reg_solo_name", ""),
+                            hand=st.session_state.get("reg_solo_hand", "Right"),
+                            sport=st.session_state.get("reg_solo_sport", "Baseball"),
+                            grad_class=st.session_state.get("reg_solo_grad", ""))
+                        if ok:
+                            _, canonical = verify_user(nu, np_)
+                            st.session_state["auth_user"] = canonical
+                            st.session_state.pop("reg_p", None)
+                            st.session_state.pop("reg_p2", None)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+    return False
+
+
+def _render_landing_screen() -> bool:
+    """Coach landing: pick an athlete from the org roster, add a new one,
+    or browse demo data. Athletes get auto-routed to their own profile
+    before this screen renders (see render_login_or_landing)."""
+    user = current_username() or ""
+    rec  = current_user_record() or {}
+    role = rec.get("role", "coach")
+    org  = get_org_record(rec.get("org_id"))
+    org_name = org.get("name") if org else None
+    _render_brand_header()
+
+    # Welcome banner with logout link
+    head_l, head_r = st.columns([5, 1])
+    with head_l:
+        org_line = (f" · Coach for <b style='color:#f1f5f9;'>{org_name}</b>"
+                    if org_name else "")
+        st.markdown(
+            f"<div style='text-align:left;color:#cbd5e1;font-size:15px;"
+            f"line-height:1.6;margin-top:6px;'>"
+            f"Signed in as <b style='color:#f1f5f9;'>{user}</b>{org_line}. "
+            f"Pick an athlete to open their profile, or create a new one."
+            f"</div>",
+            unsafe_allow_html=True)
+    with head_r:
+        if st.button("Sign out", key="landing_logout",
+                      use_container_width=True):
+            for k in ("auth_user", "auth_demo_mode", "selected_athlete_id"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    # ===== Demo mode picker — Individual / Team / Club / Org =====
+    st.divider()
+    demo_on  = st.session_state.get("auth_demo_mode", False)
+    cur_tier = st.session_state.get("auth_demo_tier", "individual")
+    toggle_l, toggle_r = st.columns([3, 2])
+    with toggle_l:
+        st.markdown(
+            "<div style='color:#f1f5f9;font-size:15px;font-weight:600;"
+            "margin-top:8px;'>Browsing</div>",
+            unsafe_allow_html=True)
+        if demo_on:
+            spec = DEMO_TIERS[cur_tier]
+            st.caption(
+                f"Demo: **{spec['label']}**. {spec['blurb']} "
+                "Toggle off to return to your real athletes.")
+        else:
+            st.caption(
+                "Showing your athletes. Try demo mode to see what each "
+                "tier (Individual / Team / Club / Org) looks like with "
+                "realistic sample rosters.")
+    with toggle_r:
+        new_state = st.toggle(
+            "Demo data on" if demo_on else "Try demo data",
+            value=demo_on, key="landing_demo_toggle")
+        if new_state != demo_on:
+            st.session_state["auth_demo_mode"] = new_state
+            st.rerun()
+
+    if demo_on:
+        tier_pick = st.radio(
+            "Tier to preview",
+            list(DEMO_TIERS.keys()),
+            format_func=lambda k: DEMO_TIERS[k]["label"],
+            index=list(DEMO_TIERS.keys()).index(cur_tier),
+            horizontal=True,
+            key="landing_demo_tier_pick")
+        if tier_pick != cur_tier:
+            st.session_state["auth_demo_tier"] = tier_pick
+            st.rerun()
+        # Seed athletes for the selected tier on demand
+        _seed_demo_tier(tier_pick)
+
+    # Roster
+    seed_demo_athletes_if_empty()
+    roster = list_athletes()   # auto-scopes by user / demo
+    cap_value = get_athlete_cap_for_user()
+    st.divider()
+
+    # ----- Teams (org sub-groups) — coach can create / delete -----
+    # In demo mode, surface the virtual teams that were seeded for the
+    # selected tier so the demo properly shows the team grouping feel.
+    org_id_for_teams = rec.get("org_id")
+    if is_demo_mode_active():
+        teams_list = get_demo_teams(current_demo_tier() or "individual")
+    else:
+        teams_list = list_teams_for_org(org_id_for_teams) if org_id_for_teams else []
+    if org_id_for_teams:
+        with st.expander("Manage teams "
+                          f"({len(teams_list)} team"
+                          f"{'s' if len(teams_list) != 1 else ''})",
+                          expanded=False):
+            st.caption(
+                "Sub-teams keep large rosters organized — Varsity / JV, "
+                "14U / 16U, etc. Athletes can stay unassigned if you don't "
+                "need teams.")
+            new_team = st.text_input("New team name",
+                                       key="land_new_team_name",
+                                       placeholder="e.g. Varsity")
+            if st.button("Add team", key="land_new_team_btn"):
+                if new_team.strip():
+                    create_team(org_id_for_teams, new_team.strip())
+                    st.rerun()
+                else:
+                    st.error("Team name can't be empty.")
+            for t in teams_list:
+                tc_l, tc_r = st.columns([3, 1])
+                with tc_l:
+                    st.markdown(f"**{t['name']}**")
+                with tc_r:
+                    if st.button("Delete", key=f"del_team_{t['id']}"):
+                        delete_team(t["id"])
+                        st.rerun()
+
+    if roster:
+        cap_str = f" / {cap_value}" if cap_value else ""
+        st.markdown(
+            f"<div style='color:#cbd5e1;font-size:13px;letter-spacing:0.08em;"
+            f"font-weight:700;text-transform:uppercase;margin-bottom:10px;'>"
+            f"Your athletes ({len(roster)}{cap_str})</div>",
+            unsafe_allow_html=True)
+
+        # Build team-grouped buckets. Each athlete lands in either a named
+        # team or "Unassigned" so coaches with no teams still see a clean
+        # single bucket.
+        buckets: dict = {}    # team_label → list[athlete]
+        team_lookup = {t["id"]: t["name"] for t in teams_list}
+        for a in roster:
+            label = team_lookup.get(a.get("team_id"), "Unassigned")
+            buckets.setdefault(label, []).append(a)
+        # Sort: named teams first (alpha), Unassigned last
+        bucket_order = sorted([k for k in buckets if k != "Unassigned"])
+        if "Unassigned" in buckets:
+            bucket_order.append("Unassigned")
+
+        for team_label in bucket_order:
+            bucket_athletes = buckets[team_label]
+            st.markdown(
+                f"<div style='margin-top:18px;color:#d4a634;font-size:13px;"
+                f"letter-spacing:0.10em;font-weight:700;text-transform:"
+                f"uppercase;'>{team_label} · {len(bucket_athletes)}</div>",
+                unsafe_allow_html=True)
+            # 3-column grid inside this team bucket
+            for row_start in range(0, len(bucket_athletes), 3):
+                cols = st.columns(3, gap="medium")
+                for i, col in enumerate(cols):
+                    idx = row_start + i
+                    if idx >= len(bucket_athletes):
+                        continue
+                    a = bucket_athletes[idx]
+                    hand_tag = f"{a['hand'][:1]}HP" if a['sport'] == 'Baseball' else f"{a['hand'][:1]}HP"
+                    sport_icon = "Softball" if a['sport'] == 'Softball' else "Baseball"
+                    with col:
+                        invite = a.get("invite_code") or "—"
+                        avatar = athlete_avatar_html(a, size_px=56)
+                        st.markdown(
+                            f"<div style='background:#1e293b;border:1px solid #334155;"
+                            f"border-radius:10px;padding:14px 16px;margin-bottom:8px;'>"
+                            f"<div style='display:flex;gap:12px;align-items:center;'>"
+                            f"{avatar}"
+                            f"<div style='min-width:0;flex:1;'>"
+                            f"<div style='font-size:11px;letter-spacing:0.10em;"
+                            f"color:#94a3b8;text-transform:uppercase;font-weight:600;'>"
+                            f"{sport_icon} · {hand_tag}</div>"
+                            f"<div style='font-size:18px;font-weight:700;"
+                            f"color:#f1f5f9;margin-top:2px;line-height:1.2;'>"
+                            f"{a['name']}</div>"
+                            f"<div style='font-size:12px;color:#94a3b8;margin-top:2px;'>"
+                            f"Class of {a['grad_class'] or '—'} · {a['level']}</div>"
+                            f"</div></div>"
+                            f"<div style='margin-top:10px;padding-top:10px;"
+                            f"border-top:1px dashed #334155;font-size:11px;"
+                            f"color:#94a3b8;letter-spacing:0.10em;font-weight:600;"
+                            f"text-transform:uppercase;'>Athlete invite code</div>"
+                            f"<div style='font-family:JetBrains Mono,Menlo,"
+                            f"monospace;font-size:16px;font-weight:700;"
+                            f"color:#d4a634;letter-spacing:0.15em;margin-top:4px;'>"
+                            f"{invite}</div>"
+                            f"</div>",
+                            unsafe_allow_html=True)
+                        bc1, bc2 = st.columns([2, 1])
+                        with bc1:
+                            if st.button(f"Open profile",
+                                          key=f"open_{a['id']}",
+                                          use_container_width=True):
+                                st.session_state["selected_athlete_id"] = a["id"]
+                                st.rerun()
+                        with bc2:
+                            if st.button("Graduated",
+                                          key=f"grad_{a['id']}",
+                                          use_container_width=True,
+                                          help="Archive this athlete. "
+                                               "History is kept; frees up "
+                                               "a roster slot.",
+                                          disabled=is_demo_mode_active()):
+                                archive_athlete(a["id"], archived=True)
+                                st.success(
+                                    f"{a['name']} archived — roster slot freed.")
+                                st.rerun()
+                        # Inline team reassign + profile pic upload
+                        if teams_list:
+                            team_opts = ["Unassigned"] + [t["name"] for t in teams_list]
+                            curr_team_name = team_lookup.get(a.get("team_id"), "Unassigned")
+                            picked_team = st.selectbox(
+                                "Team", team_opts,
+                                index=team_opts.index(curr_team_name),
+                                key=f"team_pick_{a['id']}",
+                                label_visibility="collapsed")
+                            if picked_team != curr_team_name:
+                                if picked_team == "Unassigned":
+                                    assign_athlete_to_team(a["id"], None)
+                                else:
+                                    new_tid = next(t["id"] for t in teams_list
+                                                     if t["name"] == picked_team)
+                                    assign_athlete_to_team(a["id"], new_tid)
+                                st.rerun()
+                        with st.expander(f"Profile picture", expanded=False):
+                            up = st.file_uploader(
+                                f"Upload for {a['name']}",
+                                type=["png", "jpg", "jpeg", "webp"],
+                                key=f"pic_up_{a['id']}",
+                                label_visibility="collapsed")
+                            if up is not None:
+                                ok, msg = set_athlete_profile_pic(
+                                    a["id"], up.read())
+                                (st.success if ok else st.error)(msg)
+                                if ok:
+                                    st.rerun()
+                            if a.get("profile_pic_b64") and st.button(
+                                    "Clear picture",
+                                    key=f"pic_clear_{a['id']}",
+                                    use_container_width=True):
+                                clear_athlete_profile_pic(a["id"])
+                                st.rerun()
+
+        # Archived view
+        archived_all = list_athletes(include_archived=True)
+        archived_only = [x for x in archived_all if x.get("archived")]
+        if archived_only:
+            with st.expander(
+                    f"Archived athletes ({len(archived_only)})",
+                    expanded=False):
+                st.caption(
+                    "Graduated / inactive players. Their history is still "
+                    "viewable. Unarchive to restore (will count against "
+                    "your roster cap again).")
+                for a in archived_only:
+                    ac_l, ac_m, ac_r = st.columns([2, 1, 1])
+                    with ac_l:
+                        st.markdown(
+                            f"**{a['name']}** · "
+                            f"{a.get('sport', 'Baseball')} · "
+                            f"Class of {a.get('grad_class') or '—'}")
+                    with ac_m:
+                        if st.button("Unarchive",
+                                      key=f"unarch_{a['id']}",
+                                      use_container_width=True):
+                            archive_athlete(a["id"], archived=False)
+                            st.rerun()
+                    with ac_r:
+                        if st.button("View history",
+                                      key=f"open_arch_{a['id']}",
+                                      use_container_width=True):
+                            st.session_state["selected_athlete_id"] = a["id"]
+                            st.rerun()
+    else:
+        st.info(
+            "No athletes yet. Tap **Add new athlete** below to create one, "
+            "or flip the **Try demo data** toggle above to explore with "
+            "sample players.")
+
+    # Create-new section
+    st.divider()
+    demo_tier_now = current_demo_tier() or "individual"
+    allow_add_in_demo = (
+        is_demo_mode_active() and demo_tier_now != "individual")
+    with st.expander("Add new athlete",
+                       expanded=(len(roster) == 0)):
+        if is_demo_mode_active() and not allow_add_in_demo:
+            st.caption(
+                "The Individual demo is a single-athlete preview — switch to "
+                "Single Team / Club / Large Org demo to try adding athletes, "
+                "or turn demo mode off to add to your real roster.")
+        else:
+            with st.form("landing_new_athlete"):
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    nm = st.text_input("Name", key="land_new_name")
+                    hd = st.selectbox("Throwing/Batting hand",
+                                        ["Right", "Left"], key="land_new_hand")
+                    sp = st.selectbox("Sport",
+                                        ["Baseball", "Softball"],
+                                        key="land_new_sport")
+                with fc2:
+                    gc = st.text_input("Grad class (e.g. 2026)",
+                                          key="land_new_grad")
+                    lv = st.selectbox("Level", ATHLETE_LEVELS,
+                                        index=ATHLETE_LEVELS.index("HS-Varsity"),
+                                        key="land_new_level")
+                    if teams_list:
+                        team_choices = ["Unassigned"] + [t["name"] for t in teams_list]
+                        team_pick = st.selectbox(
+                            "Team (optional)", team_choices,
+                            key="land_new_team_pick")
+                    else:
+                        team_pick = "Unassigned"
+                    nt = st.text_area("Notes", key="land_new_notes", height=70)
+                pic = st.file_uploader(
+                    "Profile picture (optional)",
+                    type=["png", "jpg", "jpeg", "webp"],
+                    key="land_new_pic")
+                go = st.form_submit_button("Create athlete", type="primary",
+                                              use_container_width=True)
+                if go:
+                    in_demo = is_demo_mode_active()
+                    if in_demo:
+                        # Skip the roster cap in demo mode — coaches are
+                        # poking around the experience, not paying yet.
+                        allowed, reason = True, None
+                    else:
+                        allowed, reason = can_add_athlete()
+                    if not nm.strip():
+                        st.error("Athlete name is required.")
+                    elif not allowed:
+                        st.error(reason)
+                    else:
+                        team_id_for_new = None
+                        if team_pick != "Unassigned":
+                            team_id_for_new = next(
+                                (t["id"] for t in teams_list
+                                  if t["name"] == team_pick), None)
+                        # Demo additions land in the active demo tier so
+                        # they show up alongside the seeded athletes.
+                        if in_demo:
+                            tier_now = current_demo_tier() or "individual"
+                            created_by_val = DEMO_TIERS[tier_now]["tag"]
+                            org_id_val = None
+                        else:
+                            created_by_val = current_username()
+                            org_id_val = "auto"
+                        new_id = add_athlete(
+                            nm.strip(), hand=hd, sport=sp,
+                            grad_class=gc.strip(), notes=nt.strip(), level=lv,
+                            created_by=created_by_val,
+                            org_id=org_id_val,
+                            team_id=team_id_for_new)
+                        if pic is not None:
+                            set_athlete_profile_pic(new_id, pic.read())
+                        st.session_state["selected_athlete_id"] = new_id
+                        st.success(f"Created {nm.strip()}.")
+                        st.rerun()
+    return False
+
+
+def _render_admin_panel() -> bool:
+    """Admin dashboard — total visibility into the whole platform.
+
+    Three tables:
+      - Orgs (count, subscription tier, status, athlete count)
+      - Users (role, org, subscription, trial usage)
+      - Athletes (name, sport, org, invite code, created_by)
+
+    Click any athlete row to impersonate (drop into their profile).
+    """
+    user = current_username() or ""
+    _render_brand_header()
+    head_l, head_r = st.columns([5, 1])
+    with head_l:
+        st.markdown(
+            f"<div style='color:#cbd5e1;font-size:15px;line-height:1.6;'>"
+            f"<b style='color:#ef4444;'>ADMIN</b> · signed in as "
+            f"<b style='color:#f1f5f9;'>{user}</b>. You can see every "
+            f"org, user, and athlete on the platform.</div>",
+            unsafe_allow_html=True)
+    with head_r:
+        if st.button("Sign out", key="admin_signout",
+                      use_container_width=True):
+            for k in ("auth_user", "auth_demo_mode", "selected_athlete_id",
+                        "admin_impersonating"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    orgs = admin_list_all_orgs()
+    users = admin_list_all_users()
+    athletes = admin_list_all_athletes()
+
+    st.divider()
+    # ----- Summary KPIs -----
+    paying_orgs   = [o for o in orgs if o.get("subscription_status") == "active"]
+    paying_users  = [u for u in users
+                       if u.get("role") == "athlete" and not u.get("org_id")
+                       and u.get("subscription_status") == "active"]
+    mrr = 0.0
+    for o in paying_orgs:
+        tier = SUBSCRIPTION_TIERS.get(o.get("subscription_tier") or "")
+        if tier:
+            mrr += float(tier["monthly_usd"])
+    for u in paying_users:
+        tier = SUBSCRIPTION_TIERS.get(u.get("subscription_tier") or "")
+        if tier:
+            mrr += float(tier["monthly_usd"])
+    kpi_cols = st.columns(4)
+    kpi_cols[0].metric("Organizations", len(orgs))
+    kpi_cols[1].metric("Users", len(users))
+    kpi_cols[2].metric("Athletes", len(athletes))
+    kpi_cols[3].metric("MRR (est.)", f"${mrr:,.0f}")
+
+    st.divider()
+    st.subheader(f"Organizations ({len(orgs)})")
+    if not orgs:
+        st.caption("No orgs yet.")
+    else:
+        import pandas as pd
+        org_rows = []
+        for o in orgs:
+            ath_n = sum(1 for a in athletes if a.get("org_id") == o["id"])
+            org_rows.append({
+                "ID": o["id"], "Name": o["name"],
+                "Owner": o["owner_username"],
+                "Status": o.get("subscription_status", "trial"),
+                "Tier": o.get("subscription_tier") or "—",
+                "Athletes": ath_n,
+                "Invite code": o.get("invite_code") or "—",
+                "Created": (o.get("created_at") or "")[:10],
+            })
+        st.dataframe(pd.DataFrame(org_rows), use_container_width=True,
+                       hide_index=True)
+
+    st.divider()
+    st.subheader(f"Users ({len(users)})")
+    if not users:
+        st.caption("No users yet.")
+    else:
+        import pandas as pd
+        user_rows = []
+        for u in users:
+            user_rows.append({
+                "Username": u["username"],
+                "Role": u.get("role", "coach"),
+                "Org ID": u.get("org_id") or "—",
+                "Status": u.get("subscription_status", "trial"),
+                "Tier": u.get("subscription_tier") or "—",
+                "Trial sess/pitch":
+                    f"{u.get('trial_sessions_used', 0)}/{u.get('trial_pitches_used', 0)}",
+                "Stripe": (u.get("stripe_customer_id") or "—")[:18],
+                "Created": (u.get("created_at") or "")[:10],
+            })
+        st.dataframe(pd.DataFrame(user_rows), use_container_width=True,
+                       hide_index=True)
+
+    st.divider()
+    st.subheader(f"Athletes ({len(athletes)})")
+    if not athletes:
+        st.caption("No athletes yet.")
+    else:
+        # Picker + impersonate button
+        opts = ["Pick to impersonate..."] + [
+            f"#{a['id']} · {a['name']} ({a.get('sport', 'Baseball')}) — org {a.get('org_id') or 'solo'}"
+            for a in athletes]
+        pick = st.selectbox("Open as athlete", opts, key="admin_imp_pick")
+        if pick != opts[0] and st.button("Impersonate selected",
+                                              key="admin_imp_btn",
+                                              type="primary"):
+            idx = opts.index(pick) - 1
+            admin_impersonate_athlete(athletes[idx]["id"])
+            st.rerun()
+        import pandas as pd
+        ath_rows = [{
+            "ID": a["id"], "Name": a["name"],
+            "Sport": a.get("sport", "Baseball"),
+            "Hand": a.get("hand"),
+            "Org ID": a.get("org_id") or "—",
+            "Invite": a.get("invite_code") or "—",
+            "Created by": a.get("created_by"),
+        } for a in athletes]
+        st.dataframe(pd.DataFrame(ath_rows), use_container_width=True,
+                       hide_index=True)
+
+    st.divider()
+    with st.expander("Bootstrap a new admin (requires secret code)",
+                       expanded=False):
+        bu = st.text_input("Username to promote", key="admin_promote_user")
+        bc = st.text_input("Bootstrap code", type="password",
+                              key="admin_promote_code")
+        if st.button("Promote to admin", key="admin_promote_btn"):
+            ok, msg = promote_user_to_admin(bu, bc)
+            (st.success if ok else st.error)(msg)
+    return False
+
+
+def render_login_or_landing() -> bool:
+    """Top-level gate. Returns True ONLY when the user has logged in AND
+    picked an athlete (so main() should proceed to the analytics app).
+    Otherwise it renders login or landing UI itself and returns False."""
+    if not current_username():
+        _render_login_screen()
+        return False
+
+    # Admin role bypasses the regular landing and gets the admin panel.
+    # If they've explicitly opted into impersonating an athlete, fall
+    # through to the main app instead.
+    rec = current_user_record() or {}
+    if rec.get("role") == "admin":
+        if st.session_state.get("admin_impersonating") and \
+           st.session_state.get("selected_athlete_id"):
+            return True
+        _render_admin_panel()
+        return False
+
+    # Player accounts skip the landing — they only see their own athlete
+    if rec.get("role") == "athlete":
+        # Conversion prompt: if their team archived them OR their athlete
+        # is gone, offer to convert to a solo Individual account.
+        archived_ath = needs_player_conversion_prompt()
+        if archived_ath:
+            _render_brand_header()
+            st.markdown(
+                f"<div style='max-width:560px;margin:20px auto 0 auto;"
+                f"background:#1e293b;border:1px solid #334155;border-left:"
+                f"4px solid #d4a634;border-radius:12px;padding:22px 26px;'>"
+                f"<div style='font-size:11px;letter-spacing:0.12em;font-weight:"
+                f"700;color:#d4a634;text-transform:uppercase;margin-bottom:8px;'>"
+                f"Your team archived your profile</div>"
+                f"<div style='color:#f1f5f9;font-size:18px;font-weight:700;"
+                f"margin-bottom:6px;'>{archived_ath['name']}</div>"
+                f"<div style='color:#cbd5e1;font-size:14px;line-height:1.6;'>"
+                f"You can convert to an Individual account to keep all your "
+                f"history (every session, every pitch, every video). You'd "
+                f"own your data outright with no organization attached. The "
+                f"trial counter resets so you have time to evaluate before "
+                f"subscribing.</div></div>",
+                unsafe_allow_html=True)
+            cv_l, cv_r = st.columns(2)
+            with cv_l:
+                if st.button("Convert to Individual account",
+                              type="primary", use_container_width=True,
+                              key="player_convert_btn"):
+                    ok, msg = convert_player_to_solo(current_username())
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+            with cv_r:
+                if st.button("Sign out", use_container_width=True,
+                              key="player_convert_signout"):
+                    for k in ("auth_user", "auth_demo_mode",
+                                "selected_athlete_id"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+            return False
+        linked = rec.get("linked_athlete_id")
+        if linked:
+            st.session_state["selected_athlete_id"] = linked
+            return True
+        # No athlete linked (shouldn't happen after register) — show
+        # an explanatory screen instead of dropping into a coach landing.
+        _render_brand_header()
+        st.error(
+            "Your account isn't linked to an athlete profile yet. Ask your "
+            "coach to share the invite code for your profile and create a "
+            "new account with it.")
+        if st.button("Sign out", key="orphan_signout"):
+            for k in ("auth_user", "auth_demo_mode", "selected_athlete_id"):
+                st.session_state.pop(k, None)
+            st.rerun()
+        return False
+
+    # Coach — if they haven't picked an athlete yet, show landing
+    if not st.session_state.get("selected_athlete_id"):
+        _render_landing_screen()
+        return False
+    return True
+
+
 def main():
     st.set_page_config(
         page_title="Diamond Sports Lab",
@@ -12101,6 +14239,13 @@ def main():
         initial_sidebar_state="expanded",
     )
     _inject_global_styles()
+
+    # ===== LOGIN / LANDING GATE =====
+    # Renders login or landing screen and returns False until the user
+    # has signed in AND picked an athlete. Keeps the analytics screens
+    # from popping up on a random profile.
+    if not render_login_or_landing():
+        return
 
     # ===== iOS Safari rotation lock =====
     # Streamlit's default viewport meta tag lets iOS recompute scale on
@@ -12271,7 +14416,17 @@ def main():
             roster_options.append(DEMO_ATHLETE_BB)
             roster_options.append(DEMO_ATHLETE_SB)
         roster_options += [_athlete_label(a) for a in roster]
-        roster_options.append(ADD_NEW)
+        # Only coaches can add athletes — hide for athlete-role users
+        if (current_user_record() or {}).get("role") != "athlete":
+            roster_options.append(ADD_NEW)
+
+        # If landing screen set a selected_athlete_id, sync the dropdown to it
+        _picked_id = st.session_state.get("selected_athlete_id")
+        if _picked_id:
+            for _a in roster:
+                if _a["id"] == _picked_id:
+                    st.session_state["selected_athlete_label"] = _athlete_label(_a)
+                    break
 
         # Maintain selection across reruns
         if "selected_athlete_label" not in st.session_state:
@@ -12486,6 +14641,74 @@ def main():
             )
             if video_url_input2 and video_url_input2 != st.session_state.get("bullpen_video_url"):
                 st.session_state["bullpen_video_url"] = video_url_input2
+
+        # ===== Account footer (role-aware) =====
+        st.divider()
+        _user_rec = current_user_record() or {}
+        _user_role = _user_rec.get("role", "coach")
+        _org_rec = get_org_record(_user_rec.get("org_id"))
+        _user_label = current_username() or "—"
+        _role_label = ("Coach" if _user_role == "coach"
+                        else "Athlete")
+        _sub = f" · {_org_rec['name']}" if _org_rec else ""
+        st.markdown(
+            f"<div style='font-size:11px;color:#94a3b8;letter-spacing:0.08em;"
+            f"font-weight:600;text-transform:uppercase;margin-bottom:6px;'>"
+            f"{_role_label}{_sub}</div>"
+            f"<div style='font-size:12px;color:#f1f5f9;margin-bottom:8px;'>"
+            f"{_user_label}</div>",
+            unsafe_allow_html=True)
+        if _user_role == "admin":
+            # Admin badge + back-to-admin button
+            st.markdown(
+                "<div style='color:#ef4444;font-size:11px;letter-spacing:0.10em;"
+                "font-weight:700;margin-bottom:6px;'>ADMIN MODE</div>",
+                unsafe_allow_html=True)
+            adm_l, adm_r = st.columns(2)
+            with adm_l:
+                if st.button("Admin panel",
+                              key="sidebar_admin_panel",
+                              use_container_width=True,
+                              help="Back to the org/user overview."):
+                    st.session_state.pop("selected_athlete_id", None)
+                    st.session_state.pop("admin_impersonating", None)
+                    st.rerun()
+            with adm_r:
+                if st.button("Sign out", key="sidebar_signout",
+                              use_container_width=True):
+                    for k in ("auth_user", "auth_demo_mode",
+                                "selected_athlete_id",
+                                "selected_athlete_label",
+                                "admin_impersonating"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+        elif _user_role == "coach":
+            acct_l, acct_r = st.columns(2)
+            with acct_l:
+                if st.button("Switch athlete",
+                              key="sidebar_switch_athlete",
+                              use_container_width=True,
+                              help="Back to the landing screen to pick or "
+                                   "create a different athlete."):
+                    st.session_state.pop("selected_athlete_id", None)
+                    st.rerun()
+            with acct_r:
+                if st.button("Sign out", key="sidebar_signout",
+                              use_container_width=True):
+                    for k in ("auth_user", "auth_demo_mode",
+                                "selected_athlete_id",
+                                "selected_athlete_label"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+        else:
+            # Athlete: sign-out only (no athlete switching)
+            if st.button("Sign out", key="sidebar_signout",
+                          use_container_width=True):
+                for k in ("auth_user", "auth_demo_mode",
+                            "selected_athlete_id",
+                            "selected_athlete_label"):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
     # -------- Mode branch: if Hitting Lab, render swing report and return --------
     if app_mode == "Hitting":
