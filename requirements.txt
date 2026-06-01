@@ -1,32 +1,26 @@
 # Version specs use >= (not ==) so pip can find prebuilt wheels for
-# whichever Python version you're on (3.10, 3.12, 3.13, 3.14, etc.).
-# Pinning with == forces pip to build from source when a wheel doesn't
-# exist for your Python — that's what causes "failed wheel build" errors.
+# whichever Python version you're on. Streamlit Cloud Python version
+# is pinned to 3.12 via runtime.txt so MediaPipe wheels are available.
 
 streamlit>=1.36.0
 pandas>=2.2.0
 plotly>=5.22.0
 kaleido>=0.2.1    # renders Plotly figs as static PNGs (mobile rotation fix)
-pillow>=11.0      # imaging — Python 3.14 wheels start here
+pillow>=11.0
 reportlab>=4.0
 matplotlib>=3.9
 pypdf>=4.0
 
 # =====================================================================
-# Live Capture (Beta) — phone/tablet camera tracking
+# Live Capture + Upload Video — phone/tablet camera tracking
 # =====================================================================
-# These ARE installed on Streamlit Cloud too — they install cleanly via
-# pip wheels (av has prebuilt FFmpeg bindings since v12). Make sure your
-# `packages.txt` includes ffmpeg if you ever see PyAV runtime errors on
-# the deployed version.
+# av needs ffmpeg from packages.txt (already added).
 streamlit-webrtc>=0.47.0
 opencv-python-headless>=4.10.0
 av>=12.0
 numpy>=1.26
 
-# OPTIONAL — pose extraction via MediaPipe.
-# MediaPipe ships wheels for Python 3.9-3.12. Streamlit Cloud defaults to
-# 3.13/3.14 which doesn't have MediaPipe wheels yet, so it's commented
-# out for cloud deploy. Locally on Python 3.12 you can uncomment to
-# enable skeleton overlay + biomech from pose.
-# mediapipe>=0.10.14
+# Pose extraction via MediaPipe — drives skeleton overlay + biomech in
+# Live Capture and Upload Video. Wheels available for Python 3.9-3.12, so
+# Streamlit Cloud must run 3.12 (pinned in runtime.txt).
+mediapipe>=0.10.14
