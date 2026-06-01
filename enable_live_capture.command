@@ -42,12 +42,13 @@ echo ""
 "$PY" -m pip install --upgrade pip --user
 echo ""
 
-# Install the four Live Capture packages
+# Install the Live Capture + Upload Video packages
 "$PY" -m pip install --upgrade --user \
     streamlit-webrtc \
     opencv-python-headless \
     av \
-    numpy
+    numpy \
+    streamlit-image-coordinates
 
 INSTALL_RESULT=$?
 echo ""

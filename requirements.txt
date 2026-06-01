@@ -19,6 +19,7 @@ streamlit-webrtc>=0.47.0
 opencv-python-headless>=4.10.0
 av>=12.0
 numpy>=1.26
+streamlit-image-coordinates>=0.1.6   # click-to-calibrate plate
 
 # Pose extraction via MediaPipe — drives skeleton overlay + biomech in
 # Live Capture and Upload Video. Wheels available for Python 3.9-3.12, so

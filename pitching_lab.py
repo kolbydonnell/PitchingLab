@@ -9798,6 +9798,220 @@ def render_calibration_with_presets(state_prefix: str,
     }
 
 
+# =============================================================================
+# CLICK-TO-CALIBRATE — point at the plate in a still frame
+# =============================================================================
+# A coach drops a bullpen video in. We grab a clean still, show it big, and
+# ask them to tap the LEFT edge of home plate, then the RIGHT edge. From
+# those two points we derive everything:
+#   - plate_cx, plate_cy = midpoint of the two clicks
+#   - plate_w = pixel distance between the two clicks
+#   - ball radius = (plate_w_px / 17 in) * 2.9 in / 2 in pixels (regulation
+#     plate width 17 in, regulation baseball diameter ~2.9 in)
+#   - rmin / rmax = ball_radius * 0.6 / 1.6 to stay tolerant
+#
+# No pixel-typing, no preset lookup. Falls back to the preset picker
+# gracefully if the streamlit-image-coordinates package isn't installed.
+
+# Regulation reference (inches)
+_PLATE_WIDTH_IN_BASEBALL  = 17.0
+_BALL_DIAMETER_IN_BASE    = 2.9     # baseball
+_BALL_DIAMETER_IN_SOFTBALL = 3.8    # softball (~3.8 in for 12-in circumference)
+
+
+def _is_click_calibration_available() -> bool:
+    try:
+        import streamlit_image_coordinates  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def extract_calibration_still(video_path: str,
+                                target_time_sec: float = 1.0):
+    """Pull a single decent frame from a video for calibration purposes.
+
+    Picks ~1 second in so the pitcher's hand isn't obscuring the plate on
+    frame 0. Returns (png_bytes, orig_width, orig_height) or (None,0,0).
+    """
+    try:
+        import cv2
+    except Exception:
+        return None, 0, 0
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None, 0, 0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    target_frame = min(max(int(target_time_sec * fps), 0),
+                        max(total - 1, 0))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+    ok, frame = cap.read()
+    if not ok:
+        # Retry frame 0 — some codecs reject seeking
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, frame = cap.read()
+        if not ok:
+            cap.release()
+            return None, 0, 0
+    h, w = frame.shape[:2]
+    cap.release()
+    ok2, png = cv2.imencode(".png", frame)
+    if not ok2:
+        return None, 0, 0
+    return png.tobytes(), w, h
+
+
+def _derive_calibration_from_two_points(left_pt: tuple,
+                                           right_pt: tuple,
+                                           sport: str = "Baseball") -> dict:
+    """From the LEFT-edge + RIGHT-edge clicks on the plate, build the
+    full calibration dict the rest of the pipeline expects."""
+    lx, ly = left_pt
+    rx, ry = right_pt
+    plate_w = max(10, int(abs(rx - lx)))
+    plate_cx = int((lx + rx) / 2)
+    plate_cy = int((ly + ry) / 2)
+    # Ball radius in pixels from regulation geometry
+    ball_d_in = (_BALL_DIAMETER_IN_SOFTBALL
+                  if sport.lower().startswith("s")
+                  else _BALL_DIAMETER_IN_BASE)
+    px_per_in = plate_w / _PLATE_WIDTH_IN_BASEBALL
+    ball_r_px = max(3.0, (ball_d_in * px_per_in) / 2.0)
+    rmin = max(2, int(round(ball_r_px * 0.6)))
+    rmax = max(rmin + 2, int(round(ball_r_px * 1.6)))
+    return {
+        "plate_cx_px":  plate_cx,
+        "plate_cy_px":  plate_cy,
+        "plate_w_px":   plate_w,
+        "ball_rmin_px": rmin,
+        "ball_rmax_px": rmax,
+    }
+
+
+def render_click_calibration(video_path: str,
+                                state_prefix: str,
+                                sport: str = "Baseball",
+                                display_width: int = 720) -> dict | None:
+    """Show a still from the video. User clicks LEFT then RIGHT plate edge.
+    Returns the calibration dict, or None if not yet calibrated.
+
+    State machine (per state_prefix in session_state):
+        step           — "left" | "right" | "done"
+        left_orig_pt   — (x,y) in ORIGINAL pixel coords
+        right_orig_pt  — (x,y) in ORIGINAL pixel coords
+    """
+    if not _is_click_calibration_available():
+        st.caption(
+            "Click-to-calibrate needs the `streamlit-image-coordinates` "
+            "package (already in requirements.txt — make sure your "
+            "Streamlit Cloud build is up to date)."
+        )
+        return None
+
+    from streamlit_image_coordinates import streamlit_image_coordinates
+
+    png, orig_w, orig_h = extract_calibration_still(video_path)
+    if png is None:
+        st.error("Couldn't extract a still from the video — file may be corrupted.")
+        return None
+
+    step_key  = f"{state_prefix}cc_step"
+    left_key  = f"{state_prefix}cc_left"
+    right_key = f"{state_prefix}cc_right"
+    if step_key not in st.session_state:
+        st.session_state[step_key] = "left"
+    step = st.session_state[step_key]
+
+    # Header + instructions
+    instr_color = "#22c55e" if step != "done" else "#94a3b8"
+    if step == "left":
+        instr = ("Step 1 of 2 — <b>tap the LEFT edge of home plate</b> in "
+                 "the image below. The frame is from about one second into "
+                 "your video.")
+    elif step == "right":
+        instr = ("Step 2 of 2 — <b>tap the RIGHT edge of home plate</b>. "
+                 "Try to match the same height (Y) as the left click.")
+    else:
+        instr = ("Calibrated. Tap <b>Start over</b> to re-click if the "
+                 "preview crosshair below doesn't look right.")
+    st.markdown(
+        f"<div style='background:#1e293b;border-left:4px solid {instr_color};"
+        f"border-radius:8px;padding:12px 16px;margin:8px 0 14px 0;'>"
+        f"<div style='color:#f1f5f9;font-size:14px;line-height:1.5;'>"
+        f"{instr}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # Render the still and capture the click
+    click = streamlit_image_coordinates(
+        png,
+        width=display_width,
+        key=f"{state_prefix}cc_img",
+    )
+
+    # Coordinate scaling: streamlit_image_coordinates returns coords in
+    # the DISPLAYED image space. Multiply by orig/displayed ratio to get
+    # the actual pixel of the source video.
+    if click is not None:
+        scale_x = orig_w / display_width
+        # The component preserves aspect ratio, so disp_h = orig_h/orig_w * disp_w
+        disp_h = int(orig_h * display_width / max(1, orig_w))
+        scale_y = orig_h / max(1, disp_h)
+        click_orig = (int(click["x"] * scale_x), int(click["y"] * scale_y))
+
+        if step == "left":
+            st.session_state[left_key] = click_orig
+            st.session_state[step_key] = "right"
+            st.rerun()
+        elif step == "right":
+            st.session_state[right_key] = click_orig
+            st.session_state[step_key] = "done"
+            st.rerun()
+
+    # Show current calibration + reset button if we have both points
+    left_pt  = st.session_state.get(left_key)
+    right_pt = st.session_state.get(right_key)
+    btn_l, btn_r = st.columns([1, 1])
+    with btn_l:
+        if st.button("Start over", key=f"{state_prefix}cc_reset",
+                      use_container_width=True):
+            for k in (step_key, left_key, right_key):
+                st.session_state.pop(k, None)
+            st.rerun()
+    with btn_r:
+        if left_pt and right_pt and st.button(
+                "Re-click right edge only",
+                key=f"{state_prefix}cc_reset_right",
+                use_container_width=True):
+            st.session_state.pop(right_key, None)
+            st.session_state[step_key] = "right"
+            st.rerun()
+
+    if not (left_pt and right_pt):
+        return None
+
+    cal = _derive_calibration_from_two_points(left_pt, right_pt, sport=sport)
+    # Persist for downstream
+    for k, v in cal.items():
+        st.session_state[f"{state_prefix}{k}"] = v
+    # Show what was computed
+    st.markdown(
+        f"<div style='background:#0f172a;border:1px solid #334155;"
+        f"border-radius:10px;padding:14px 18px;margin:12px 0;'>"
+        f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+        f"color:#22c55e;text-transform:uppercase;margin-bottom:8px;'>"
+        f"Calibration ready</div>"
+        f"<div style='font-size:14px;color:#cbd5e1;line-height:1.7;'>"
+        f"Plate center: ({cal['plate_cx_px']}, {cal['plate_cy_px']}) px<br>"
+        f"Plate width: {cal['plate_w_px']} px ≈ 17 inches<br>"
+        f"Expected ball radius: {cal['ball_rmin_px']}–{cal['ball_rmax_px']} px"
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+    return cal
+
+
 def process_uploaded_video(video_path: str,
                              calibration: dict,
                              sport: str = "Baseball",
@@ -10117,13 +10331,15 @@ def _run_upload_video_mode(active_athlete_id: int | None,
             "on the open side — same setup as Live mode.<br>"
             "2. Later, when you have good Wi-Fi, AirDrop the video file to your "
             "laptop (or open this app on the device that has the video).<br>"
-            "3. Calibrate the plate position below (you can pause the video "
-            "in any player to read the pixel coordinates, or eyeball it).<br>"
-            "4. Upload the video file. The app will scan every frame, detect "
-            "the ball, segment the recording into individual pitches, and "
-            "(if MediaPipe is installed) extract a skeleton + biomech reading "
-            "from each pitch's release frame.<br>"
-            "5. Review the detected pitches — open the <b>Mechanics</b> "
+            "3. Upload the video file in the app.<br>"
+            "4. Calibrate by tapping the LEFT then RIGHT edge of home plate "
+            "on the still that pops up. The app does the pixel math from "
+            "there — no manual numbers needed.<br>"
+            "5. Tap <b>Process</b>. The app scans every frame, detects the "
+            "ball, segments the recording into individual pitches, and "
+            "(if MediaPipe is installed) extracts a skeleton + biomech "
+            "reading from each pitch's release frame.<br>"
+            "6. Review the detected pitches — open the <b>Mechanics</b> "
             "expander on any pitch to see the skeleton overlay and pose "
             "metrics — then tap <b>Save to History</b> to add them to the "
             "athlete's record."
@@ -10132,17 +10348,8 @@ def _run_upload_video_mode(active_athlete_id: int | None,
         unsafe_allow_html=True,
     )
 
-    # ===== Calibration — preset-driven =====
-    st.markdown("**Step 1 — Calibration** (pick the closest match to your setup)")
-    cal = render_calibration_with_presets(state_prefix="upload_")
-    plate_cx = cal["plate_cx_px"]
-    plate_cy = cal["plate_cy_px"]
-    plate_w  = cal["plate_w_px"]
-    ball_min = cal["ball_rmin_px"]
-    ball_max = cal["ball_rmax_px"]
-
-    st.divider()
-    st.markdown("**Step 2 — Upload the video file**")
+    # ===== Step 1 — upload the file first =====
+    st.markdown("**Step 1 — Upload the video file**")
     uploaded = st.file_uploader(
         "Drop a .mp4 / .mov / .m4v file here",
         type=["mp4", "mov", "m4v", "avi"],
@@ -10168,6 +10375,36 @@ def _run_upload_video_mode(active_athlete_id: int | None,
     with open(tmp_path, "wb") as f:
         f.write(uploaded.read())
     st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
+
+    # ===== Step 2 — click-to-calibrate on a still from the video =====
+    st.divider()
+    st.markdown("**Step 2 — Calibrate the plate** (click two points)")
+    cal = render_click_calibration(
+        tmp_path,
+        state_prefix="upload_cc_",
+        sport=athlete_sport,
+    )
+
+    # Fallback (or refinement): expandable manual / preset picker
+    with st.expander("Use preset or manual numbers instead",
+                       expanded=(cal is None)):
+        st.caption(
+            "Falling back here is fine if click-to-calibrate isn't loading "
+            "on your device (some older mobile browsers). Pick a preset or "
+            "type pixel coordinates by hand. Click-derived values above take "
+            "precedence if both are set."
+        )
+        fallback_cal = render_calibration_with_presets(state_prefix="upload_")
+
+    cal = cal or fallback_cal
+    if cal is None:
+        st.info("Calibrate the plate before processing.")
+        return
+    plate_cx = cal["plate_cx_px"]
+    plate_cy = cal["plate_cy_px"]
+    plate_w  = cal["plate_w_px"]
+    ball_min = cal["ball_rmin_px"]
+    ball_max = cal["ball_rmax_px"]
 
     # Process the video — show progress
     if st.button("Process video", type="primary", use_container_width=True,
