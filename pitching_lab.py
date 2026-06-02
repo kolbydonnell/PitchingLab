@@ -9336,19 +9336,21 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         ))
 
     # Layout: dark navy-ish background so the green field stands out.
-    # X range goes only slightly past the foul poles (no more dead deep-
-    # corner space). Y range only slightly past CF wall. Combined with
-    # scaleanchor, the field fills most of the chart on phone without
-    # distorting any of the geometric shapes — exactly the "bigger but
-    # not warped" sweet spot.
-    plot_range_x = fd["of_wall_lf_rf"] * 1.06   # just past LF/RF foul pole
-    plot_range_y = fd["of_wall_cf"] * 1.06      # just past CF wall
+    # NO scaleanchor — at the canvas aspect we render (900×620 ≈ 1.45:1)
+    # vs the actual field data aspect (about 1.48:1 wide), the difference
+    # is under 2%, well below what the eye notices. Removing scaleanchor
+    # lets the field FILL the chart with zero empty padding instead of
+    # being marooned in a sea of navy. fixedrange + autorange=False so
+    # Plotly can't quietly re-expand the ranges.
+    plot_range_x = fd["of_wall_lf_rf"] * 1.08   # just past LF/RF foul pole
+    plot_range_y = fd["of_wall_cf"] * 1.08      # just past CF wall
     fig.update_layout(
         xaxis=dict(title="", range=[-plot_range_x, plot_range_x],
-                    showgrid=False, zeroline=False, visible=False),
+                    showgrid=False, zeroline=False, visible=False,
+                    fixedrange=True, autorange=False),
         yaxis=dict(title="", range=[-30, plot_range_y + 20],
-                    scaleanchor="x", scaleratio=1,
-                    showgrid=False, zeroline=False, visible=False),
+                    showgrid=False, zeroline=False, visible=False,
+                    fixedrange=True, autorange=False),
         plot_bgcolor="#0f172a",  # dark blue-gray "stadium" background
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
