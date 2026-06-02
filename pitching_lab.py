@@ -14884,6 +14884,72 @@ def main():
     if not render_login_or_landing():
         return
 
+    # ===== Chart-sizing diagnostic overlay =====
+    # Shown whenever sidebar 'Diagnose chart sizes' is clicked. Renders a
+    # live-updating box at the top of every screen with viewport + chart
+    # widths so the user can rotate the phone and screenshot the result.
+    if st.session_state.get("show_chart_diag"):
+        st.markdown("""
+        <div id="chart-diag-box"
+             style="position:sticky;top:0;z-index:9999;
+                    background:#0f172a;color:#22c55e;
+                    border:2px solid #22c55e;border-radius:8px;
+                    padding:12px 14px;margin:8px 0 14px 0;
+                    font-family:JetBrains Mono,Menlo,monospace;
+                    font-size:12px;line-height:1.5;
+                    white-space:pre-wrap;word-break:break-all;">
+        Diagnostic loading...
+        </div>
+        <script>
+        (function(){
+            function snapshot() {
+                const box = document.getElementById('chart-diag-box');
+                if (!box) return;
+                const lines = [];
+                lines.push('VIEWPORT: ' + window.innerWidth + ' x ' + window.innerHeight);
+                lines.push('DEVICE PIXEL RATIO: ' + window.devicePixelRatio);
+                if (window.visualViewport) {
+                    lines.push('VISUAL VIEWPORT: ' + Math.round(window.visualViewport.width) + ' x ' + Math.round(window.visualViewport.height));
+                }
+                const img = document.querySelector('.stImage img, [data-testid="stImage"] img');
+                if (!img) {
+                    lines.push('NO CHART IMAGE ON THIS PAGE');
+                    lines.push('Open a page with a chart (Overview tab on any athlete).');
+                } else {
+                    lines.push('IMG NATURAL: ' + img.naturalWidth + ' x ' + img.naturalHeight);
+                    lines.push('IMG DISPLAYED: ' + img.offsetWidth + ' x ' + img.offsetHeight);
+                    lines.push('IMG INLINE STYLE: ' + (img.getAttribute('style') || '(none)').slice(0,120));
+                    lines.push('IMG COMPUTED w: ' + getComputedStyle(img).width);
+                    lines.push('--- PARENT CHAIN ---');
+                    let el = img.parentElement;
+                    let depth = 0;
+                    while (el && el !== document.body && depth < 10) {
+                        const cls = el.className ? '.' + String(el.className).split(/\\s+/).filter(Boolean).slice(0,2).join('.') : '';
+                        const tid = el.getAttribute && el.getAttribute('data-testid');
+                        const tidStr = tid ? '[' + tid + ']' : '';
+                        lines.push(depth + ': ' + el.tagName + cls + tidStr + ' w=' + el.offsetWidth);
+                        el = el.parentElement;
+                        depth++;
+                    }
+                }
+                box.textContent = lines.join('\\n');
+            }
+            snapshot();
+            // Refresh on rotation, resize, and every second so the box
+            // always reflects current state.
+            window.addEventListener('orientationchange', () =>
+                setTimeout(snapshot, 350));
+            window.addEventListener('resize', snapshot);
+            setInterval(snapshot, 1000);
+        })();
+        </script>
+        """, unsafe_allow_html=True)
+        # Also offer an obvious dismiss button right below the box
+        if st.button("Hide diagnostic", key="hide_chart_diag",
+                      use_container_width=True):
+            st.session_state.pop("show_chart_diag", None)
+            st.rerun()
+
     # ===== iOS Safari rotation lock =====
     # Streamlit's default viewport meta tag lets iOS recompute scale on
     # every rotation, which compounds and shrinks the layout each time.
@@ -15467,6 +15533,18 @@ def main():
                       use_container_width=True,
                       help="See subscription tiers and manage your plan."):
             st.session_state["show_plans_page"] = True
+            st.rerun()
+
+        # ===== TEMP: chart-sizing diagnostic =====
+        # Renders viewport + image + parent-chain widths into a visible
+        # box on-screen so users without a USB cable can debug the iOS
+        # rotation shrinkage by screenshotting. Remove once the rotation
+        # bug is resolved.
+        if st.button("Diagnose chart sizes", key="sidebar_chart_diag_btn",
+                      use_container_width=True,
+                      help="Show viewport and chart widths on-screen so "
+                           "we can debug the iPhone rotation bug."):
+            st.session_state["show_chart_diag"] = True
             st.rerun()
 
         # ===== Account footer (role-aware) =====
