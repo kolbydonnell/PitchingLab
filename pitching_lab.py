@@ -8327,6 +8327,37 @@ button, input, select, textarea {
     width: 100% !important;
 }
 
+/* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
+   Disable pointer-events on chart images and Plotly chart bodies so
+   mouse-wheel events fall through them onto the page scroller.
+   Streamlit's image wrapper otherwise traps the wheel for things like
+   image zoom controls that we don't actually use.
+   The streamlit-image-coordinates IFRAME is the one chart-like element
+   that DOES need pointer-events (click calibration), so we re-enable
+   it explicitly below.                                                  */
+.stImage img,
+[data-testid="stImage"] img,
+.stPlotlyChart .js-plotly-plot,
+.stPlotlyChart .plot-container,
+.stPlotlyChart .svg-container,
+.stPlotlyChart .main-svg {
+    pointer-events: none !important;
+}
+/* Click-to-calibrate component lives in an iframe and DOES need
+   pointer events for its tap targets. */
+iframe[title*="streamlit_image_coordinates"],
+iframe[title*="image_coordinates"] {
+    pointer-events: auto !important;
+}
+
+/* Make absolutely sure the page itself can scroll (some Streamlit
+   versions add overflow:hidden to html, which combined with charts
+   filling the viewport can lock scroll entirely). */
+html, body {
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+}
+
 /* Plotly chart containers (the few that remain) — same approach */
 .stPlotlyChart {
     min-height: 500px !important;
