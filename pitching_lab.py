@@ -8307,24 +8307,49 @@ button, input, select, textarea {
    means dimensions reset to the new viewport on every rotation — no
    compounding feedback loop. */
 
-/* Lock the page's main block to the viewport width, not the parent. */
-.stApp, .main, .block-container {
+/* ===== iOS rotation lock — pin EVERY Streamlit wrapper to the
+   viewport width =====
+   The classic iOS Safari rotation bug: each portrait↔landscape flip
+   recalculates layout and every intermediate Streamlit wrapper
+   (stAppViewContainer → stVerticalBlock → stElementContainer → stImage)
+   bakes in a slightly smaller width than the last. The chart image
+   faithfully follows whatever its parent is, so it shrinks too.
+   The fix: force every wrapper to be EXACTLY 100vw and
+   `box-sizing: border-box` so internal padding can't push it narrower.
+   ============================================================== */
+.stApp, .main, section.main, div.main, .block-container,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stMainBlockContainer"],
+[data-testid="stVerticalBlock"],
+[data-testid="stHorizontalBlock"],
+[data-testid="stElementContainer"],
+[data-testid="stImage"],
+[data-testid="column"] {
     max-width: 100vw !important;
+    box-sizing: border-box !important;
+    overflow-x: hidden;
+}
+.stApp, .main, section.main, .block-container {
     width: 100vw !important;
-    overflow-x: hidden !important;
 }
 
-/* Static chart images — lock to viewport-relative width so they reset
-   on every rotation instead of compounding. */
+/* Static chart images — pin DIRECTLY to viewport width so the value
+   doesn't depend on any parent wrapper. After rotation iOS forces a
+   reflow, but `100vw` re-evaluates to the new viewport on every paint,
+   so the image always equals the current viewport width — no
+   compounding shrinkage. */
 .stImage img, [data-testid="stImage"] img {
-    width: 100% !important;
-    min-width: min(95vw, 100%) !important;
+    width: 100vw !important;
+    min-width: 100vw !important;
     max-width: 100vw !important;
     height: auto !important;
     display: block !important;
+    margin-left: 0 !important;
 }
 .stImage, [data-testid="stImage"] {
-    width: 100% !important;
+    width: 100vw !important;
+    margin-left: 0 !important;
 }
 
 /* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
@@ -14898,11 +14923,41 @@ def main():
                     });
                 } catch(e) {}
             }
+            // Force every chart image to the CURRENT viewport width.
+            // Belt-and-suspenders for the iOS rotation shrinkage bug —
+            // even if the CSS 100vw rules don't reapply correctly, this
+            // hard-sets the inline style on every <img> that sits inside
+            // a Streamlit image container.
+            function pinChartImagesToViewport() {
+                const w = window.innerWidth;
+                document.querySelectorAll(
+                    '.stImage img, [data-testid="stImage"] img'
+                ).forEach(img => {
+                    img.style.setProperty('width', w + 'px', 'important');
+                    img.style.setProperty('min-width', w + 'px', 'important');
+                    img.style.setProperty('max-width', w + 'px', 'important');
+                    img.style.setProperty('height', 'auto', 'important');
+                });
+            }
+            // Initial pin + after every load tick
+            window.addEventListener('load', pinChartImagesToViewport);
+            // Run again right after every rotate so new viewport wins
             window.addEventListener('orientationchange', () => {
                 lockViewport();
-                setTimeout(() => { lockViewport(); snapPlotly(); }, 300);
-                setTimeout(() => { lockViewport(); snapPlotly(); }, 700);
+                setTimeout(() => {
+                    lockViewport();
+                    snapPlotly();
+                    pinChartImagesToViewport();
+                }, 300);
+                setTimeout(() => {
+                    lockViewport();
+                    snapPlotly();
+                    pinChartImagesToViewport();
+                }, 700);
             });
+            window.addEventListener('resize', pinChartImagesToViewport);
+            // Catch any lazily-rendered charts after Streamlit reruns
+            setInterval(pinChartImagesToViewport, 1500);
         })();
         </script>
 
