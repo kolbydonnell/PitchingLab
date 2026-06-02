@@ -7306,7 +7306,7 @@ def _render_pitch_detail_panel(pitch: pd.Series, athlete_name: str = "",
         unsafe_allow_html=True,
     )
     if pitch.get("Outlier_Reasons"):
-        st.caption(f"📍 **Why flagged:** {pitch['Outlier_Reasons']}")
+        st.caption(f"**Why flagged:** {pitch['Outlier_Reasons']}")
 
     # Key metrics in a clean 4-column grid
     c1, c2, c3, c4 = st.columns(4)
@@ -7339,7 +7339,7 @@ def _render_pitch_detail_panel(pitch: pd.Series, athlete_name: str = "",
     video_data = st.session_state.get("bullpen_video")
     video_url  = st.session_state.get("bullpen_video_url")
     if video_data is not None or video_url:
-        st.markdown("**🎥 Video — bullpen (use video controls to scrub + slow-motion)**")
+        st.markdown("**Video — bullpen (use video controls to scrub + slow-motion)**")
         if video_data is not None:
             st.video(video_data)
         else:
@@ -9637,7 +9637,7 @@ def _render_swing_detail_panel(swing: pd.Series, sport: str = "Baseball"):
         "weak_contact":  "⚠️ **Weak contact.** Likely a routine out. Look at the bat path and "
                           "timing in the mechanics tab.",
         "foul":          "🟡 **Foul ball.** Late or out in front — adjust timing or aim.",
-        "whiff":         "❌ **Swing and miss.** Look for the chase pattern — was this in the zone "
+        "whiff":         "**Swing and miss.** Look for the chase pattern — was this in the zone "
                           "or did you go after a ball?",
     }
     st.markdown("")  # spacing
@@ -9650,30 +9650,46 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
     """Render the Hitting Lab view. v1 = Overview tab with KPIs, charts,
     swing list. Mechanics + drills + PDF come in subsequent phases.
     """
-    # ===== Welcome / empty state when no data =====
-    if not demo_mode:
+    # ===== Source the swing data =====
+    # Priority: (1) demo mode → generate fake. (2) saved hitting history
+    # for this athlete → load most recent session. (3) empty state with
+    # CTAs to capture or turn on Sample Session.
+    df = None
+    if demo_mode:
+        with st.spinner(f"Generating swing session for {athlete_name}..."):
+            df = generate_hitting_session(athlete_name, hand=athlete_hand,
+                                             sport=athlete_sport)
+    elif active_athlete_id is not None:
+        try:
+            recent = list_sessions(active_athlete_id,
+                                       session_kind="hitting", limit=1)
+            if recent:
+                df = load_session_df(recent[0]["id"])
+        except Exception:
+            df = None
+
+    if df is None or len(df) == 0:
         _branded_header_hitting(athlete_name, athlete_hand, athlete_class,
                                   demo_mode, sport=athlete_sport)
         st.markdown(_flat_html(
-            "<div style='background:white;border:1px solid #e5e7eb;border-radius:14px;"
-            "padding:28px 28px;margin-top:12px;'>"
+            "<div style='background:#1e293b;border:1px solid #334155;"
+            "border-radius:14px;padding:28px 28px;margin-top:12px;'>"
             "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
             "color:#d4a634;text-transform:uppercase;margin-bottom:8px;'>"
-            "◆ Hitting Lab</div>"
-            "<div style='font-size:22px;font-weight:700;color:#1a2150;margin-bottom:8px;'>"
-            "Ready to see a Post-Swing Report?</div>"
-            "<div style='font-size:14px;color:#4b5563;line-height:1.5;'>"
-            "Hitting Lab v1 currently supports <b>Sample Sessions only</b> — turn on the "
-            "<b>Sample Session</b> toggle in the sidebar to generate a believable batting "
-            "practice session and explore the full report. Real CSV import "
-            "(Blast Motion + HitTrax/Rapsodo + ProPlayAI Swing) lands in v1.1."
+            "Hitting Lab</div>"
+            "<div style='font-size:22px;font-weight:700;color:#f1f5f9;"
+            "margin-bottom:8px;'>"
+            f"No swing data yet for {athlete_name}.</div>"
+            "<div style='font-size:14px;color:#cbd5e1;line-height:1.6;'>"
+            "Two ways to get started:<br>"
+            "&nbsp;&nbsp;• Turn on <b>Live Capture (Beta)</b> in the sidebar "
+            "and film a tee or front-toss session with your phone.<br>"
+            "&nbsp;&nbsp;• Turn on <b>Sample Session</b> in the sidebar to "
+            "generate a believable batting practice and explore the full "
+            "report layout."
             "</div></div>"
         ), unsafe_allow_html=True)
         st.stop()
-
-    # ===== Generate the sample swing session =====
-    with st.spinner(f"Generating swing session for {athlete_name}..."):
-        df = generate_hitting_session(athlete_name, hand=athlete_hand, sport=athlete_sport)
 
     _branded_header_hitting(athlete_name, athlete_hand, athlete_class,
                              demo_mode, sport=athlete_sport)
@@ -9706,7 +9722,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
 
     # ===== Tabs =====
     tab_overview, tab_swings, tab_history, tab_action = st.tabs(
-        ["📊 Overview", "🎯 Swing Detail", "📈 History", "🚀 Action Plan"]
+        ["Overview", "Swing Detail", "History", "Action Plan"]
     )
 
     # ----- Overview -----
@@ -10209,7 +10225,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         c5.metric("Bat Spd",  f"{s['avg_spin']:.1f} mph"
                                                 if s.get("avg_spin") is not None else "—")
                         with c6:
-                            if st.button("🗑 Delete",
+                            if st.button("Delete",
                                           key=f"del_hit_session_{s['id']}",
                                           use_container_width=True):
                                 delete_session(s["id"])
@@ -10233,7 +10249,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                     athlete_level=athlete_level,
                 )
                 st.download_button(
-                    label="📄 Download Post-Swing Report (PDF)",
+                    label="Download Post-Swing Report (PDF)",
                     data=pdf_bytes,
                     file_name=f"Post-Swing-Report_{athlete_name.replace(' ', '_')}.pdf",
                     mime="application/pdf",
@@ -10297,7 +10313,7 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
                         ),
                         unsafe_allow_html=True,
                     )
-                st.caption(f"📍 Why this fired: _{d['trigger']}_")
+                st.caption(f"Why this fired: _{d['trigger']}_")
 
         # =========================================================
         # 5-DAY STRUCTURED WEEKLY PLAN
@@ -12549,7 +12565,7 @@ def run_live_capture_tab(active_athlete_id: int | None,
     ball_radius_hi = cal["ball_rmax_px"]
 
     st.divider()
-    st.markdown("**🎬 Step 2 — Live capture**")
+    st.markdown("**Step 2 — Live capture**")
 
     # ===== Video processor class — runs MediaPipe (if available) + ball detection per frame =====
     class PoseExtractor(VideoProcessorBase):
@@ -12782,7 +12798,7 @@ def run_live_capture_tab(active_athlete_id: int | None,
     st.divider()
     snap_l, snap_r = st.columns([1.0, 1.0])
     with snap_l:
-        if st.button("📌 Snap Pitch (at end of throw)",
+        if st.button("Snap Pitch (at end of throw)",
                       use_container_width=True, type="primary",
                       key="livecap_snap_btn",
                       disabled=ctx.video_processor is None):
@@ -12819,7 +12835,7 @@ def run_live_capture_tab(active_athlete_id: int | None,
             else:
                 st.warning("No pose detected yet — make sure the pitcher is in frame.")
     with snap_r:
-        if st.button("🗑 Clear all snapped pitches",
+        if st.button("Clear all snapped pitches",
                       use_container_width=True, key="livecap_clear_btn"):
             st.session_state["livecap_snapped_pitches"] = []
             st.session_state.pop("livecap_last_pitch", None)
@@ -13045,7 +13061,7 @@ def run_live_capture_tab(active_athlete_id: int | None,
         st.dataframe(snap_df, use_container_width=True, hide_index=True)
 
         if active_athlete_id is not None:
-            if st.button("💾 Save this session to history",
+            if st.button("Save this session to history",
                           type="primary", use_container_width=True,
                           key="livecap_save_session_btn"):
                 # Build a minimal canonical pitching df from the snapped pitches.
@@ -13100,7 +13116,7 @@ def run_live_capture_tab(active_athlete_id: int | None,
                 except Exception as e:
                     st.error(f"Could not save: {e}")
         else:
-            st.info("👤 Pick a pitcher from the sidebar to enable saving this session to their history.")
+            st.info("Pick a pitcher from the sidebar to enable saving this session to their history.")
     else:
         st.info("No pitches snapped yet. Tap **Snap Pitch** at the release moment of each pitch.")
 
@@ -13174,30 +13190,45 @@ def run_hitting_live_capture(active_athlete_id: int | None,
             "swing-mechanics extraction."
         )
 
-    # --- Calibration row ---
+    # --- Calibration — coach-friendly defaults + collapsible advanced ---
     st.divider()
     st.markdown("**Step 1 — Calibration**")
-    cal_c1, cal_c2, cal_c3, cal_c4 = st.columns(4)
-    with cal_c1:
-        tee_x = st.number_input("Tee position X (px)", min_value=0, max_value=4000,
-                                  value=int(st.session_state.get("hitcap_tee_x", 320)),
-                                  step=10, key="hitcap_tee_x_input")
-    with cal_c2:
-        tee_y = st.number_input("Tee position Y (px)", min_value=0, max_value=4000,
-                                  value=int(st.session_state.get("hitcap_tee_y", 400)),
-                                  step=10, key="hitcap_tee_y_input")
-    with cal_c3:
-        ref_dist_ft = st.number_input("Tee-to-camera (ft)", min_value=5, max_value=50,
-                                        value=int(st.session_state.get("hitcap_dist", 20)),
-                                        step=1, key="hitcap_dist_input",
-                                        help="Used to scale pixel motion → real-world ft.")
-    with cal_c4:
-        ball_min = st.number_input("Ball radius min (px)", min_value=2, max_value=40,
-                                     value=int(st.session_state.get("hitcap_rmin", 6)),
-                                     step=1, key="hitcap_rmin_input")
-        ball_max = st.number_input("Ball radius max (px)", min_value=4, max_value=80,
-                                     value=int(st.session_state.get("hitcap_rmax", 22)),
-                                     step=1, key="hitcap_rmax_input")
+    st.caption(
+        "Quick rule of thumb: phone roughly 20 ft from the tee, "
+        "perpendicular to the swing path. The defaults below work for "
+        "most setups — only open Advanced if exit-velo readings look way "
+        "off after your first few swings.")
+    ref_dist_ft = st.slider(
+        "Tee-to-camera distance (ft)", min_value=5, max_value=50,
+        value=int(st.session_state.get("hitcap_dist", 20)), step=1,
+        key="hitcap_dist_input",
+        help="Used to scale pixel motion to real-world feet. The slider "
+             "covers the 5-50 ft range every coach actually uses.")
+    with st.expander("Advanced — manual pixel calibration", expanded=False):
+        cal_c1, cal_c2 = st.columns(2)
+        with cal_c1:
+            tee_x = st.number_input(
+                "Tee position X (px)", min_value=0, max_value=4000,
+                value=int(st.session_state.get("hitcap_tee_x", 320)),
+                step=10, key="hitcap_tee_x_input")
+            tee_y = st.number_input(
+                "Tee position Y (px)", min_value=0, max_value=4000,
+                value=int(st.session_state.get("hitcap_tee_y", 400)),
+                step=10, key="hitcap_tee_y_input")
+        with cal_c2:
+            ball_min = st.number_input(
+                "Ball radius min (px)", min_value=2, max_value=40,
+                value=int(st.session_state.get("hitcap_rmin", 6)),
+                step=1, key="hitcap_rmin_input")
+            ball_max = st.number_input(
+                "Ball radius max (px)", min_value=4, max_value=80,
+                value=int(st.session_state.get("hitcap_rmax", 22)),
+                step=1, key="hitcap_rmax_input")
+    # Pull the latest values whether the expander was opened or not
+    tee_x   = int(st.session_state.get("hitcap_tee_x", 320))
+    tee_y   = int(st.session_state.get("hitcap_tee_y", 400))
+    ball_min = int(st.session_state.get("hitcap_rmin", 6))
+    ball_max = int(st.session_state.get("hitcap_rmax", 22))
     st.session_state["hitcap_tee_x"] = tee_x
     st.session_state["hitcap_tee_y"] = tee_y
     st.session_state["hitcap_dist"]  = ref_dist_ft
@@ -13553,13 +13584,35 @@ def _render_login_screen() -> bool:
       - Athlete (Invite Code) → joins a coach's org via per-athlete code
     """
     _render_brand_header()
+
+    # ===== Value-prop panel — what is this product? =====
     st.markdown(
-        "<div style='max-width:520px;margin:14px auto 0 auto;'>"
-        "<div style='color:#94a3b8;font-size:14px;text-align:center;line-height:1.6;'>"
-        "Sign in to your account, or create one if it's your first time. "
-        "Coaches manage an organization. Players can register on their own "
-        "or join a coach's org with an invite code."
-        "</div></div>",
+        "<div style='max-width:680px;margin:18px auto 8px auto;"
+        "background:#1e293b;border:1px solid #334155;border-radius:14px;"
+        "padding:22px 28px;'>"
+        "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
+        "color:#d4a634;text-transform:uppercase;margin-bottom:10px;'>"
+        "Diamond Sports Lab</div>"
+        "<div style='color:#f1f5f9;font-size:17px;line-height:1.5;"
+        "font-weight:600;margin-bottom:10px;'>"
+        "Bullpen + batting-cage analytics for the modern coach — no "
+        "$1,000 device required.</div>"
+        "<div style='color:#cbd5e1;font-size:13px;line-height:1.7;'>"
+        "Film a session with your phone. The app tracks velocity, break, "
+        "spin, exit velocity, launch angle, and pose biomech from the "
+        "video alone. Get a full bullpen / post-swing report with "
+        "drill-level coaching cues in 60 seconds."
+        "</div>"
+        "<div style='display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;"
+        "padding-top:14px;border-top:1px solid #334155;'>"
+        "<div style='font-size:12px;color:#94a3b8;'>"
+        "<b style='color:#22c55e;'>Baseball</b> + Softball</div>"
+        "<div style='font-size:12px;color:#94a3b8;'>"
+        "<b style='color:#22c55e;'>Pitching</b> + Hitting</div>"
+        "<div style='font-size:12px;color:#94a3b8;'>"
+        "<b style='color:#22c55e;'>Individual</b> + Team + Org plans</div>"
+        "</div>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
@@ -13567,8 +13620,6 @@ def _render_login_screen() -> bool:
     with st.container(border=False):
         d_pad_l, d_btn, d_pad_r = st.columns([1, 2, 1])
         with d_btn:
-            st.markdown(
-                "<div style='height:14px;'></div>", unsafe_allow_html=True)
             if st.button("Try the demo (no sign-up)",
                           key="login_try_demo",
                           use_container_width=True,
@@ -13581,10 +13632,19 @@ def _render_login_screen() -> bool:
                 st.session_state["auth_demo_tier"] = "individual"
                 st.rerun()
             st.caption(
-                "Tip: drop in to see what each subscription tier feels "
-                "like before creating an account.")
+                "See exactly what each subscription tier looks like "
+                "before creating an account.")
             st.markdown(
-                "<div style='height:8px;'></div>", unsafe_allow_html=True)
+                "<div style='height:6px;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='max-width:520px;margin:14px auto 0 auto;'>"
+        "<div style='color:#94a3b8;font-size:14px;text-align:center;line-height:1.6;'>"
+        "Or sign in if you already have an account. New coaches manage "
+        "an organization · new players can register on their own or "
+        "join a coach's org with an invite code."
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
 
     with st.container(border=False):
         col_pad_l, col_form, col_pad_r = st.columns([1, 3, 1])
@@ -14395,7 +14455,7 @@ def main():
         # Determines which lab the rest of the app shows. Persisted across reruns.
         app_mode = st.radio(
             "Lab",
-            ["⚾ Pitching", "🏏 Hitting"],
+            ["Pitching", "Hitting"],
             index=1 if st.session_state.get("app_mode") == "Hitting" else 0,
             horizontal=True,
             key="app_mode_radio",
@@ -14434,9 +14494,9 @@ def main():
         _profile_label = "Hitter Profile" if st.session_state.get("app_mode") == "Hitting" else "Pitcher Profile"
         st.subheader(_profile_label)
 
-        # Sport icon helper (used in roster labels + header)
+        # Sport label helper (text-only — no emoji, matches dark-mode brand)
         def _sport_icon(s: str) -> str:
-            return "🥎" if s == "Softball" else "⚾"
+            return "SB" if s == "Softball" else "BB"
 
         # Role labels swap with mode. Same athlete record — only the display
         # changes. Pitching shows "RHP/LHP"; Hitting shows "RHH/LHH".
@@ -14448,14 +14508,14 @@ def main():
 
         def _athlete_label(a: dict) -> str:
             suffix = f"{a['hand'][:1]}{HAND_TAG}"
-            return (f"{_sport_icon(a.get('sport', 'Baseball'))} "
+            return (f"[{_sport_icon(a.get('sport', 'Baseball'))}] "
                     f"{a['name']} ({suffix}, {a['grad_class'] or '—'})")
 
         # ===== ROSTER DROPDOWN =====
         roster = list_athletes()
-        ADD_NEW = f"➕ Add new {ROLE_NOUN}..."
-        DEMO_ATHLETE_BB = f"🎬 Sample {ROLE_DROPDOWN_LABEL} — Baseball"
-        DEMO_ATHLETE_SB = f"🎬 Sample {ROLE_DROPDOWN_LABEL} — Softball"
+        ADD_NEW = f"Add new {ROLE_NOUN}..."
+        DEMO_ATHLETE_BB = f"Sample {ROLE_DROPDOWN_LABEL} — Baseball"
+        DEMO_ATHLETE_SB = f"Sample {ROLE_DROPDOWN_LABEL} — Softball"
         roster_options: list = []
         if demo_mode and not roster:
             # First-run demo experience: offer both sports as virtual defaults
@@ -14587,7 +14647,7 @@ def main():
                                  "sport": e_sport, "grad_class": e_class}
                     st.session_state["selected_athlete_label"] = _athlete_label(updated_a)
                     st.rerun()
-                if st.button(f"🗄️ Archive this {ROLE_NOUN}", use_container_width=True,
+                if st.button(f"Archive this {ROLE_NOUN}", use_container_width=True,
                               key=f"archive_btn_{aid}",
                               help="Hides them from the roster but keeps history."):
                     archive_athlete(active_athlete_id, archived=True)
@@ -14608,7 +14668,7 @@ def main():
                     f"I understand: permanently delete **{athlete_name}** AND all their session history.",
                     key=confirm_key,
                 )
-                if st.button("🗑️ Delete permanently (cannot be undone)",
+                if st.button("Delete permanently (cannot be undone)",
                               use_container_width=True,
                               disabled=not confirm,
                               type="secondary",
@@ -14676,7 +14736,7 @@ def main():
             if video_upload_demo is not None:
                 st.session_state["bullpen_video"] = video_upload_demo
                 st.session_state["bullpen_video_url"] = None
-            if st.button("🎥 Load a sample bullpen video", use_container_width=True):
+            if st.button("Load a sample bullpen video", use_container_width=True):
                 st.session_state["bullpen_video_url"] = SAMPLE_PITCHER_VIDEO_URL
                 st.session_state["bullpen_video"] = None
             video_url_input2 = st.text_input(
@@ -14821,7 +14881,7 @@ def main():
             cta_a, cta_b = st.columns(2)
             with cta_a:
                 with st.container(border=True):
-                    st.markdown("### 🎬  Try a Sample Session")
+                    st.markdown("### Try a Sample Session")
                     st.markdown(
                         "We'll generate a believable bullpen for any pitcher name "
                         "you type. **No uploads needed.** Best way to see the full "
@@ -14840,7 +14900,7 @@ def main():
                         st.rerun()
             with cta_b:
                 with st.container(border=True):
-                    st.markdown("### 📂  Upload Real Bullpen Data")
+                    st.markdown("### Upload Real Bullpen Data")
                     st.markdown(
                         "Drop in your **Pitch Logic / Rapsodo**, **Pulse**, and "
                         "**ProPlayAI** CSV exports using the three file uploaders "
@@ -14876,7 +14936,7 @@ def main():
             try:
                 return parse_fn(file_arg)
             except ParserError as e:
-                st.error(f"❌ **{label} parsing failed.**\n\n{str(e)}")
+                st.error(f"**{label} parsing failed.**\n\n{str(e)}")
                 st.info(
                     "👉 Copy the error message above and the file preview below, "
                     "paste them back to Claude, and the parser will be updated."
@@ -14884,14 +14944,14 @@ def main():
                 st.stop()
             except KeyError as e:
                 st.error(
-                    f"❌ **{label} parsing hit an unexpected column.**\n\n"
+                    f"**{label} parsing hit an unexpected column.**\n\n"
                     f"Missing column: {e}\n\n"
                     "This usually means the CSV uses a different name for this field. "
                     "Copy the error + file preview and paste back to Claude."
                 )
                 st.stop()
             except Exception as e:
-                st.error(f"❌ **{label} parsing crashed:** `{type(e).__name__}: {e}`")
+                st.error(f"**{label} parsing crashed:** `{type(e).__name__}: {e}`")
                 st.stop()
 
         with st.spinner("Parsing Pitch Logic..."):
@@ -15209,7 +15269,7 @@ def main():
             v_data = st.session_state.get("bullpen_video")
             v_url  = st.session_state.get("bullpen_video_url")
             if v_data is not None or v_url:
-                st.markdown("**🎥 Side-by-side video**")
+                st.markdown("**Side-by-side video**")
                 st.caption(
                     "Both players show the same bullpen video — scrub each one to "
                     "the moment of the pitch you're comparing, and use the speed "
@@ -15365,7 +15425,7 @@ def main():
                         c4.metric("Peak Velo", f"{s['peak_velocity']:.1f} mph" if s.get("peak_velocity") is not None else "—")
                         c5.metric("Max Stress", f"{s['max_stress']:.1f} Nm" if s.get("max_stress") is not None else "—")
                         with c6:
-                            if st.button("🗑 Delete",
+                            if st.button("Delete",
                                           key=f"del_session_{s['id']}",
                                           use_container_width=True):
                                 delete_session(s["id"])
@@ -15376,7 +15436,7 @@ def main():
 
     # ---- Pitch Tunneling tab ----
     with tab_tunneling:
-        st.subheader("🪢 Pitch Tunneling — pair sequencing tool")
+        st.subheader("Pitch Tunneling — pair sequencing tool")
         st.caption(
             "Pick the **starting pitch**, click anywhere on the zone to place it, "
             "then pick the **second pitch** you want to tunnel off the first. The "
@@ -15655,7 +15715,7 @@ def main():
                         ),
                         unsafe_allow_html=True,
                     )
-                st.caption(f"📍 Why this fired: _{d['trigger']}_")
+                st.caption(f"Why this fired: _{d['trigger']}_")
 
         # =========================
         # 5-DAY STRUCTURED WEEKLY PLAN
