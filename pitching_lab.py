@@ -13125,6 +13125,319 @@ def run_live_capture_tab(active_athlete_id: int | None,
 # LIVE CAPTURE  (Hitting Lab) — phone tracks the ball off the tee/toss +
 # pose-based swing biomech. Phone-only — no Blast Motion, no HitTrax.
 # =============================================================================
+def process_uploaded_swing_video(video_path: str,
+                                    calibration: dict,
+                                    sport: str = "Baseball",
+                                    min_ball_radius: int = 6,
+                                    max_ball_radius: int = 22,
+                                    progress_cb=None) -> list[dict]:
+    """Run swing detection on a pre-recorded hitting video.
+
+    Strategy mirrors process_uploaded_video for pitching, but the ball
+    behaviour is reversed: in pitching the ball arrives at the plate; in
+    hitting the ball *leaves* the contact zone at high speed off the bat.
+
+    A "swing" is segmented as a burst of ball motion where pixel speed
+    spikes (the post-contact flight). Between swings the ball is either
+    stationary on the tee, slow incoming from a tosser, or absent.
+
+    Returns one dict per detected swing with:
+        exit_velocity_mph, launch_angle_deg, contact_t_sec,
+        n_samples_used, t_start_sec, t_end_sec
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot process video — OpenCV/NumPy not available: {e}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video file: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    # ----- Pass 1: ball position per frame -----
+    positions: list[tuple[float, int, int]] = []
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        pos = detect_ball_in_frame(
+            frame,
+            ball_radius_px_range=(min_ball_radius, max_ball_radius),
+            motion_blur_tolerant=True)
+        if pos:
+            t_sec = frame_idx / fps
+            positions.append((t_sec, pos[0], pos[1]))
+        frame_idx += 1
+        if progress_cb and frame_idx % 30 == 0 and total_frames > 0:
+            progress_cb(min(1.0, frame_idx / total_frames))
+    cap.release()
+    if progress_cb:
+        progress_cb(1.0)
+
+    if len(positions) < 5:
+        return []
+
+    # ----- Pass 2: find post-contact bursts -----
+    # Compute pixel speed between consecutive samples. A "swing" is a
+    # contiguous run where speed > exit_threshold (much faster than a
+    # toss or stationary ball). Separated by quiet gaps.
+    EXIT_PX_PER_FRAME = 12.0   # ~50 mph+ at typical zoom — robust threshold
+    speeds = []
+    for i in range(1, len(positions)):
+        dt = positions[i][0] - positions[i-1][0]
+        if dt <= 0:
+            speeds.append(0.0)
+            continue
+        dx = positions[i][1] - positions[i-1][1]
+        dy = positions[i][2] - positions[i-1][2]
+        px_per_sec = ((dx * dx + dy * dy) ** 0.5) / dt
+        speeds.append(px_per_sec / fps)   # px per frame for easy threshold
+
+    swings: list[list[int]] = []   # list of position-index ranges
+    cur: list[int] = []
+    quiet_count = 0
+    QUIET_FRAMES_FOR_GAP = 20
+    for i, sp in enumerate(speeds, start=1):
+        if sp >= EXIT_PX_PER_FRAME:
+            cur.append(i)
+            quiet_count = 0
+        else:
+            quiet_count += 1
+            if cur and quiet_count >= QUIET_FRAMES_FOR_GAP:
+                if len(cur) >= 3:
+                    swings.append(cur)
+                cur = []
+    if len(cur) >= 3:
+        swings.append(cur)
+
+    # ----- Pass 3: per-swing exit velo + launch angle -----
+    plate_dist_ft = float(calibration.get("ref_dist_ft", 20.0))
+    # Same rough scale as the live capture path uses
+    ft_per_px = 1.0 / (30.0 * (20.0 / max(plate_dist_ft, 1.0)))
+    out = []
+    for swing_i, idx_range in enumerate(swings, start=1):
+        # Indices into `positions`
+        xs = [positions[k][1] for k in idx_range]
+        ys = [positions[k][2] for k in idx_range]
+        ts = [positions[k][0] for k in idx_range]
+        if len(xs) < 3:
+            continue
+        # Peak pixel speed inside the burst
+        pixel_speeds = []
+        for k in range(1, len(xs)):
+            dt = max(ts[k] - ts[k-1], 1e-6)
+            dx = xs[k] - xs[k-1]
+            dy = ys[k] - ys[k-1]
+            pixel_speeds.append(((dx*dx + dy*dy) ** 0.5) / dt)
+        if not pixel_speeds:
+            continue
+        import numpy as _np
+        peak_px_per_sec = float(_np.max(pixel_speeds))
+        peak_fps = peak_px_per_sec * ft_per_px
+        peak_mph = peak_fps / 1.467
+        # Launch angle from a couple of frames after peak
+        peak_idx = int(_np.argmax(pixel_speeds))
+        la = None
+        if peak_idx + 2 < len(xs):
+            dx_la = xs[peak_idx + 2] - xs[peak_idx]
+            dy_la = ys[peak_idx + 2] - ys[peak_idx]
+            import math as _math
+            la = _math.degrees(_math.atan2(-dy_la, abs(dx_la)))
+        out.append({
+            "swing_num":          swing_i,
+            "exit_velocity_mph":  round(peak_mph, 1),
+            "launch_angle_deg":   (round(la, 1) if la is not None else None),
+            "contact_t_sec":      ts[0],
+            "t_start_sec":        ts[0],
+            "t_end_sec":          ts[-1],
+            "n_samples_used":     len(xs),
+        })
+    return out
+
+
+def _run_upload_swing_video_mode(active_athlete_id: int | None,
+                                     athlete_name: str,
+                                     athlete_hand: str,
+                                     athlete_sport: str = "Baseball"):
+    """Upload Video mode for HITTING — mirror of pitching upload flow."""
+    st.markdown(
+        _flat_html(
+            "<div style='background:#f0f9ff;border:1px solid #bae6fd;"
+            "border-left:4px solid #0ea5e9;border-radius:8px;padding:14px 18px;"
+            "margin:8px 0 12px 0;'>"
+            "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            "color:#0369a1;text-transform:uppercase;margin-bottom:6px;'>"
+            "How upload mode works for hitting</div>"
+            "<div style='font-size:13px;color:#1f2937;line-height:1.6;'>"
+            "1. At the cage, film the session with your <b>phone's native "
+            "Camera app</b> (1080p, 60 fps if your phone supports it). "
+            "Phone roughly 20 ft to the side of the hitter, perpendicular "
+            "to the swing path — same setup as Live mode.<br>"
+            "2. Later, AirDrop the video to your laptop (or open this app "
+            "on the device that has the video).<br>"
+            "3. Upload the video below. The app scans every frame, finds "
+            "every swing by detecting post-contact ball bursts, and "
+            "computes exit velocity + launch angle per swing.<br>"
+            "4. Review the detected swings and save the keepers to the "
+            "hitter's history.<br>"
+            "<b>Works for:</b> tee, soft toss, front toss, live BP, and "
+            "in-game video — anywhere the ball clearly leaves the bat in "
+            "frame."
+            "</div></div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    import tempfile, os
+    st.markdown("**Step 1 — Upload video**")
+    uploaded = st.file_uploader(
+        "Drop a .mp4 / .mov / .m4v file here",
+        type=["mp4", "mov", "m4v", "avi"],
+        key="hitcap_upload_file",
+        help="iPhone 1080p, 30-240 fps. Native camera output works directly.")
+    if uploaded is None:
+        st.info("No video uploaded yet.")
+        return
+
+    tmp_path = os.path.join(tempfile.gettempdir(),
+                              f"hitcap_{uploaded.name}")
+    last_name_key = "hitcap_upload_last_name"
+    if st.session_state.get(last_name_key) != uploaded.name:
+        with open(tmp_path, "wb") as f:
+            f.write(uploaded.read())
+        st.session_state[last_name_key] = uploaded.name
+        st.session_state.pop("hitcap_upload_swings", None)
+    st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
+
+    # ----- Step 2: camera distance (hitting calibration is simpler) -----
+    st.divider()
+    st.markdown("**Step 2 — Camera distance**")
+    ref_dist_ft = st.slider(
+        "Camera-to-contact-zone distance (ft)", min_value=5, max_value=50,
+        value=int(st.session_state.get("hitcap_upload_dist", 20)), step=1,
+        key="hitcap_upload_dist",
+        help="Used to scale pixel motion to real-world feet.")
+    ball_min = int(st.session_state.get("hitcap_upload_rmin", 6))
+    ball_max = int(st.session_state.get("hitcap_upload_rmax", 22))
+    with st.expander("Advanced — ball radius bounds", expanded=False):
+        adv_l, adv_r = st.columns(2)
+        with adv_l:
+            ball_min = st.number_input(
+                "Ball radius min (px)", min_value=2, max_value=40,
+                value=ball_min, step=1, key="hitcap_upload_rmin_in")
+        with adv_r:
+            ball_max = st.number_input(
+                "Ball radius max (px)", min_value=4, max_value=80,
+                value=ball_max, step=1, key="hitcap_upload_rmax_in")
+
+    # ----- Step 3: process -----
+    if st.button("Process video", type="primary",
+                  use_container_width=True,
+                  key="hitcap_upload_process_btn"):
+        try:
+            import cv2  # noqa
+        except Exception as e:
+            st.error(f"OpenCV missing — can't process video. ({e})")
+            return
+        progress = st.progress(0.0, text="Scanning frames for ball...")
+        def _cb(frac):
+            progress.progress(min(1.0, frac),
+                                text=f"Scanning frames... {int(frac*100)}%")
+        try:
+            with st.spinner("Detecting swings..."):
+                swings = process_uploaded_swing_video(
+                    tmp_path,
+                    {"ref_dist_ft": float(ref_dist_ft), "sport": athlete_sport},
+                    sport=athlete_sport,
+                    min_ball_radius=int(ball_min),
+                    max_ball_radius=int(ball_max),
+                    progress_cb=_cb)
+            progress.empty()
+            st.session_state["hitcap_upload_swings"] = swings
+            if swings:
+                st.success(f"Found {len(swings)} swing(s) in this video.")
+            else:
+                st.warning(
+                    "No swings detected. Try lowering the ball-radius min "
+                    "in Advanced, or check that the ball is clearly "
+                    "visible coming off the bat in your video.")
+        except Exception as e:
+            progress.empty()
+            st.error(f"Processing failed: {e}")
+
+    # ----- Step 4: review + save -----
+    swings = st.session_state.get("hitcap_upload_swings", [])
+    if not swings:
+        return
+    st.divider()
+    st.subheader(f"Detected swings ({len(swings)})")
+    st.caption("Each row is one swing. Deselect any that look wrong.")
+    keep = []
+    for s in swings:
+        c1, c2, c3, c4 = st.columns([1, 1.6, 1.6, 2.0])
+        with c1:
+            include = st.checkbox(f"Swing {s['swing_num']}", value=True,
+                                     key=f"hitcap_upload_keep_{s['swing_num']}")
+            if include:
+                keep.append(s)
+        ev = s.get("exit_velocity_mph")
+        la = s.get("launch_angle_deg")
+        c2.metric("Exit velo", f"{ev} mph" if ev else "—")
+        c3.metric("Launch angle", f"{la:+.0f}°" if la is not None else "—")
+        c4.metric("Samples", s.get("n_samples_used", "—"))
+
+    st.divider()
+    if active_athlete_id is None:
+        st.info("Pick a hitter from the sidebar to enable saving to history.")
+        return
+    if st.button(f"Save {len(keep)} swing(s) to history",
+                  type="primary", use_container_width=True,
+                  key="hitcap_upload_save_btn"):
+        from datetime import datetime as _dt, timedelta as _td
+        base_time = _dt.utcnow()
+        rows = []
+        for i, s in enumerate(keep, start=1):
+            rows.append({
+                "Swing_Num":              i,
+                "Timestamp":              base_time + _td(seconds=2 * (i - 1)),
+                "Pitch_Type_Faced":       "Unknown",
+                "Pitch_Velocity_mph":     None,
+                "Plate_X_ft":             None,
+                "Plate_Z_ft":             None,
+                "Swing_Type":             "swing",
+                "Swing_Outcome":          "solid_contact",
+                "Bat_Speed_mph":          None,
+                "Attack_Angle_deg":       None,
+                "On_Plane_Eff_pct":       None,
+                "Peak_Hand_Speed_mph":    None,
+                "Time_to_Contact_sec":    None,
+                "Exit_Velocity_mph":      s.get("exit_velocity_mph"),
+                "Launch_Angle_deg":       s.get("launch_angle_deg"),
+                "Contact_Offset_in":      None,
+                "Distance_ft":            None,
+                "Spray_Angle_deg":        None,
+                "Peak_Hip_Shoulder_Sep_deg": None,
+                "Stride_Length_in":       None,
+                "Lead_Knee_Flex_deg":     None,
+            })
+        cap_df = pd.DataFrame(rows)
+        try:
+            new_id = save_session(active_athlete_id, cap_df,
+                                    session_type="real",
+                                    session_kind="hitting")
+            st.success(
+                f"Saved as session #{new_id}. Open the Hitting History tab "
+                "to see it trended.")
+            st.session_state["hitcap_upload_swings"] = []
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+
+
 def run_hitting_live_capture(active_athlete_id: int | None,
                               athlete_name: str,
                               athlete_hand: str,
@@ -13139,6 +13452,24 @@ def run_hitting_live_capture(active_athlete_id: int | None,
         "mechanics (hip-shoulder separation, attack angle, stride length). "
         "No bat sensor or HitTrax required."
     )
+
+    # ===== INPUT MODE — Live or Upload Video =====
+    capture_mode = st.radio(
+        "Capture mode",
+        ["Live (real-time camera)",
+         "Upload Video (film now, process later)"],
+        index=0,
+        horizontal=True,
+        key="hitcap_mode",
+        help="Live uses the phone's camera in real-time over local Wi-Fi. "
+             "Upload Video lets you film at the cage with your phone's "
+             "native camera, then upload the file when you're on good "
+             "Wi-Fi.",
+    )
+    if capture_mode.startswith("Upload"):
+        _run_upload_swing_video_mode(active_athlete_id, athlete_name,
+                                        athlete_hand, athlete_sport)
+        return
 
     # --- Verify the live-capture stack ---
     required_missing = []
@@ -13194,25 +13525,30 @@ def run_hitting_live_capture(active_athlete_id: int | None,
     st.divider()
     st.markdown("**Step 1 — Calibration**")
     st.caption(
-        "Quick rule of thumb: phone roughly 20 ft from the tee, "
-        "perpendicular to the swing path. The defaults below work for "
-        "most setups — only open Advanced if exit-velo readings look way "
-        "off after your first few swings.")
+        "Works for **tee work, soft toss, front toss, and live pitches**. "
+        "Phone roughly 20 ft from the contact zone, perpendicular to the "
+        "swing path. The defaults below work for most setups — only open "
+        "Advanced if exit-velo readings look off after a few swings. "
+        "**For live pitches:** tap Snap Swing within ~150 ms of contact so "
+        "the algorithm locks onto the post-contact ball.")
     ref_dist_ft = st.slider(
-        "Tee-to-camera distance (ft)", min_value=5, max_value=50,
+        "Camera-to-contact-zone distance (ft)", min_value=5, max_value=50,
         value=int(st.session_state.get("hitcap_dist", 20)), step=1,
         key="hitcap_dist_input",
-        help="Used to scale pixel motion to real-world feet. The slider "
-             "covers the 5-50 ft range every coach actually uses.")
+        help="Used to scale pixel motion to real-world feet. Same number "
+             "whether you're hitting off a tee, front toss, or live BP.")
     with st.expander("Advanced — manual pixel calibration", expanded=False):
         cal_c1, cal_c2 = st.columns(2)
         with cal_c1:
             tee_x = st.number_input(
-                "Tee position X (px)", min_value=0, max_value=4000,
+                "Contact-zone X (px)", min_value=0, max_value=4000,
                 value=int(st.session_state.get("hitcap_tee_x", 320)),
-                step=10, key="hitcap_tee_x_input")
+                step=10, key="hitcap_tee_x_input",
+                help="Pixel column where the ball is at contact "
+                     "(tee top, hitting zone, or wherever the bat meets "
+                     "the ball).")
             tee_y = st.number_input(
-                "Tee position Y (px)", min_value=0, max_value=4000,
+                "Contact-zone Y (px)", min_value=0, max_value=4000,
                 value=int(st.session_state.get("hitcap_tee_y", 400)),
                 step=10, key="hitcap_tee_y_input")
         with cal_c2:
@@ -14230,6 +14566,155 @@ def _render_admin_panel() -> bool:
     return False
 
 
+def render_plans_and_billing_page():
+    """Full-screen Plans & Billing — replaces the old in-tab Pricing page.
+
+    Pulls live tier data from SUBSCRIPTION_TIERS so updating prices in one
+    place (the constants block) updates the page automatically. CTAs are
+    Stripe-ready: clicking 'Choose' starts checkout when Stripe is set
+    up, otherwise shows a 'billing not yet enabled' notice.
+    """
+    rec = current_user_record() or {}
+    org = get_org_record(rec.get("org_id"))
+
+    head_l, head_r = st.columns([5, 1])
+    with head_l:
+        st.markdown(
+            "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
+            "color:#d4a634;text-transform:uppercase;margin-bottom:6px;'>"
+            "Plans &amp; Billing</div>"
+            "<div style='font-size:24px;font-weight:800;color:#f1f5f9;"
+            "line-height:1.2;'>Pick the plan that fits your roster</div>",
+            unsafe_allow_html=True)
+    with head_r:
+        if st.button("Back to app", key="billing_back",
+                      use_container_width=True):
+            st.session_state.pop("show_plans_page", None)
+            st.rerun()
+
+    # Current plan summary (if any)
+    sub_entity = org if org else rec
+    sub_status = (sub_entity or {}).get("subscription_status", "trial")
+    sub_tier   = (sub_entity or {}).get("subscription_tier")
+    tier_info  = SUBSCRIPTION_TIERS.get(sub_tier) if sub_tier else None
+    status_color = {"active": "#22c55e", "trial": "#d4a634",
+                     "past_due": "#ef4444", "canceled": "#ef4444",
+                     "expired": "#ef4444"}.get(sub_status, "#94a3b8")
+    status_label = {"active": "Active subscription",
+                     "trial": "Free trial",
+                     "past_due": "Payment past due",
+                     "canceled": "Canceled",
+                     "expired": "Expired",
+                     "billing_disabled": "Billing not enabled yet"}.get(
+                         sub_status, "Status unknown")
+    st.markdown(
+        f"<div style='background:#1e293b;border:1px solid #334155;"
+        f"border-left:4px solid {status_color};border-radius:10px;"
+        f"padding:16px 20px;margin:14px 0;'>"
+        f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+        f"color:{status_color};text-transform:uppercase;margin-bottom:4px;'>"
+        f"{status_label}</div>"
+        f"<div style='color:#f1f5f9;font-size:15px;'>"
+        f"{tier_info['label'] if tier_info else 'No tier selected'}"
+        f"</div></div>",
+        unsafe_allow_html=True)
+
+    cycle = st.radio("Billing cycle",
+                       ["Annual (save ~30%)", "Monthly"],
+                       horizontal=True, key="plans_cycle")
+    is_annual = cycle.startswith("Annual")
+
+    cols = st.columns(len(SUBSCRIPTION_TIERS))
+    for i, (key, t) in enumerate(SUBSCRIPTION_TIERS.items()):
+        price = t["annual_usd"] if is_annual else t["monthly_usd"]
+        unit  = "/yr" if is_annual else "/mo"
+        is_current = (sub_tier == key and sub_status == "active")
+        border = "#22c55e" if is_current else "#334155"
+        with cols[i]:
+            st.markdown(
+                f"<div style='background:#1e293b;border:2px solid {border};"
+                f"border-radius:12px;padding:20px 18px;height:100%;'>"
+                f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+                f"color:#94a3b8;text-transform:uppercase;'>{t['label']}</div>"
+                f"<div style='font-size:32px;font-weight:800;color:#f1f5f9;"
+                f"margin:10px 0 2px 0;'>${price:.0f}"
+                f"<span style='font-size:14px;font-weight:500;"
+                f"color:#94a3b8;'>{unit}</span></div>"
+                f"<div style='font-size:13px;color:#cbd5e1;line-height:1.5;"
+                f"min-height:60px;'>{t['blurb']}</div>"
+                f"<div style='font-size:11px;color:#64748b;margin-top:8px;"
+                f"padding-top:8px;border-top:1px dashed #334155;'>"
+                f"Up to {t['athlete_cap']} athlete"
+                f"{'s' if t['athlete_cap'] > 1 else ''}</div>"
+                f"</div>",
+                unsafe_allow_html=True)
+            if is_current:
+                st.success("Your current plan")
+            else:
+                if st.button(f"Choose {t['label']}",
+                              key=f"plans_choose_{key}_{cycle}",
+                              use_container_width=True,
+                              type="primary"):
+                    if stripe_is_configured():
+                        st.session_state["pending_checkout_tier"]   = key
+                        st.session_state["pending_checkout_annual"] = is_annual
+                        st.info("Redirecting to Stripe Checkout...")
+                    else:
+                        st.warning(
+                            "Card processing isn't turned on yet. Email "
+                            "[kolbydonnell@gmail.com](mailto:kolbydonnell@gmail.com)"
+                            " to subscribe directly while billing is being set up.")
+
+    st.divider()
+    st.markdown(
+        f"**Free trial:** every account starts with {TRIAL_SESSIONS_CAP} "
+        f"free saved sessions or {TRIAL_PITCHES_CAP} total captured "
+        f"pitches — whichever comes first. After that you keep full read "
+        f"access to your existing data; new captures require an active "
+        f"subscription.")
+    with st.expander("Can I cancel anytime?", expanded=False):
+        st.markdown(
+            "Yes. Month-to-month. No contracts, no cancellation fees. "
+            "Annual saves about 30% if you want to lock in.")
+    with st.expander("What happens if I cancel?", expanded=False):
+        st.markdown(
+            "Your saved sessions and athletes stay viewable forever — "
+            "we don't delete data when you cancel. You just can't add "
+            "new captures until you resubscribe.")
+    with st.expander("Can a single player use this without a coach?",
+                       expanded=False):
+        st.markdown(
+            "Yes — the Individual tier is built for that. Solo athletes "
+            "or parents tracking their kid's college recruiting get the "
+            "full app for one athlete profile.")
+    with st.expander("Can a former team player keep their data?",
+                       expanded=False):
+        st.markdown(
+            "Yes. When a coach archives a graduated player, that player "
+            "is offered a one-click conversion to an Individual account "
+            "on their next login. Their data comes with them, the trial "
+            "resets, and they own their profile from then on.")
+
+    st.divider()
+    sell_l, sell_r = st.columns(2)
+    with sell_l:
+        try:
+            sell_pdf = generate_sell_sheet_pdf()
+            st.download_button(
+                "Download sell-sheet PDF",
+                data=sell_pdf,
+                file_name="Diamond_Sports_Lab_Sell_Sheet.pdf",
+                mime="application/pdf",
+                use_container_width=True)
+        except Exception as e:
+            st.caption(f"Sell sheet generation issue: {e}")
+    with sell_r:
+        st.link_button(
+            "Schedule a 15-min walkthrough",
+            url="mailto:kolbydonnell@gmail.com?subject=Diamond%20Sports%20Lab%20Demo",
+            use_container_width=True)
+
+
 def render_login_or_landing() -> bool:
     """Top-level gate. Returns True ONLY when the user has logged in AND
     picked an athlete (so main() should proceed to the analytics app).
@@ -14724,6 +15209,14 @@ def main():
             if video_url_input2 and video_url_input2 != st.session_state.get("bullpen_video_url"):
                 st.session_state["bullpen_video_url"] = video_url_input2
 
+        # ===== Plans & Billing entry =====
+        st.divider()
+        if st.button("Plans & Billing", key="sidebar_plans_btn",
+                      use_container_width=True,
+                      help="See subscription tiers and manage your plan."):
+            st.session_state["show_plans_page"] = True
+            st.rerun()
+
         # ===== Account footer (role-aware) =====
         st.divider()
         _user_rec = current_user_record() or {}
@@ -14791,6 +15284,15 @@ def main():
                             "selected_athlete_label"):
                     st.session_state.pop(k, None)
                 st.rerun()
+
+    # ===== PLANS & BILLING short-circuit =====
+    # Tapping 'Plans & Billing' in the sidebar replaces the main pane
+    # (analytics tabs) with the pricing page. Sidebar stays visible so
+    # the user can navigate back via 'Back to app' or by tapping the
+    # button again.
+    if st.session_state.get("show_plans_page"):
+        render_plans_and_billing_page()
+        return
 
     # -------- Mode branch: if Hitting Lab, render swing report and return --------
     if app_mode == "Hitting":
@@ -14991,9 +15493,9 @@ def main():
     st.divider()
 
     # -------- Tabs --------
-    tab_overview, tab_per_pitch, tab_history, tab_tunneling, tab_alignment, tab_action, tab_pricing = st.tabs(
-        ["📊 Overview", "🎯 Per-Pitch Detail", "📈 History",
-         "🪢 Tunneling", "🔧 Alignment Quality", "🚀 Action Plan", "💎 Pricing"]
+    tab_overview, tab_per_pitch, tab_history, tab_tunneling, tab_alignment, tab_action = st.tabs(
+        ["Overview", "Per-Pitch Detail", "History",
+         "Tunneling", "Alignment Quality", "Action Plan"]
     )
 
     # ---- Overview tab ----
@@ -15957,190 +16459,6 @@ def main():
                 help="Use the PDF above for emails. This text version is for when you want "
                      "to copy/paste the plan directly into a text message body.",
             )
-
-    # ---- Pricing tab ----
-    with tab_pricing:
-        # Big hero pricing card
-        hero_html = _flat_html(
-            "<div style='background:linear-gradient(135deg,#1a2150 0%,#232c5e 100%);"
-            "padding:36px 32px;border-radius:14px;color:white;"
-            "box-shadow:0 4px 14px rgba(26,33,80,0.15);text-align:center;'>"
-            "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
-            "color:#d4a634;text-transform:uppercase;margin-bottom:10px;'>"
-            "Simple, Honest Pricing</div>"
-            "<div style='font-size:64px;font-weight:800;line-height:1;margin-bottom:6px;'>"
-            "$49<span style='font-size:22px;font-weight:500;'> / month</span></div>"
-            "<div style='font-size:14px;color:#d4a634;font-weight:600;margin-bottom:14px;'>"
-            "Flat fee · Unlimited pitchers · All features · Cancel anytime</div>"
-            "<div style='display:inline-block;background:rgba(22,163,74,0.20);"
-            "color:#86efac;padding:8px 18px;border-radius:20px;font-weight:700;"
-            "font-size:13px;letter-spacing:0.04em;'>"
-            "🟢 30-DAY FREE TRIAL · NO CONTRACT · NO CARD UPFRONT</div>"
-            "</div>"
-        )
-        st.markdown(hero_html, unsafe_allow_html=True)
-
-        st.write("")  # spacer
-
-        # CTAs
-        cta_a, cta_b, cta_c = st.columns(3)
-        with cta_a:
-            st.link_button(
-                "Start 30-day Free Trial →",
-                url="mailto:kolbydonnell@gmail.com?subject=Diamond%20Sports%20Lab%20Trial",
-                use_container_width=True,
-                type="primary",
-            )
-        with cta_b:
-            try:
-                sell_pdf = generate_sell_sheet_pdf()
-                st.download_button(
-                    "📄 Download Sell Sheet PDF",
-                    data=sell_pdf,
-                    file_name="Diamond_Sports_Lab_Sell_Sheet.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.warning(f"Sell sheet generation issue: {e}")
-        with cta_c:
-            st.link_button(
-                "💬 Schedule a 15-min Demo",
-                url="mailto:kolbydonnell@gmail.com?subject=Diamond%20Sports%20Lab%20Demo",
-                use_container_width=True,
-            )
-
-        st.divider()
-
-        # What's included
-        st.subheader("Everything's included — no feature gates")
-        wi1, wi2 = st.columns(2)
-        with wi1:
-            st.markdown(_flat_html(
-                "<div style='background:#f0fdf4;border:1px solid #bbf7d0;"
-                "border-left:4px solid #16a34a;border-radius:8px;padding:16px 18px;'>"
-                "<div style='font-weight:700;color:#15803d;font-size:14px;margin-bottom:8px;'>"
-                "✓ Core analytics</div>"
-                "<div style='font-size:13px;color:#1f2937;line-height:1.8;'>"
-                "• Multi-pitcher roster + history<br/>"
-                "• Auto-saved sessions with rolling baselines<br/>"
-                "• Self-healing data alignment across 3 hardware vendors<br/>"
-                "• Strike-zone scatter with outlier detection<br/>"
-                "• Per-pitch detail panel with biomechanics<br/>"
-                "• Side-by-side pitch comparison<br/>"
-                "</div></div>"
-            ), unsafe_allow_html=True)
-        with wi2:
-            st.markdown(_flat_html(
-                "<div style='background:#fefce8;border:1px solid #fde68a;"
-                "border-left:4px solid #d4a634;border-radius:8px;padding:16px 18px;'>"
-                "<div style='font-weight:700;color:#92400e;font-size:14px;margin-bottom:8px;'>"
-                "✓ Coach + parent workflow</div>"
-                "<div style='font-size:13px;color:#1f2937;line-height:1.8;'>"
-                "• One-click branded PDF post-bullpen report<br/>"
-                "• Mechanics critique with strengths + corrective drills<br/>"
-                "• Today + Week action plan with grip diagrams<br/>"
-                "• Plain-English glossary for parents<br/>"
-                "• Bullpen video upload + slow-motion playback<br/>"
-                "• Trend charts across the season<br/>"
-                "</div></div>"
-            ), unsafe_allow_html=True)
-
-        st.divider()
-
-        # Comparison table
-        st.subheader("How Diamond Sports Lab compares")
-        st.caption("Honest comparison vs the alternatives most coaches consider.")
-
-        compare_html = _flat_html(
-            "<table style='width:100%;border-collapse:collapse;border:1px solid #e5e7eb;"
-            "border-radius:8px;overflow:hidden;font-size:13px;'>"
-            "<thead><tr style='background:#1a2150;color:white;'>"
-            "<th style='padding:12px;text-align:left;'>What you get</th>"
-            "<th style='padding:12px;text-align:center;'>Diamond Sports Lab</th>"
-            "<th style='padding:12px;text-align:center;'>Rapsodo PRO</th>"
-            "<th style='padding:12px;text-align:center;'>TrackMan B1</th>"
-            "<th style='padding:12px;text-align:center;'>Mustard.com</th>"
-            "</tr></thead>"
-            "<tbody style='background:white;'>"
-            "<tr><td style='padding:10px 12px;font-weight:600;'>Software / month</td>"
-            "<td style='text-align:center;font-weight:700;color:#16a34a;'>$49</td>"
-            "<td style='text-align:center;'>$499</td>"
-            "<td style='text-align:center;'>$160+</td>"
-            "<td style='text-align:center;'>$10</td></tr>"
-            "<tr style='background:#f6f7fb;'><td style='padding:10px 12px;font-weight:600;'>Hardware upfront</td>"
-            "<td style='text-align:center;font-weight:700;color:#16a34a;'>$610</td>"
-            "<td style='text-align:center;'>$3,000+</td>"
-            "<td style='text-align:center;'>$30,000+</td>"
-            "<td style='text-align:center;'>Phone only</td></tr>"
-            "<tr><td style='padding:10px 12px;font-weight:600;'>Ball-flight data</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td></tr>"
-            "<tr style='background:#f6f7fb;'><td style='padding:10px 12px;font-weight:600;'>Arm-health / elbow stress</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td></tr>"
-            "<tr><td style='padding:10px 12px;font-weight:600;'>3D biomechanics</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td></tr>"
-            "<tr style='background:#f6f7fb;'><td style='padding:10px 12px;font-weight:600;'>Branded parent PDF</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td></tr>"
-            "<tr><td style='padding:10px 12px;font-weight:600;'>Portable to any field</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td>"
-            "<td style='text-align:center;color:#dc2626;'>—</td>"
-            "<td style='text-align:center;color:#16a34a;'>✓</td></tr>"
-            "</tbody></table>"
-        )
-        st.markdown(compare_html, unsafe_allow_html=True)
-        st.caption(
-            "Pricing as of May 2026. Rapsodo and TrackMan also require an annual "
-            "software subscription on top of hardware. Diamond Sports Lab works alongside "
-            "an existing Rapsodo if you have one — drop the Rapsodo CSV in directly."
-        )
-
-        st.divider()
-
-        # FAQ
-        st.subheader("Frequently asked")
-        with st.expander("What happens after the 30-day trial?", expanded=False):
-            st.markdown(
-                "If you don't pay, the app stops generating new reports — but your historical "
-                "data is yours forever and can be exported as CSVs. No data lock-in."
-            )
-        with st.expander("Do I need to buy the hardware to use this?", expanded=False):
-            st.markdown(
-                "If you already have a Rapsodo or TrackMan, you can use those instead — drop "
-                "the CSV exports directly in. The hardware stack is recommended for new "
-                "facilities; existing data sources work alongside it."
-            )
-        with st.expander("Can I cancel anytime?", expanded=False):
-            st.markdown(
-                "Yes. Month-to-month. No contracts, no cancellation fees. "
-                "Annual prepay gets you ~2 months free if you want to lock in."
-            )
-        with st.expander("Do you have a free tier?", expanded=False):
-            st.markdown(
-                "Not yet. The 30-day free trial covers everyone. If you want a longer "
-                "trial because of season scheduling (e.g., 'I want to try this in spring "
-                "training when our pitchers are throwing 3× a week'), reach out — we'll "
-                "extend it for legitimate reasons."
-            )
-        with st.expander("Can a single pitcher / parent use this without a coach?", expanded=False):
-            st.markdown(
-                "Yes — the app works just as well for an individual pitcher tracking their "
-                "own development for college recruiting. A separate 'Solo' tier may launch "
-                "at $19/mo for 1 pitcher in the future; for now the $49 plan covers it."
-            )
-
 
 def _safe_main():
     """Run main() with a friendly error card if anything goes wrong.
