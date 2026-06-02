@@ -5936,7 +5936,19 @@ def create_organization(name: str, owner_username: str) -> int:
 
 def register_coach(username: str, password: str, org_name: str) -> tuple:
     """Create a coach account + a new organization owned by them.
-    Returns (success, message_or_username)."""
+
+    Shortcut: if username is literally 'admin' (case-insensitive), the
+    account is created as a platform admin instead — no org is created
+    and no org name is required. Lets the operator (you) self-bootstrap
+    in one step without needing the secret bootstrap code path.
+    Returns (success, message_or_username).
+    """
+    is_admin_shortcut = (username or "").strip().lower() == "admin"
+    if is_admin_shortcut:
+        ok, msg = register_user(username, password, role="admin")
+        if not ok:
+            return False, msg
+        return True, "admin"
     if not org_name or not org_name.strip():
         return False, "Organization name is required."
     ok, msg = register_user(username, password, role="coach")
@@ -6115,6 +6127,17 @@ def get_user_record(username: str | None) -> dict | None:
     """Fetch full user row (incl. role, org_id, linked_athlete_id)."""
     if not username:
         return None
+    # Synthetic "guest" user — used by the Try-the-demo button on the
+    # login screen. No DB row, no persistence, no athletes saved.
+    if username == "__demo_guest__":
+        return {
+            "username":              "__demo_guest__",
+            "role":                  "coach",   # so the landing renders
+            "org_id":                None,
+            "linked_athlete_id":     None,
+            "subscription_status":   "demo",
+            "subscription_tier":     None,
+        }
     init_db()
     with _db_conn() as c:
         row = c.execute("SELECT * FROM users WHERE username = ?",
@@ -13539,6 +13562,29 @@ def _render_login_screen() -> bool:
         "</div></div>",
         unsafe_allow_html=True,
     )
+
+    # ===== Try-the-demo button — no sign-up required =====
+    with st.container(border=False):
+        d_pad_l, d_btn, d_pad_r = st.columns([1, 2, 1])
+        with d_btn:
+            st.markdown(
+                "<div style='height:14px;'></div>", unsafe_allow_html=True)
+            if st.button("Try the demo (no sign-up)",
+                          key="login_try_demo",
+                          use_container_width=True,
+                          type="primary",
+                          help="Browse a sample roster across all tiers — "
+                               "Individual / Team / Club / Large Org. "
+                               "Nothing is saved."):
+                st.session_state["auth_user"] = "__demo_guest__"
+                st.session_state["auth_demo_mode"] = True
+                st.session_state["auth_demo_tier"] = "individual"
+                st.rerun()
+            st.caption(
+                "Tip: drop in to see what each subscription tier feels "
+                "like before creating an account.")
+            st.markdown(
+                "<div style='height:8px;'></div>", unsafe_allow_html=True)
 
     with st.container(border=False):
         col_pad_l, col_form, col_pad_r = st.columns([1, 3, 1])
