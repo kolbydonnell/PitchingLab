@@ -3557,11 +3557,12 @@ def _build_tunnel_batter_view(tunnel_data: dict, sport: str = "Baseball",
     fig.update_layout(
         title=dict(text=title, font=dict(size=13, color="#1a2150")),
         xaxis=dict(title=x_title, range=(-2.0, 2.0),
-                    zeroline=False, showgrid=False),
+                    zeroline=False, showgrid=False,
+                    fixedrange=True, autorange=False),
         # Range now reaches 7.5 ft so the release point (z≈6) is visible
         yaxis=dict(title="Height (ft)", range=(-0.5, 7.5),
                     zeroline=False, showgrid=False,
-                    scaleanchor="x", scaleratio=1),
+                    fixedrange=True, autorange=False),
         height=560, plot_bgcolor="white",
         margin=dict(l=20, r=20, t=50, b=40),
         dragmode=False,
@@ -3792,10 +3793,11 @@ def _build_tunnel_pitcher_view(tunnel_data: dict, sport: str = "Baseball") -> "g
         title=dict(text="Pitcher POV — looking down at the catcher's mitt",
                     font=dict(size=13, color="#1a2150")),
         xaxis=dict(range=(-8, 8), zeroline=False, showgrid=False,
-                    showticklabels=False, showline=False),
+                    showticklabels=False, showline=False,
+                    fixedrange=True, autorange=False),
         yaxis=dict(range=(-8, 6), zeroline=False, showgrid=False,
                     showticklabels=False, showline=False,
-                    scaleanchor="x", scaleratio=1),
+                    fixedrange=True, autorange=False),
         height=560, plot_bgcolor="#dbeafe",
         margin=dict(l=20, r=20, t=50, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
@@ -7272,12 +7274,18 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
             name=ptype,
         ))
 
+    # NOTE: no scaleanchor — at 900×550 chart dimensions, locking the
+    # y/x pixel ratio to 1:1 forces Plotly to extend the visible range
+    # to ±10 ft on both axes (because the chart pixels aren't square).
+    # Letting each axis honor its explicit `range` independently keeps
+    # the data tight in the strike-zone area on every device.
     fig.update_layout(
         xaxis=dict(title="Plate Side (ft) — catcher's view",
-                   range=SZ_PLOT_X_RANGE, zeroline=False, showgrid=False),
+                   range=SZ_PLOT_X_RANGE, zeroline=False, showgrid=False,
+                   fixedrange=True, autorange=False),
         yaxis=dict(title="Height (ft)",
                    range=SZ_PLOT_Z_RANGE, zeroline=False, showgrid=False,
-                   scaleanchor="x", scaleratio=1),
+                   fixedrange=True, autorange=False),
         height=550,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=20, r=20, t=40, b=40),
@@ -9516,10 +9524,11 @@ def _build_hit_quality_zone_heatmap_figure(
             x=0.5, xanchor="center", y=0.97,
         ),
         xaxis=dict(title="Plate Side (ft) — catcher's view", range=(-1.5, 1.5),
-                    zeroline=False, showgrid=False),
+                    zeroline=False, showgrid=False,
+                    fixedrange=True, autorange=False),
         yaxis=dict(title="Height (ft)", range=(0.5, 4.5),
                     zeroline=False, showgrid=False,
-                    scaleanchor="x", scaleratio=1),
+                    fixedrange=True, autorange=False),
         height=800,
         legend=dict(orientation="h", yanchor="bottom", y=1.04),
         margin=dict(l=20, r=20, t=60, b=40),
@@ -9591,12 +9600,14 @@ def _build_hit_quality_zone_figure(df: pd.DataFrame) -> "go.Figure":
             name=outcome.replace("_", " ").title(),
         ))
 
+    # No scaleanchor — see note in _build_strike_zone_figure.
     fig.update_layout(
         xaxis=dict(title="Plate Side (ft)", range=SZ_PLOT_X_RANGE,
-                    zeroline=False, showgrid=False),
+                    zeroline=False, showgrid=False,
+                    fixedrange=True, autorange=False),
         yaxis=dict(title="Height (ft)", range=SZ_PLOT_Z_RANGE,
                     zeroline=False, showgrid=False,
-                    scaleanchor="x", scaleratio=1),
+                    fixedrange=True, autorange=False),
         height=560,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=20, r=20, t=40, b=40),
@@ -15473,80 +15484,11 @@ def main():
             st.session_state["show_plans_page"] = True
             st.rerun()
 
-        # ===== TEMP: always-on chart-sizing diagnostic =====
-        # No button gating — renders the diagnostic right here in the
-        # sidebar so it's visible the moment the user opens the menu,
-        # regardless of click/event quirks. Remove this entire block once
-        # the iOS rotation bug is resolved.
-        st.divider()
-        st.markdown(
-            "<div style='font-size:10px;letter-spacing:0.10em;font-weight:700;"
-            "color:#ef4444;text-transform:uppercase;'>"
-            "Debug: chart sizes</div>",
-            unsafe_allow_html=True)
-        import streamlit.components.v1 as _components_v1
-        _components_v1.html("""
-        <div id="chart-diag-box"
-             style="background:#0f172a;color:#22c55e;
-                    border:2px solid #22c55e;border-radius:6px;
-                    padding:10px 12px;margin:6px 0;
-                    font-family:'JetBrains Mono',Menlo,monospace;
-                    font-size:11px;line-height:1.5;
-                    white-space:pre-wrap;word-break:break-word;
-                    min-height:240px;">
-        Loading...
-        </div>
-        <script>
-        (function(){
-            function snapshot() {
-                const box = document.getElementById('chart-diag-box');
-                if (!box) return;
-                const parent = window.parent;
-                const lines = [];
-                try {
-                    lines.push('OK ' + new Date().toISOString().slice(11,19));
-                    lines.push('VIEWPORT: ' + parent.innerWidth + 'x' + parent.innerHeight);
-                    lines.push('DPR: ' + parent.devicePixelRatio);
-                    if (parent.visualViewport) {
-                        lines.push('VISUAL: ' + Math.round(parent.visualViewport.width) + 'x' + Math.round(parent.visualViewport.height));
-                    }
-                    const doc = parent.document;
-                    const img = doc.querySelector('.stImage img, [data-testid="stImage"] img');
-                    if (!img) {
-                        lines.push('');
-                        lines.push('NO CHART ON PAGE');
-                        lines.push('Open Overview tab');
-                    } else {
-                        lines.push('');
-                        lines.push('IMG: ' + img.offsetWidth + 'x' + img.offsetHeight);
-                        lines.push('NAT: ' + img.naturalWidth + 'x' + img.naturalHeight);
-                        lines.push('COMP w: ' + parent.getComputedStyle(img).width);
-                        lines.push('');
-                        lines.push('PARENT CHAIN:');
-                        let el = img.parentElement;
-                        let depth = 0;
-                        while (el && el !== doc.body && depth < 10) {
-                            const tid = el.getAttribute && el.getAttribute('data-testid');
-                            const tag = tid ? '[' + tid + ']' : el.tagName;
-                            lines.push(depth + ': ' + tag + ' w=' + el.offsetWidth);
-                            el = el.parentElement;
-                            depth++;
-                        }
-                    }
-                } catch(err) {
-                    lines.push('ERROR: ' + err.message);
-                }
-                box.textContent = lines.join('\\n');
-            }
-            snapshot();
-            const parent = window.parent;
-            parent.addEventListener('orientationchange',
-                () => setTimeout(snapshot, 350));
-            parent.addEventListener('resize', snapshot);
-            setInterval(snapshot, 1000);
-        })();
-        </script>
-        """, height=300, scrolling=False)
+        # (Chart diagnostic removed — the real bug was scaleanchor=x in
+        # the strike-zone / tunneling / heat-map figures forcing Plotly
+        # to extend axis ranges to keep 1:1 pixel scaling on non-square
+        # canvases. See the "no scaleanchor" notes in the affected
+        # figure builders.)
 
         # ===== Account footer (role-aware) =====
         st.divider()
