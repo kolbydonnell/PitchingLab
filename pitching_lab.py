@@ -9337,23 +9337,24 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
 
     # Layout: dark navy-ish background so the green field stands out, no axes.
     plot_range = max(fd["of_wall_lf_rf"], fd["of_wall_cf"]) * 1.10
-    # NOTE: no scaleanchor — locking 1:1 pixel ratio forces Plotly to
-    # extend the axes way past the field data, leaving the field
-    # squashed in the middle of the chart. Dropping it means the field
-    # outline gets slightly vertically stretched, but every spray dot
-    # and the OF wall arc fills the chart and is way easier to read on
-    # a phone. Worth the tiny geometric trade.
+    # scaleanchor back ON so the field stays geometrically correct
+    # (OF wall stays as a circular arc, dirt circle stays round). The
+    # original problem was a canvas way taller than the field, which
+    # forced Plotly to pad the field with empty space. Solution: keep
+    # scaleanchor BUT render at native dimensions close to the field's
+    # natural aspect (~1.8:1 wide). The call site passes width_px=900
+    # height_px=560 (1.6:1) — close enough that the padding is small
+    # and the field fills most of the chart without distortion.
     fig.update_layout(
         xaxis=dict(title="", range=[-plot_range, plot_range],
-                    showgrid=False, zeroline=False, visible=False,
-                    fixedrange=True, autorange=False),
+                    showgrid=False, zeroline=False, visible=False),
         yaxis=dict(title="", range=[-30, plot_range + 20],
-                    showgrid=False, zeroline=False, visible=False,
-                    fixedrange=True, autorange=False),
+                    scaleanchor="x", scaleratio=1,
+                    showgrid=False, zeroline=False, visible=False),
         plot_bgcolor="#0f172a",  # dark blue-gray "stadium" background
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=900,
+        height=560,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9831,11 +9832,13 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            # height_px=900 + no scaleanchor means the field fills the
-            # whole chart vertically instead of being padded with empty
-            # space above and below — way bigger on phone.
+            # Render at a wider native aspect (~1.6:1) so the field
+            # naturally fills the chart with scaleanchor on — no padding
+            # waste, no vertical distortion. The end result on phone is
+            # a tasteful, properly-proportioned field that's bigger
+            # than the original layout's empty-padded version.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  height_px=900)
+                                  width_px=900, height_px=560)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
