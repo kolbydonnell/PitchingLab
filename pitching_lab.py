@@ -14912,6 +14912,61 @@ def main():
         )
         st.divider()
 
+        # ===== PERSISTENT NAVIGATION =====
+        # Always-visible "Home" gets the user back to the landing screen
+        # (or back to login if they signed in as a guest). Means no screen
+        # in the app feels like a dead end.
+        _nav_rec = current_user_record() or {}
+        _nav_role = _nav_rec.get("role", "coach")
+        if _nav_role == "admin":
+            _home_label = "Admin panel"
+        elif _nav_role == "athlete":
+            _home_label = "My profile"
+        elif current_username() == "__demo_guest__":
+            _home_label = "Demo home"
+        else:
+            _home_label = "Home"
+        if st.button(_home_label, key="sidebar_home_btn",
+                      use_container_width=True,
+                      help="Back to the home screen — you're never stuck."):
+            st.session_state.pop("show_plans_page", None)
+            st.session_state.pop("show_billing_modal", None)
+            if _nav_role == "admin":
+                st.session_state.pop("admin_impersonating", None)
+            # For non-athlete roles, also drop the selected athlete so
+            # render_login_or_landing sends them to the landing picker.
+            if _nav_role != "athlete":
+                st.session_state.pop("selected_athlete_id", None)
+            st.rerun()
+
+        # ===== Demo tier switcher (always visible while in demo mode) =====
+        if is_demo_mode_active():
+            cur_tier_sb = st.session_state.get("auth_demo_tier", "individual")
+            tier_pick_sb = st.selectbox(
+                "Demo tier",
+                list(DEMO_TIERS.keys()),
+                format_func=lambda k: DEMO_TIERS[k]["label"],
+                index=list(DEMO_TIERS.keys()).index(cur_tier_sb)
+                       if cur_tier_sb in DEMO_TIERS else 0,
+                key="sidebar_demo_tier",
+                help="Flip between tiers to see what Individual, Team, "
+                     "Club, and Large Org rosters look like.")
+            if tier_pick_sb != cur_tier_sb:
+                st.session_state["auth_demo_tier"] = tier_pick_sb
+                _seed_demo_tier(tier_pick_sb)
+                # When tier changes, drop the selected athlete so the
+                # landing reshuffles to the new tier's roster.
+                st.session_state.pop("selected_athlete_id", None)
+                st.session_state.pop("selected_athlete_label", None)
+                st.rerun()
+            if st.button("Turn demo off", key="sidebar_demo_off",
+                          use_container_width=True):
+                st.session_state["auth_demo_mode"] = False
+                st.session_state.pop("selected_athlete_id", None)
+                st.session_state.pop("selected_athlete_label", None)
+                st.rerun()
+        st.divider()
+
         # ===== MODE SWITCH — Pitching / Hitting =====
         # Determines which lab the rest of the app shows. Persisted across reruns.
         app_mode = st.radio(
@@ -15263,8 +15318,9 @@ def main():
                 if st.button("Switch athlete",
                               key="sidebar_switch_athlete",
                               use_container_width=True,
-                              help="Back to the landing screen to pick or "
-                                   "create a different athlete."):
+                              help="Same as Home — back to the landing "
+                                   "screen to pick or create a different "
+                                   "athlete."):
                     st.session_state.pop("selected_athlete_id", None)
                     st.rerun()
             with acct_r:
