@@ -9337,16 +9337,23 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
 
     # Layout: dark navy-ish background so the green field stands out, no axes.
     plot_range = max(fd["of_wall_lf_rf"], fd["of_wall_cf"]) * 1.10
+    # NOTE: no scaleanchor — locking 1:1 pixel ratio forces Plotly to
+    # extend the axes way past the field data, leaving the field
+    # squashed in the middle of the chart. Dropping it means the field
+    # outline gets slightly vertically stretched, but every spray dot
+    # and the OF wall arc fills the chart and is way easier to read on
+    # a phone. Worth the tiny geometric trade.
     fig.update_layout(
         xaxis=dict(title="", range=[-plot_range, plot_range],
-                    showgrid=False, zeroline=False, visible=False),
+                    showgrid=False, zeroline=False, visible=False,
+                    fixedrange=True, autorange=False),
         yaxis=dict(title="", range=[-30, plot_range + 20],
-                    scaleanchor="x", scaleratio=1,
-                    showgrid=False, zeroline=False, visible=False),
+                    showgrid=False, zeroline=False, visible=False,
+                    fixedrange=True, autorange=False),
         plot_bgcolor="#0f172a",  # dark blue-gray "stadium" background
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=760,
+        height=900,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9824,8 +9831,11 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
+            # height_px=900 + no scaleanchor means the field fills the
+            # whole chart vertically instead of being padded with empty
+            # space above and below — way bigger on phone.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  height_px=620)
+                                  height_px=900)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
