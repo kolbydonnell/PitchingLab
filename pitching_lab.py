@@ -13584,35 +13584,13 @@ def _render_login_screen() -> bool:
       - Athlete (Invite Code) → joins a coach's org via per-athlete code
     """
     _render_brand_header()
-
-    # ===== Value-prop panel — what is this product? =====
     st.markdown(
-        "<div style='max-width:680px;margin:18px auto 8px auto;"
-        "background:#1e293b;border:1px solid #334155;border-radius:14px;"
-        "padding:22px 28px;'>"
-        "<div style='font-size:11px;letter-spacing:0.14em;font-weight:700;"
-        "color:#d4a634;text-transform:uppercase;margin-bottom:10px;'>"
-        "Diamond Sports Lab</div>"
-        "<div style='color:#f1f5f9;font-size:17px;line-height:1.5;"
-        "font-weight:600;margin-bottom:10px;'>"
-        "Bullpen + batting-cage analytics for the modern coach — no "
-        "$1,000 device required.</div>"
-        "<div style='color:#cbd5e1;font-size:13px;line-height:1.7;'>"
-        "Film a session with your phone. The app tracks velocity, break, "
-        "spin, exit velocity, launch angle, and pose biomech from the "
-        "video alone. Get a full bullpen / post-swing report with "
-        "drill-level coaching cues in 60 seconds."
-        "</div>"
-        "<div style='display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;"
-        "padding-top:14px;border-top:1px solid #334155;'>"
-        "<div style='font-size:12px;color:#94a3b8;'>"
-        "<b style='color:#22c55e;'>Baseball</b> + Softball</div>"
-        "<div style='font-size:12px;color:#94a3b8;'>"
-        "<b style='color:#22c55e;'>Pitching</b> + Hitting</div>"
-        "<div style='font-size:12px;color:#94a3b8;'>"
-        "<b style='color:#22c55e;'>Individual</b> + Team + Org plans</div>"
-        "</div>"
-        "</div>",
+        "<div style='max-width:520px;margin:14px auto 0 auto;'>"
+        "<div style='color:#94a3b8;font-size:14px;text-align:center;line-height:1.6;'>"
+        "Sign in to your account, or create one if it's your first time. "
+        "Coaches manage an organization. Players can register on their own "
+        "or join a coach's org with an invite code."
+        "</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -13620,6 +13598,8 @@ def _render_login_screen() -> bool:
     with st.container(border=False):
         d_pad_l, d_btn, d_pad_r = st.columns([1, 2, 1])
         with d_btn:
+            st.markdown(
+                "<div style='height:14px;'></div>", unsafe_allow_html=True)
             if st.button("Try the demo (no sign-up)",
                           key="login_try_demo",
                           use_container_width=True,
@@ -13631,20 +13611,16 @@ def _render_login_screen() -> bool:
                 st.session_state["auth_demo_mode"] = True
                 st.session_state["auth_demo_tier"] = "individual"
                 st.rerun()
-            st.caption(
-                "See exactly what each subscription tier looks like "
-                "before creating an account.")
+            with st.expander("What's in the demo?", expanded=False):
+                st.markdown(
+                    "Browse a realistic sample roster at any subscription "
+                    "tier — Individual (1 athlete), Single Team (12), "
+                    "Club (24 across age groups), or Large Org (33 across "
+                    "Varsity / JV / Freshman). Click any athlete to see "
+                    "their full bullpen or post-swing report. Nothing is "
+                    "saved, no card required.")
             st.markdown(
-                "<div style='height:6px;'></div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div style='max-width:520px;margin:14px auto 0 auto;'>"
-        "<div style='color:#94a3b8;font-size:14px;text-align:center;line-height:1.6;'>"
-        "Or sign in if you already have an account. New coaches manage "
-        "an organization · new players can register on their own or "
-        "join a coach's org with an invite code."
-        "</div></div>",
-        unsafe_allow_html=True,
-    )
+                "<div style='height:8px;'></div>", unsafe_allow_html=True)
 
     with st.container(border=False):
         col_pad_l, col_form, col_pad_r = st.columns([1, 3, 1])
