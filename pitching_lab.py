@@ -14863,53 +14863,98 @@ def main():
 
         <script>
         /* =========================================================
-           CHART WHEEL PASS-THROUGH
+           CHART WHEEL PASS-THROUGH (v2)
            ---------------------------------------------------------
-           Chart and image containers steal the mouse wheel event,
-           which means the page stops scrolling the moment the
-           cursor enters a chart. We intercept wheel events on those
-           containers and manually scroll the page by the same delta,
-           so the user can scroll past any chart naturally.
+           Chart, image, and component-iframe containers steal mouse
+           wheel events, freezing page scroll. We capture wheel events
+           globally (in the capture phase so we fire before charts
+           react) and forward them to the actual scrollable container.
+
+           Streamlit Cloud's scrollable container isn't window — it's
+           usually <section.main> or a stAppViewContainer div. We
+           walk from the body to find which ancestor actually has
+           overflow scroll and is taller than its viewport.
            ========================================================= */
         (function() {
-            const CHART_SELECTORS = [
-                '.stImage',
-                '[data-testid="stImage"]',
-                '.stPlotlyChart',
-                '.js-plotly-plot',
-                '.plot-container',
-                '.svg-container',
-                'iframe[title*="streamlit_image_coordinates"]',
-            ];
-            function passWheelThrough(el) {
-                if (el._wheelPassThrough) return;
-                el._wheelPassThrough = true;
-                el.addEventListener('wheel', function(e) {
-                    // Forward the wheel to the page scroller
-                    const dy = e.deltaY;
-                    const dx = e.deltaX;
-                    if (dy || dx) {
-                        window.scrollBy({ top: dy, left: dx,
-                                            behavior: 'auto' });
+            let scroller = null;
+            function findScroller() {
+                if (scroller && document.body.contains(scroller)) {
+                    return scroller;
+                }
+                const candidates = [
+                    document.querySelector('[data-testid="stAppViewContainer"]'),
+                    document.querySelector('section.main'),
+                    document.querySelector('div.main'),
+                    document.querySelector('.main'),
+                    document.scrollingElement,
+                    document.documentElement,
+                    document.body,
+                ];
+                for (const el of candidates) {
+                    if (!el) continue;
+                    const style = window.getComputedStyle(el);
+                    const canScroll = (style.overflowY === 'auto' ||
+                                          style.overflowY === 'scroll');
+                    if (canScroll && el.scrollHeight > el.clientHeight + 1) {
+                        scroller = el;
+                        return el;
                     }
-                    e.preventDefault();
-                    e.stopPropagation();
-                }, { passive: false, capture: true });
+                }
+                // Fallback: whichever candidate has the largest content overflow
+                let best = null, bestDiff = 0;
+                for (const el of candidates) {
+                    if (!el) continue;
+                    const diff = el.scrollHeight - el.clientHeight;
+                    if (diff > bestDiff) {
+                        bestDiff = diff;
+                        best = el;
+                    }
+                }
+                scroller = best;
+                return best;
             }
-            function scanAndWire() {
-                CHART_SELECTORS.forEach(sel => {
-                    document.querySelectorAll(sel).forEach(passWheelThrough);
-                });
+            function isChartTarget(el) {
+                if (!el) return false;
+                // Walk up to find a chart/image/iframe container
+                let cur = el;
+                while (cur && cur !== document.body) {
+                    if (cur.classList) {
+                        if (cur.classList.contains('stImage') ||
+                            cur.classList.contains('stPlotlyChart') ||
+                            cur.classList.contains('js-plotly-plot') ||
+                            cur.classList.contains('plot-container') ||
+                            cur.classList.contains('svg-container')) {
+                            return true;
+                        }
+                    }
+                    if (cur.tagName === 'IMG' || cur.tagName === 'IFRAME' ||
+                        cur.tagName === 'SVG') {
+                        return true;
+                    }
+                    if (cur.getAttribute && (
+                        cur.getAttribute('data-testid') === 'stImage' ||
+                        cur.getAttribute('data-testid') === 'stPlotlyChart')) {
+                        return true;
+                    }
+                    cur = cur.parentElement;
+                }
+                return false;
             }
-            // Run now + every second to catch lazily-rendered charts after
-            // Streamlit reruns / tab switches.
-            scanAndWire();
-            setInterval(scanAndWire, 1000);
-            // Also wire newly-added DOM nodes via MutationObserver
-            try {
-                const mo = new MutationObserver(scanAndWire);
-                mo.observe(document.body, { childList: true, subtree: true });
-            } catch(e) {}
+            function onWheel(e) {
+                if (!isChartTarget(e.target)) return;
+                const sc = findScroller();
+                if (!sc) return;
+                sc.scrollTop += e.deltaY;
+                sc.scrollLeft += e.deltaX;
+                e.preventDefault();
+                e.stopPropagation();
+            }
+            // Capture phase = fire before chart libraries see it
+            document.addEventListener('wheel', onWheel,
+                                          { passive: false, capture: true });
+            // Re-evaluate the scroller every few seconds in case Streamlit
+            // re-mounts its view container after a rerun.
+            setInterval(() => { scroller = null; findScroller(); }, 3000);
         })();
         </script>
         """,
