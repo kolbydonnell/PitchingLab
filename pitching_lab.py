@@ -14860,6 +14860,58 @@ def main():
             });
         })();
         </script>
+
+        <script>
+        /* =========================================================
+           CHART WHEEL PASS-THROUGH
+           ---------------------------------------------------------
+           Chart and image containers steal the mouse wheel event,
+           which means the page stops scrolling the moment the
+           cursor enters a chart. We intercept wheel events on those
+           containers and manually scroll the page by the same delta,
+           so the user can scroll past any chart naturally.
+           ========================================================= */
+        (function() {
+            const CHART_SELECTORS = [
+                '.stImage',
+                '[data-testid="stImage"]',
+                '.stPlotlyChart',
+                '.js-plotly-plot',
+                '.plot-container',
+                '.svg-container',
+                'iframe[title*="streamlit_image_coordinates"]',
+            ];
+            function passWheelThrough(el) {
+                if (el._wheelPassThrough) return;
+                el._wheelPassThrough = true;
+                el.addEventListener('wheel', function(e) {
+                    // Forward the wheel to the page scroller
+                    const dy = e.deltaY;
+                    const dx = e.deltaX;
+                    if (dy || dx) {
+                        window.scrollBy({ top: dy, left: dx,
+                                            behavior: 'auto' });
+                    }
+                    e.preventDefault();
+                    e.stopPropagation();
+                }, { passive: false, capture: true });
+            }
+            function scanAndWire() {
+                CHART_SELECTORS.forEach(sel => {
+                    document.querySelectorAll(sel).forEach(passWheelThrough);
+                });
+            }
+            // Run now + every second to catch lazily-rendered charts after
+            // Streamlit reruns / tab switches.
+            scanAndWire();
+            setInterval(scanAndWire, 1000);
+            // Also wire newly-added DOM nodes via MutationObserver
+            try {
+                const mo = new MutationObserver(scanAndWire);
+                mo.observe(document.body, { childList: true, subtree: true });
+            } catch(e) {}
+        })();
+        </script>
         """,
         unsafe_allow_html=True,
     )
