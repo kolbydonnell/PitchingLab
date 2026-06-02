@@ -14884,71 +14884,9 @@ def main():
     if not render_login_or_landing():
         return
 
-    # ===== Chart-sizing diagnostic overlay =====
-    # Shown whenever sidebar 'Diagnose chart sizes' is clicked. Renders a
-    # live-updating box at the top of every screen with viewport + chart
-    # widths so the user can rotate the phone and screenshot the result.
-    if st.session_state.get("show_chart_diag"):
-        st.markdown("""
-        <div id="chart-diag-box"
-             style="position:sticky;top:0;z-index:9999;
-                    background:#0f172a;color:#22c55e;
-                    border:2px solid #22c55e;border-radius:8px;
-                    padding:12px 14px;margin:8px 0 14px 0;
-                    font-family:JetBrains Mono,Menlo,monospace;
-                    font-size:12px;line-height:1.5;
-                    white-space:pre-wrap;word-break:break-all;">
-        Diagnostic loading...
-        </div>
-        <script>
-        (function(){
-            function snapshot() {
-                const box = document.getElementById('chart-diag-box');
-                if (!box) return;
-                const lines = [];
-                lines.push('VIEWPORT: ' + window.innerWidth + ' x ' + window.innerHeight);
-                lines.push('DEVICE PIXEL RATIO: ' + window.devicePixelRatio);
-                if (window.visualViewport) {
-                    lines.push('VISUAL VIEWPORT: ' + Math.round(window.visualViewport.width) + ' x ' + Math.round(window.visualViewport.height));
-                }
-                const img = document.querySelector('.stImage img, [data-testid="stImage"] img');
-                if (!img) {
-                    lines.push('NO CHART IMAGE ON THIS PAGE');
-                    lines.push('Open a page with a chart (Overview tab on any athlete).');
-                } else {
-                    lines.push('IMG NATURAL: ' + img.naturalWidth + ' x ' + img.naturalHeight);
-                    lines.push('IMG DISPLAYED: ' + img.offsetWidth + ' x ' + img.offsetHeight);
-                    lines.push('IMG INLINE STYLE: ' + (img.getAttribute('style') || '(none)').slice(0,120));
-                    lines.push('IMG COMPUTED w: ' + getComputedStyle(img).width);
-                    lines.push('--- PARENT CHAIN ---');
-                    let el = img.parentElement;
-                    let depth = 0;
-                    while (el && el !== document.body && depth < 10) {
-                        const cls = el.className ? '.' + String(el.className).split(/\\s+/).filter(Boolean).slice(0,2).join('.') : '';
-                        const tid = el.getAttribute && el.getAttribute('data-testid');
-                        const tidStr = tid ? '[' + tid + ']' : '';
-                        lines.push(depth + ': ' + el.tagName + cls + tidStr + ' w=' + el.offsetWidth);
-                        el = el.parentElement;
-                        depth++;
-                    }
-                }
-                box.textContent = lines.join('\\n');
-            }
-            snapshot();
-            // Refresh on rotation, resize, and every second so the box
-            // always reflects current state.
-            window.addEventListener('orientationchange', () =>
-                setTimeout(snapshot, 350));
-            window.addEventListener('resize', snapshot);
-            setInterval(snapshot, 1000);
-        })();
-        </script>
-        """, unsafe_allow_html=True)
-        # Also offer an obvious dismiss button right below the box
-        if st.button("Hide diagnostic", key="hide_chart_diag",
-                      use_container_width=True):
-            st.session_state.pop("show_chart_diag", None)
-            st.rerun()
+    # (Chart-sizing diagnostic now lives at the bottom of the sidebar
+    # and renders unconditionally — see the "Debug: chart sizes" block
+    # in the sidebar code. No main-area gate needed.)
 
     # ===== iOS Safari rotation lock =====
     # Streamlit's default viewport meta tag lets iOS recompute scale on
@@ -15535,17 +15473,80 @@ def main():
             st.session_state["show_plans_page"] = True
             st.rerun()
 
-        # ===== TEMP: chart-sizing diagnostic =====
-        # Renders viewport + image + parent-chain widths into a visible
-        # box on-screen so users without a USB cable can debug the iOS
-        # rotation shrinkage by screenshotting. Remove once the rotation
-        # bug is resolved.
-        if st.button("Diagnose chart sizes", key="sidebar_chart_diag_btn",
-                      use_container_width=True,
-                      help="Show viewport and chart widths on-screen so "
-                           "we can debug the iPhone rotation bug."):
-            st.session_state["show_chart_diag"] = True
-            st.rerun()
+        # ===== TEMP: always-on chart-sizing diagnostic =====
+        # No button gating — renders the diagnostic right here in the
+        # sidebar so it's visible the moment the user opens the menu,
+        # regardless of click/event quirks. Remove this entire block once
+        # the iOS rotation bug is resolved.
+        st.divider()
+        st.markdown(
+            "<div style='font-size:10px;letter-spacing:0.10em;font-weight:700;"
+            "color:#ef4444;text-transform:uppercase;'>"
+            "Debug: chart sizes</div>",
+            unsafe_allow_html=True)
+        import streamlit.components.v1 as _components_v1
+        _components_v1.html("""
+        <div id="chart-diag-box"
+             style="background:#0f172a;color:#22c55e;
+                    border:2px solid #22c55e;border-radius:6px;
+                    padding:10px 12px;margin:6px 0;
+                    font-family:'JetBrains Mono',Menlo,monospace;
+                    font-size:11px;line-height:1.5;
+                    white-space:pre-wrap;word-break:break-word;
+                    min-height:240px;">
+        Loading...
+        </div>
+        <script>
+        (function(){
+            function snapshot() {
+                const box = document.getElementById('chart-diag-box');
+                if (!box) return;
+                const parent = window.parent;
+                const lines = [];
+                try {
+                    lines.push('OK ' + new Date().toISOString().slice(11,19));
+                    lines.push('VIEWPORT: ' + parent.innerWidth + 'x' + parent.innerHeight);
+                    lines.push('DPR: ' + parent.devicePixelRatio);
+                    if (parent.visualViewport) {
+                        lines.push('VISUAL: ' + Math.round(parent.visualViewport.width) + 'x' + Math.round(parent.visualViewport.height));
+                    }
+                    const doc = parent.document;
+                    const img = doc.querySelector('.stImage img, [data-testid="stImage"] img');
+                    if (!img) {
+                        lines.push('');
+                        lines.push('NO CHART ON PAGE');
+                        lines.push('Open Overview tab');
+                    } else {
+                        lines.push('');
+                        lines.push('IMG: ' + img.offsetWidth + 'x' + img.offsetHeight);
+                        lines.push('NAT: ' + img.naturalWidth + 'x' + img.naturalHeight);
+                        lines.push('COMP w: ' + parent.getComputedStyle(img).width);
+                        lines.push('');
+                        lines.push('PARENT CHAIN:');
+                        let el = img.parentElement;
+                        let depth = 0;
+                        while (el && el !== doc.body && depth < 10) {
+                            const tid = el.getAttribute && el.getAttribute('data-testid');
+                            const tag = tid ? '[' + tid + ']' : el.tagName;
+                            lines.push(depth + ': ' + tag + ' w=' + el.offsetWidth);
+                            el = el.parentElement;
+                            depth++;
+                        }
+                    }
+                } catch(err) {
+                    lines.push('ERROR: ' + err.message);
+                }
+                box.textContent = lines.join('\\n');
+            }
+            snapshot();
+            const parent = window.parent;
+            parent.addEventListener('orientationchange',
+                () => setTimeout(snapshot, 350));
+            parent.addEventListener('resize', snapshot);
+            setInterval(snapshot, 1000);
+        })();
+        </script>
+        """, height=300, scrolling=False)
 
         # ===== Account footer (role-aware) =====
         st.divider()
