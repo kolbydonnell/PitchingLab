@@ -8360,6 +8360,36 @@ button, input, select, textarea {
     margin-left: 0 !important;
 }
 
+/* ===== Lock down stray horizontal scroll on text/KPI elements =====
+   Subheaders, st.metric cards, markdown blocks, and tab labels should
+   never be horizontally scrollable. If their content is too wide for
+   the viewport, it should wrap or truncate — never produce a side-scroll
+   region that the user can swipe and reposition. */
+[data-testid="stMetric"],
+[data-testid="stMetricLabel"],
+[data-testid="stMetricValue"],
+[data-testid="stMetricDelta"],
+[data-testid="stMarkdown"],
+[data-testid="stMarkdownContainer"],
+[data-testid="stHeader"],
+[data-testid="stHeading"],
+[data-testid="stSubheader"],
+[data-testid="stCaption"],
+[data-testid="stText"],
+[data-testid="stTabs"],
+.stTabs [role="tablist"],
+.stMarkdown,
+.stTabs,
+.stText,
+h1, h2, h3, h4, h5, h6, p, span, div.stMarkdown {
+    overflow-x: hidden !important;
+    overflow-y: visible !important;
+    touch-action: pan-y !important;
+    overscroll-behavior-x: contain !important;
+    word-wrap: break-word !important;
+    word-break: normal;
+}
+
 /* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
    Disable pointer-events on chart images and Plotly chart bodies so
    mouse-wheel events fall through them onto the page scroller.
@@ -9335,16 +9365,14 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
             name=outcome.replace("_", " ").title(),
         ))
 
-    # Layout: aim for the classic baseball-diagram dome look (refs the
-    # user shared — Shutterstock / Net World Sports style).
+    # Layout: classic baseball-diagram dome look — wide foul lines.
     #   - X tight to foul poles (no horizontal navy past them)
     #   - Y from home (0) to CF wall, no padding
-    #   - Canvas aspect ~1.50:1 (900×600). Data is 1.65:1, so this
-    #     gives ~10% vertical stretch — foul lines appear at a slightly
-    #     steeper outward angle (about 49° instead of 45°), which is
-    #     exactly the "fuller, more arc-like" diamond shape every
-    #     baseball illustration uses for visual clarity. Field reads
-    #     as a wide arc, OF wall as a clear dome.
+    #   - Canvas aspect ~1.96:1 (900×460). Data is 1.65:1, so this
+    #     gives ~18% horizontal stretch — foul lines come off home
+    #     plate at ~50° outward (vs the geometric 45°), giving the
+    #     "spread wide" diamond look every baseball illustration uses.
+    #     Bases visibly further apart, OF wall a wide arc.
     plot_range_x = fd["of_wall_lf_rf"] * 1.00
     plot_range_y = fd["of_wall_cf"] * 1.00
     fig.update_layout(
@@ -9357,7 +9385,7 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         plot_bgcolor="#0f172a",
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=600,
+        height=460,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9835,12 +9863,12 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            # 900×600 = 1.50:1 canvas. Field gets a ~10% vertical
-            # stretch which yields the classic baseball-diagram dome
-            # look (foul lines at ~49° outward angle, OF wall as a
-            # wide arc). Slightly bigger overall on phone too.
+            # 900×460 = 1.96:1 canvas → ~18% horizontal stretch →
+            # foul lines spread at ~50° outward angle (vs geometric
+            # 45°). Wider basepaths, dome-shape OF wall — matches the
+            # baseball-illustration style the user is after.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  width_px=900, height_px=600)
+                                  width_px=900, height_px=460)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
