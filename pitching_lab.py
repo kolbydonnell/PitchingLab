@@ -9335,26 +9335,27 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
             name=outcome.replace("_", " ").title(),
         ))
 
-    # Layout: dark navy-ish background so the green field stands out.
-    # NO scaleanchor — at the canvas aspect we render (900×620 ≈ 1.45:1)
-    # vs the actual field data aspect (about 1.48:1 wide), the difference
-    # is under 2%, well below what the eye notices. Removing scaleanchor
-    # lets the field FILL the chart with zero empty padding instead of
-    # being marooned in a sea of navy. fixedrange + autorange=False so
-    # Plotly can't quietly re-expand the ranges.
-    plot_range_x = fd["of_wall_lf_rf"] * 1.08   # just past LF/RF foul pole
-    plot_range_y = fd["of_wall_cf"] * 1.08      # just past CF wall
+    # Layout: maximize field, minimize navy padding.
+    #   - X range tight to the foul poles (1.03 multiplier)
+    #   - Y range starts at 0 (no dead strip below home plate)
+    #   - Y range ends 3% past CF wall (no dead strip above)
+    #   - Canvas aspect (900×540 = 1.67:1) matches the resulting data
+    #     aspect (~1.62:1) within 3% — field fills the chart edge to
+    #     edge with virtually invisible distortion and almost no
+    #     leftover navy space.
+    plot_range_x = fd["of_wall_lf_rf"] * 1.03
+    plot_range_y = fd["of_wall_cf"] * 1.03
     fig.update_layout(
         xaxis=dict(title="", range=[-plot_range_x, plot_range_x],
                     showgrid=False, zeroline=False, visible=False,
                     fixedrange=True, autorange=False),
-        yaxis=dict(title="", range=[-30, plot_range_y + 20],
+        yaxis=dict(title="", range=[0, plot_range_y],
                     showgrid=False, zeroline=False, visible=False,
                     fixedrange=True, autorange=False),
-        plot_bgcolor="#0f172a",  # dark blue-gray "stadium" background
+        plot_bgcolor="#0f172a",
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=620,
+        height=540,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9832,11 +9833,11 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            # Render at native canvas matching the cropped field aspect
-            # (~1.5:1). With scaleanchor on, the field fills the chart
-            # naturally — bigger on phone than before, undistorted.
+            # Native canvas 900×540 = 1.67:1 wide, matching a real
+            # baseball field viewed from above. Field fills chart with
+            # the right "wide and proportional" feel.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  width_px=900, height_px=620)
+                                  width_px=900, height_px=540)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
