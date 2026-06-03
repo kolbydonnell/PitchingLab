@@ -9335,17 +9335,16 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
             name=outcome.replace("_", " ").title(),
         ))
 
-    # Layout: maximize field, minimize navy padding.
-    #   - X range exactly at the foul poles (no padding) → foul lines
-    #     reach the very edge of the chart
-    #   - Y range from home (0) to the CF wall (no padding either end)
-    #   - Canvas aspect bumped to 900×500 = 1.80:1 (slightly wider than
-    #     the field's natural ~1.65:1). The mild horizontal stretch
-    #     makes the basepath wedge ~9% wider on screen, eating the
-    #     foul-territory navy that no fix can avoid at the natural
-    #     geometric angle. Outfield wall arc becomes a very slight
-    #     ellipse (9% wider than tall) — still reads clearly as an
-    #     OF wall.
+    # Layout: aim for the classic baseball-diagram dome look (refs the
+    # user shared — Shutterstock / Net World Sports style).
+    #   - X tight to foul poles (no horizontal navy past them)
+    #   - Y from home (0) to CF wall, no padding
+    #   - Canvas aspect ~1.50:1 (900×600). Data is 1.65:1, so this
+    #     gives ~10% vertical stretch — foul lines appear at a slightly
+    #     steeper outward angle (about 49° instead of 45°), which is
+    #     exactly the "fuller, more arc-like" diamond shape every
+    #     baseball illustration uses for visual clarity. Field reads
+    #     as a wide arc, OF wall as a clear dome.
     plot_range_x = fd["of_wall_lf_rf"] * 1.00
     plot_range_y = fd["of_wall_cf"] * 1.00
     fig.update_layout(
@@ -9358,7 +9357,7 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         plot_bgcolor="#0f172a",
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=500,
+        height=600,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9836,11 +9835,12 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            # 900×500 = 1.80:1 canvas — slightly wider than the field's
-            # natural 1.65:1 so the basepath wedge "fattens up" and eats
-            # the side-navy that's there because foul lines are at 45°.
+            # 900×600 = 1.50:1 canvas. Field gets a ~10% vertical
+            # stretch which yields the classic baseball-diagram dome
+            # look (foul lines at ~49° outward angle, OF wall as a
+            # wide arc). Slightly bigger overall on phone too.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  width_px=900, height_px=500)
+                                  width_px=900, height_px=600)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
