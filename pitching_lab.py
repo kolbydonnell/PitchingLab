@@ -9336,15 +9336,18 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         ))
 
     # Layout: maximize field, minimize navy padding.
-    #   - X range tight to the foul poles (1.03 multiplier)
-    #   - Y range starts at 0 (no dead strip below home plate)
-    #   - Y range ends 3% past CF wall (no dead strip above)
-    #   - Canvas aspect (900×540 = 1.67:1) matches the resulting data
-    #     aspect (~1.62:1) within 3% — field fills the chart edge to
-    #     edge with virtually invisible distortion and almost no
-    #     leftover navy space.
-    plot_range_x = fd["of_wall_lf_rf"] * 1.03
-    plot_range_y = fd["of_wall_cf"] * 1.03
+    #   - X range exactly at the foul poles (no padding) → foul lines
+    #     reach the very edge of the chart
+    #   - Y range from home (0) to the CF wall (no padding either end)
+    #   - Canvas aspect bumped to 900×500 = 1.80:1 (slightly wider than
+    #     the field's natural ~1.65:1). The mild horizontal stretch
+    #     makes the basepath wedge ~9% wider on screen, eating the
+    #     foul-territory navy that no fix can avoid at the natural
+    #     geometric angle. Outfield wall arc becomes a very slight
+    #     ellipse (9% wider than tall) — still reads clearly as an
+    #     OF wall.
+    plot_range_x = fd["of_wall_lf_rf"] * 1.00
+    plot_range_y = fd["of_wall_cf"] * 1.00
     fig.update_layout(
         xaxis=dict(title="", range=[-plot_range_x, plot_range_x],
                     showgrid=False, zeroline=False, visible=False,
@@ -9355,7 +9358,7 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         plot_bgcolor="#0f172a",
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=540,
+        height=500,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9833,11 +9836,11 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            # Native canvas 900×540 = 1.67:1 wide, matching a real
-            # baseball field viewed from above. Field fills chart with
-            # the right "wide and proportional" feel.
+            # 900×500 = 1.80:1 canvas — slightly wider than the field's
+            # natural 1.65:1 so the basepath wedge "fattens up" and eats
+            # the side-navy that's there because foul lines are at 45°.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  width_px=900, height_px=540)
+                                  width_px=900, height_px=500)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
