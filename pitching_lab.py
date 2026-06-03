@@ -9224,7 +9224,12 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
     DIRT_LINE  = "#8a5c2c"
     FOUL_LINE  = "#ffffff"
 
-    base_path_ft = float(fd["base_path_ft"])
+    # Compression boundary set to the DIAMOND DIAGONAL (2nd-base distance
+    # = bp * sqrt(2) ≈ 127 ft for baseball, ≈ 85 ft for softball) so the
+    # entire infield diamond is true-to-scale. Any distance beyond that
+    # (shallow OF and out) gets the 0.55× compression.
+    bp_leg_ft    = float(fd["base_path_ft"])
+    base_path_ft = bp_leg_ft * math.sqrt(2)   # diamond diagonal = boundary
     COMPRESSION  = 0.55
 
     # Pre-compute the COMPRESSED wall distance at each angle so the field
