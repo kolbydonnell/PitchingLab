@@ -9123,27 +9123,60 @@ def _field_dimensions(sport: str) -> dict:
     }
 
 
+def scale_dist(distance_ft: float, base_path_ft: float = 90.0,
+                compression: float = 0.55) -> float:
+    """Compress distances past the infield so the chart shows a readable
+    spray chart instead of a true-to-scale field where the infield looks
+    tiny relative to the outfield.
+
+    Rules:
+      - distance ≤ base_path_ft  → returned 1:1 (infield true to scale)
+      - distance > base_path_ft  → infield_portion + (excess * compression)
+
+    With base_path_ft=90 (MLB) and compression=0.55:
+        90 ft  →  90 ft  (infield boundary, unchanged)
+        200 ft → 150.5 ft (shallow OF gets ~25% closer)
+        300 ft → 205.5 ft
+        400 ft → 260.5 ft (CF wall ~35% closer visually)
+        330 ft (foul pole) → 222 ft
+
+    Effect: infield diamond fills ~2x more chart real estate, the
+    "dead zone" between infield and shallow OF gets compressed, and
+    every dot still lands in the geometrically-correct part of the
+    field outline because the field outline is drawn with the same
+    function applied.
+    """
+    if distance_ft is None:
+        return None
+    if distance_ft <= base_path_ft:
+        return float(distance_ft)
+    return float(base_path_ft + (distance_ft - base_path_ft) * compression)
+
+
 def _spray_landing_xy(spray_angle_deg: float, distance_ft: float,
-                       hand: str = "Right") -> tuple:
-    """Convert (spray_angle, distance) to (x, y) coordinates on the field.
+                       hand: str = "Right",
+                       base_path_ft: float = 90.0,
+                       compression: float = 0.55) -> tuple:
+    """Convert (spray_angle, distance) to (x, y) on the COMPRESSED field.
 
     Convention:
       home plate at (0, 0), CF straight up the +y axis.
-      For a RIGHT-handed hitter: pull side = -x (left field).
-      For a LEFT-handed hitter: pull side = +x (right field) — we mirror.
+      RIGHT-handed: pull side = -x (left field).
+      LEFT-handed: pull side = +x (right field) — we mirror.
       spray_angle: negative = pull, 0 = center, positive = oppo.
+
+    Distance is passed through scale_dist() so dots and the field
+    outline share the same coordinate space and remain consistent.
     """
     import math
     if spray_angle_deg is None or distance_ft is None:
         return None, None
-    # spray_angle from center: -45 = pull foul pole, +45 = oppo foul pole
+    d = scale_dist(distance_ft, base_path_ft=base_path_ft,
+                     compression=compression)
     angle = math.radians(spray_angle_deg)
-    # For RHH, pull side = LEFT field = -x on a field-view chart.
-    # sin(-30°) = -0.5, so x_sign = +1 puts a pulled ball at x = -175 (LF). ✓
-    # For LHH, we mirror so their pull side (still negative spray angle) goes to RF (+x).
     x_sign = -1.0 if hand == "Left" else 1.0
-    x = x_sign * distance_ft * math.sin(angle)
-    y = distance_ft * math.cos(angle)
+    x = x_sign * d * math.sin(angle)
+    y = d * math.cos(angle)
     return x, y
 
 
@@ -9159,28 +9192,55 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
     fd = _field_dimensions(sport)
     fig = go.Figure()
 
-    GRASS = "#5b9a4f"      # outfield grass
-    DIRT  = "#a87b48"      # infield + warning track
+    GRASS      = "#5b9a4f"      # outfield grass
+    DIRT       = "#a87b48"      # infield + warning track
+    FOUL_DIRT  = "#7a5a3a"      # darker dirt for foul territory
     GRASS_LINE = "#3e6e36"
     DIRT_LINE  = "#8a5c2c"
     FOUL_LINE  = "#ffffff"
 
-    # ----- (1) Outfield grass (big green fill bounded by foul lines + wall) -----
-    wall_pts_x, wall_pts_y = [], []
-    # Start at home plate
-    wall_pts_x.append(0); wall_pts_y.append(0)
-    # Walk along LF foul line out to LF foul pole
-    # Foul line for RHH-viewer chart: LF line goes from home toward upper-left
-    # at 45° (angle -45 from CF-axis). Distance = foul_extent up to wall.
-    # Then arc from LF foul-pole around to RF foul-pole
-    # Then back down the RF foul line to home.
-    # We approximate the wall as an arc spanning -45° to +45° from CF.
-    for deg in range(-45, 46, 2):
+    base_path_ft = float(fd["base_path_ft"])
+    COMPRESSION  = 0.55
+
+    # Pre-compute the COMPRESSED wall distance at each angle so the field
+    # outline shares the same coordinate transform as the data points
+    # (scale_dist is applied identically to both).
+    def _scaled_wall_xy(deg: int) -> tuple:
         t = abs(deg) / 45.0
         wall_dist = fd["of_wall_cf"] * (1 - t) + fd["of_wall_lf_rf"] * t
+        d = scale_dist(wall_dist, base_path_ft=base_path_ft,
+                        compression=COMPRESSION)
         rad = math.radians(deg)
-        wall_pts_x.append(-wall_dist * math.sin(rad))
-        wall_pts_y.append(wall_dist * math.cos(rad))
+        return (-d * math.sin(rad), d * math.cos(rad))
+
+    # ----- (0) FOUL TERRITORY DIRT — fills the chart corners outside the
+    #          foul lines so the field looks like a real ballpark, not a
+    #          floating wedge on a navy background. Drawn FIRST so all
+    #          the playing-surface shapes layer on top. -----
+    # Build a big "ballpark envelope" rectangle, then we cut out the
+    # in-bounds area by drawing grass over it.
+    # The envelope extends slightly past the foul-pole compressed X and
+    # past the CF compressed Y, giving the dugout/seating-area feel.
+    foul_pole_x = abs(_scaled_wall_xy(-45)[0])  # compressed foul-pole X
+    cf_y         = _scaled_wall_xy(0)[1]         # compressed CF Y
+    env_x = foul_pole_x * 1.18
+    env_y_top = cf_y * 1.05
+    env_y_bot = -cf_y * 0.10
+    fig.add_trace(go.Scatter(
+        x=[-env_x, -env_x, env_x, env_x, -env_x],
+        y=[env_y_bot, env_y_top, env_y_top, env_y_bot, env_y_bot],
+        mode="lines",
+        line=dict(color=FOUL_DIRT, width=0),
+        fill="toself", fillcolor=FOUL_DIRT,
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # ----- (1) Outfield grass (in-bounds: home → foul lines → OF wall → home) -----
+    wall_pts_x, wall_pts_y = [], []
+    wall_pts_x.append(0); wall_pts_y.append(0)
+    for deg in range(-45, 46, 2):
+        wx, wy = _scaled_wall_xy(deg)
+        wall_pts_x.append(wx); wall_pts_y.append(wy)
     wall_pts_x.append(0); wall_pts_y.append(0)
     fig.add_trace(go.Scatter(
         x=wall_pts_x, y=wall_pts_y,
@@ -9220,18 +9280,18 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         showlegend=False, hoverinfo="skip",
     ))
 
-    # ----- (4) Foul lines (white, drawn ON TOP of grass/dirt) -----
-    extent_for_lines = fd["of_wall_lf_rf"] * 1.02
-    fl_x = extent_for_lines * math.sin(math.radians(-45))
-    fl_y = extent_for_lines * math.cos(math.radians(-45))
-    # LF foul line (sin(-45) is negative; using direct calc gives a negative x)
+    # ----- (4) Foul lines (white, drawn ON TOP of grass/dirt).
+    # Use the compressed wall endpoint at ±45° so the foul line ends
+    # exactly where the OF wall starts in the compressed coord space. -----
+    lf_end_x, lf_end_y = _scaled_wall_xy(-45)
+    rf_end_x, rf_end_y = _scaled_wall_xy(45)
     fig.add_trace(go.Scatter(
-        x=[0, fl_x], y=[0, fl_y],
+        x=[0, lf_end_x], y=[0, lf_end_y],
         mode="lines", line=dict(color=FOUL_LINE, width=2.5),
         showlegend=False, hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=[0, -fl_x], y=[0, fl_y],
+        x=[0, rf_end_x], y=[0, rf_end_y],
         mode="lines", line=dict(color=FOUL_LINE, width=2.5),
         showlegend=False, hoverinfo="skip",
     ))
@@ -9245,25 +9305,30 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         showlegend=False, hoverinfo="skip",
     ))
 
-    # ----- (6) Range arcs at common distances -----
+    # ----- (6) Range arcs at common distances. The arcs are drawn in
+    # the COMPRESSED coordinate space (using scale_dist), but labelled
+    # with the TRUE distance. Coach sees "300 ft" where 300 ft actually
+    # is in the visual chart, not where geometric 300 ft would have
+    # been before compression. -----
     if sport == "Baseball":
-        range_marks = [200, 300, 400]
+        range_marks = [150, 250, 350]
     else:
-        range_marks = [150, 200, 250]
+        range_marks = [100, 175, 250]
     for r in range_marks:
+        r_disp = scale_dist(r, base_path_ft=base_path_ft,
+                              compression=COMPRESSION)
         arc_x, arc_y = [], []
         for deg in range(-45, 46, 3):
             rad = math.radians(deg)
-            arc_x.append(-r * math.sin(rad))
-            arc_y.append(r * math.cos(rad))
+            arc_x.append(-r_disp * math.sin(rad))
+            arc_y.append(r_disp * math.cos(rad))
         fig.add_trace(go.Scatter(
             x=arc_x, y=arc_y, mode="lines",
             line=dict(color="rgba(255,255,255,0.45)", width=1, dash="dot"),
             showlegend=False, hoverinfo="skip",
         ))
-        # Distance label at the rightmost end of the arc
         fig.add_annotation(
-            x=arc_x[-1] + 5, y=arc_y[-1] + 8,
+            x=arc_x[-1] + 4, y=arc_y[-1] + 6,
             text=f"{r} ft",
             showarrow=False,
             font=dict(size=9, color="rgba(255,255,255,0.85)"),
@@ -9283,16 +9348,19 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
     # ----- (8) Pitcher's mound -----
     md = fd["mound_distance"]
     mound_r = 9 if sport == "Baseball" else 8
+    # Pitcher's mound at compressed Y so it sits at the right spot
+    # relative to the diamond and OF wall.
+    md_y = scale_dist(md, base_path_ft=base_path_ft,
+                        compression=COMPRESSION)
     fig.add_shape(type="circle",
                    x0=-mound_r, x1=mound_r,
-                   y0=md - mound_r, y1=md + mound_r,
+                   y0=md_y - mound_r, y1=md_y + mound_r,
                    line=dict(color=DIRT_LINE, width=1.5),
                    fillcolor=DIRT, layer="above")
-    # Rubber on the mound
     rubber_w = 2.0; rubber_h = 0.4
     fig.add_shape(type="rect",
                    x0=-rubber_w, x1=rubber_w,
-                   y0=md - rubber_h, y1=md + rubber_h,
+                   y0=md_y - rubber_h, y1=md_y + rubber_h,
                    line=dict(color="black", width=0.8),
                    fillcolor="white", layer="above")
 
@@ -9365,27 +9433,26 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
             name=outcome.replace("_", " ").title(),
         ))
 
-    # Layout: classic baseball-diagram dome look — wide foul lines.
-    #   - X tight to foul poles (no horizontal navy past them)
-    #   - Y from home (0) to CF wall, no padding
-    #   - Canvas aspect ~1.96:1 (900×460). Data is 1.65:1, so this
-    #     gives ~18% horizontal stretch — foul lines come off home
-    #     plate at ~50° outward (vs the geometric 45°), giving the
-    #     "spread wide" diamond look every baseball illustration uses.
-    #     Bases visibly further apart, OF wall a wide arc.
-    plot_range_x = fd["of_wall_lf_rf"] * 1.00
-    plot_range_y = fd["of_wall_cf"] * 1.00
+    # Layout: in compressed coordinate space, the foul poles sit at
+    # ±foul_pole_x and CF wall at cf_y. We add a small margin so the
+    # foul-territory dirt has a strip past the foul poles (where
+    # dugouts would be), then a tiny margin top/bottom for breathing.
+    # Canvas aspect tuned so the visible field reads like the
+    # illustrated reference diagrams the user asked for.
+    plot_range_x = env_x   # foul-territory envelope X (already past foul poles)
+    plot_range_y_top = env_y_top
+    plot_range_y_bot = env_y_bot
     fig.update_layout(
         xaxis=dict(title="", range=[-plot_range_x, plot_range_x],
                     showgrid=False, zeroline=False, visible=False,
                     fixedrange=True, autorange=False),
-        yaxis=dict(title="", range=[0, plot_range_y],
+        yaxis=dict(title="", range=[plot_range_y_bot, plot_range_y_top],
                     showgrid=False, zeroline=False, visible=False,
                     fixedrange=True, autorange=False),
-        plot_bgcolor="#0f172a",
+        plot_bgcolor=FOUL_DIRT,  # foul-territory dirt fills any leftover area
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=460,
+        height=560,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9863,12 +9930,12 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            # 900×460 = 1.96:1 canvas → ~18% horizontal stretch →
-            # foul lines spread at ~50° outward angle (vs geometric
-            # 45°). Wider basepaths, dome-shape OF wall — matches the
-            # baseball-illustration style the user is after.
+            # Spray chart now uses scale_dist() distance compression:
+            # infield true-to-scale, outfield compressed 0.55x. With
+            # foul-territory dirt drawn into the corners, this matches
+            # the illustrated baseball-diagram style.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  width_px=900, height_px=460)
+                                  width_px=900, height_px=560)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
