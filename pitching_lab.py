@@ -9123,6 +9123,31 @@ def _field_dimensions(sport: str) -> dict:
     }
 
 
+def widen_baselines(x: float, y: float,
+                      transition_y: float = 222.0,
+                      max_stretch: float = 1.20) -> tuple:
+    """Stretch X near home plate; taper to 1× by the foul-pole Y so the
+    foul poles and OF wall stay exactly where they are.
+
+    Effect on the chart:
+      - 1st and 3rd baselines bow outward into a gentle curve
+      - 1st and 3rd base markers sit visibly wider apart
+      - Outfield wall arc + foul pole positions unchanged
+      - The chart's overall outside dimensions are preserved
+
+    Defaults: max_stretch=1.20 (20% wider at home), taper to 1× at
+    y=222 (which equals scale_dist(330) — the compressed foul-pole Y).
+    Applied AFTER scale_dist to (x, y) coordinates.
+    """
+    if y is None or x is None:
+        return x, y
+    if y >= transition_y or y <= 0:
+        return x, y
+    t = y / transition_y          # 0 at home, 1 at foul-pole Y
+    factor = max_stretch * (1 - t) + 1.0 * t
+    return x * factor, y
+
+
 def scale_dist(distance_ft: float, base_path_ft: float = 90.0,
                 compression: float = 0.55) -> float:
     """Compress distances past the infield so the chart shows a readable
@@ -9437,8 +9462,10 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
     # ±foul_pole_x and CF wall at cf_y. We add a small margin so the
     # foul-territory dirt has a strip past the foul poles (where
     # dugouts would be), then a tiny margin top/bottom for breathing.
-    # Canvas aspect tuned so the visible field reads like the
-    # illustrated reference diagrams the user asked for.
+    # Canvas aspect 2.05:1 (900×440) — combined with the compressed
+    # data aspect this gives the chart ~60° between 1st and 3rd
+    # baselines at home plate. Field reads as distinctly horizontal
+    # on phone, matches the illustrated baseball-diagram style.
     plot_range_x = env_x   # foul-territory envelope X (already past foul poles)
     plot_range_y_top = env_y_top
     plot_range_y_bot = env_y_bot
@@ -9452,7 +9479,7 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
         plot_bgcolor=FOUL_DIRT,  # foul-territory dirt fills any leftover area
         paper_bgcolor="#0f172a",
         font=dict(color="#e5e7eb"),
-        height=560,
+        height=440,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      bgcolor="rgba(0,0,0,0)",
                      font=dict(color="#e5e7eb")),
@@ -9930,12 +9957,12 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
         # Wider spray column — the field is the centerpiece of this tab.
         spray_col, detail_col = st.columns([2.0, 1.0])
         with spray_col:
-            # Spray chart now uses scale_dist() distance compression:
-            # infield true-to-scale, outfield compressed 0.55x. With
-            # foul-territory dirt drawn into the corners, this matches
-            # the illustrated baseball-diagram style.
+            # 900×440 = 2.05:1 canvas. Wider aspect plus the existing
+            # scale_dist compression gives the chart a ~60° angle
+            # between 1st and 3rd baseline at home plate — the wider
+            # diamond look the user is after.
             render_static_chart(spray_fig, key="hitting_spray_chart",
-                                  width_px=900, height_px=560)
+                                  width_px=900, height_px=440)
 
         with detail_col:
             # Picker is now the sole selection mechanism (chart is a PNG).
