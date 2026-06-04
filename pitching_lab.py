@@ -1958,7 +1958,24 @@ def generate_hitting_session(hitter_name: str, hand: str = "Right",
         launch      = _u(*prof["launch_angle"])
         contact_off = _u(*prof["contact_offset"])
         distance    = _u(*prof["distance"])
-        spray       = _u(*prof["spray"])
+
+        # ----- FOUL BALLS go into actual FOUL TERRITORY (|spray| > 45°)
+        # Previously the profile said spray=(-50, 50) which mostly lands
+        # foul balls inside the foul lines — looked wrong on the chart.
+        # Now: pick one foul side at random and pull spray angle from
+        # ±(47°-65°) so the dot lands beyond the foul line. -----
+        if outcome == "foul":
+            side = -1.0 if rng.random() < 0.5 else 1.0
+            spray = side * rng.uniform(47, 65)
+        else:
+            spray = _u(*prof["spray"])
+
+        # ----- SOFTBALL distance scaling: a softball field's CF wall
+        # sits at ~250 ft vs baseball's ~400 ft, so hit distances scale
+        # roughly to ~63% of baseball. Without this, sample hits in a
+        # softball spray chart land way past the OF wall. -----
+        if sport == "Softball" and distance is not None:
+            distance = distance * 0.62
 
         # Biomech — better numbers on solid/barrel, weaker on whiffs
         if outcome in ("barrel", "solid_contact"):
@@ -7536,7 +7553,25 @@ GRIP_LIBRARY = {
             "**Why this works:** When the ball rotates, all four red seams cut through the air "
             "every spin. That's what creates the 'rise' or 'carry' effect that makes a fastball "
             "look like it's staying up at the top of the strike zone. **More backspin = more "
-            "carry = harder to hit.**"
+            "carry = harder to hit.**\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Setup:** Glove and ball together at the chest, ball hidden behind glove.\n"
+            "- **Hand break:** Ball comes out of the glove pointing DOWN at the ground "
+            "(not up — that pre-loads the elbow into stress positions).\n"
+            "- **Foot-plant:** Throwing arm at 'high cocked' position — forearm vertical, "
+            "ball facing 2nd base, elbow at or just below shoulder height.\n"
+            "- **Release:** Arm fully extended out front, ball comes off the index and middle "
+            "fingertips with the wrist STRAIGHT — no wrist flick, no twist.\n"
+            "- **Follow-through:** Throwing hand finishes across the body to the opposite hip; "
+            "chest faces the catcher.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T pat the ball up** out of the glove (elbow flying up early = labrum stress).\n"
+            "- **DON'T flick the wrist** at release — that adds gyro spin and kills carry.\n"
+            "- **DON'T squeeze the ball** in the cocked position; tension in the fingers "
+            "delays the spin transfer and adds 2-4 ms of late effort = elbow load.\n"
+            "- **DON'T short-arm** the throw (elbow leading wrist by too much) — robs velocity AND adds stress.\n\n"
+            "**Drills to practice this:** Towel drill (clean arm path), wall-front "
+            "elbow drill (high cocked position), and four-seam release reps from one knee."
         ),
     },
     "two_seam_fastball": {
@@ -7549,7 +7584,22 @@ GRIP_LIBRARY = {
             "underneath like normal.\n\n"
             "**Why this works:** Because the spin axis is tilted to the side, the ball will sink "
             "and run toward your throwing-arm side (right for a righty, left for a lefty). "
-            "**Great for getting ground balls** when a hitter is sitting fastball."
+            "**Great for getting ground balls** when a hitter is sitting fastball.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Identical to four-seam through cocked position** — that's the whole point. The "
+            "ball needs to LOOK like a four-seam to the hitter until it's halfway to the plate.\n"
+            "- **Release:** Slightly more pressure on the INDEX finger than the middle finger "
+            "as you come over the top — this tilts the spin axis sideways.\n"
+            "- **Follow-through:** Same as four-seam — no need to consciously change anything.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T 'turn over' the wrist** to force the sink — the index-finger pressure "
+            "does the work. Conscious wrist rotation = elbow torque.\n"
+            "- **DON'T slow down** the arm trying to 'feel' the sink. Throw at fastball intent.\n"
+            "- **DON'T grip too tightly** — the two-seam needs the ball to slip slightly off "
+            "the index finger; a death grip kills the sinking action.\n\n"
+            "**Drills to practice this:** Index-finger pressure drill (alternating four-seam "
+            "and two-seam every other rep), and Driveline 'pivot pick-off' drill for clean "
+            "arm path."
         ),
     },
     "slider_standard": {
@@ -7563,7 +7613,25 @@ GRIP_LIBRARY = {
             "wrist sideways.\n\n"
             "**Why this works:** The middle finger does the work of imparting the sideways spin. "
             "If you let your wrist do it instead (by twisting), you'll stress your elbow AND "
-            "lose break. The standard grip teaches a clean, repeatable release."
+            "lose break. The standard grip teaches a clean, repeatable release.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Setup → high cocked:** IDENTICAL to fastball. The slider should be deceptive — "
+            "any difference in arm slot tips off the hitter.\n"
+            "- **Release:** As your arm comes forward, **think 'chop down with the middle "
+            "finger'** — the ball comes off the side of your middle finger like throwing a "
+            "football. **Wrist stays locked in place — no side-to-side twist.**\n"
+            "- **Follow-through:** Same finish as a fastball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T twist the wrist sideways** at release to force break. This is the #1 "
+            "slider-related elbow injury cause — supination + valgus = UCL load.\n"
+            "- **DON'T 'sweep' the arm** out to the side — slot must match fastball.\n"
+            "- **DON'T release the ball with a relaxed elbow.** A soft elbow at release "
+            "lets the wrist take over (=twist = stress).\n"
+            "- **DON'T choke the slider grip too tight** — middle-finger pressure is the lever, "
+            "but white-knuckle tension delays release and lowers velocity by 3-5 mph.\n\n"
+            "**Drills to practice this:** Wrist-lock drill (rubber-band brace around wrist "
+            "for 10 reps), towel snap-down drill, and the Driveline 'football throws' drill "
+            "to feel proper side-spin without wrist rotation."
         ),
     },
     "slider_spike_seam": {
@@ -7580,7 +7648,23 @@ GRIP_LIBRARY = {
             "**Why this is recommended for THIS pitcher:** When your slider data shows high "
             "elbow stress AND lots of gyro spin (the 'bullet spin' that doesn't create break), "
             "it usually means you're twisting your wrist to force the break. The spike grip "
-            "lets the ball cut naturally — **the break gets sharper AND your elbow gets safer.**"
+            "lets the ball cut naturally — **the break gets sharper AND your elbow gets safer.**\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Everything before release:** Same as standard slider — fastball-identical "
+            "through high-cocked.\n"
+            "- **Release:** Because the spiked index finger does more of the work, your wrist "
+            "naturally stays straighter. Think 'middle finger pulls down, index nail digs in' "
+            "— the ball cuts sideways automatically.\n"
+            "- **Follow-through:** Same as fastball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T let the index nail dig in too aggressively** — that scrapes off velocity. "
+            "It's a pressure POINT, not a claw.\n"
+            "- **DON'T grip the spike too tightly** — the spike position should feel almost "
+            "passive, not strenuous.\n"
+            "- **DON'T try to add extra wrist twist** thinking it'll add break. The whole point "
+            "of the spike is that the natural geometry does the work.\n\n"
+            "**Drills to practice this:** Slider spike grip ladder (10 reps soft toss → 10 reps "
+            "long toss → 10 reps mound) and the 'no-wrist-rotation' wall drill."
         ),
     },
     "curveball": {
@@ -7593,7 +7677,26 @@ GRIP_LIBRARY = {
             "**Why this works:** Pulling down at release creates **top spin** — the opposite of "
             "a fastball's backspin. Top spin makes the ball drop fast, like falling off a table. "
             "A great curveball drops 12-15+ inches more than a fastball over the same distance, "
-            "which is what makes hitters swing over the top of it."
+            "which is what makes hitters swing over the top of it.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Setup → high cocked:** Same as fastball.\n"
+            "- **At release:** The ball comes off the **side of the index finger and the middle "
+            "finger curls under** — think 'lifting a serving tray off a table.' The wrist itself "
+            "stays in its natural delivery plane — it does NOT twist toward the body.\n"
+            "- **Follow-through:** Hand finishes lower than for a fastball (because of the "
+            "downward pull), but the arm path is still the same line.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T 'snap' or 'roll over' the wrist** to force the top-spin. That's the "
+            "single biggest cause of youth UCL stress on a curveball.\n"
+            "- **DON'T raise the elbow above shoulder height** at cocked — common 'forced-curve' "
+            "compensation that elevates the elbow and adds shoulder torque.\n"
+            "- **DON'T slow the arm down** trying to feel the spin. Arm speed = deception = "
+            "movement. Slow arm = batting practice.\n"
+            "- **DON'T add a head-tilt** during the throw — many young pitchers tilt the head "
+            "to 'look around' the curve. That mis-aligns the shoulder and elbow paths.\n\n"
+            "**Drills to practice this:** Towel curveball drill (no ball, focus on the pull-down "
+            "feel), one-knee curveball release reps (removes the lower body to isolate arm), "
+            "and the 'thumb-up' drill to lock wrist in proper delivery plane."
         ),
     },
     "changeup_circle": {
@@ -7610,7 +7713,218 @@ GRIP_LIBRARY = {
             "by 8-12 mph without slowing your arm. Because your arm looks identical to a fastball "
             "delivery, the hitter starts their swing for a fastball — and the slower, sinking "
             "ball arrives 2-3 tenths of a second later. **It's a velocity trick disguised as a "
-            "fastball.**"
+            "fastball.**\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **EVERY phase before release:** IDENTICAL to fastball. Same arm slot, same arm "
+            "speed, same head position. Any tell here ruins the pitch.\n"
+            "- **Release:** Just as the ball is about to leave, the wrist 'pronates' — palm "
+            "rotates toward the throwing-arm side (a slight handshake motion). The ball rolls "
+            "off the middle and ring fingers.\n"
+            "- **Follow-through:** Same finish as fastball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T slow the arm down.** This is the #1 changeup tell. Slower arm = hitter "
+            "recognizes it = batting practice fastball.\n"
+            "- **DON'T pull the ball down** like a curveball. The pitch needs natural fade/"
+            "sink from the grip and pronation, not from yanking on it.\n"
+            "- **DON'T squeeze too tight** — the circle should be relaxed. Squeezing causes "
+            "the ball to come out flat and high.\n"
+            "- **DON'T tuck the head or change posture** to 'feel' the change.\n\n"
+            "**Drills to practice this:** Fastball-changeup alternation reps (5 fastballs, 5 "
+            "changes, repeat × 5) at fixed long toss distance to feel the speed difference; "
+            "'palm-up' shadow drill to groove the pronation; and bucket-tip drill from Driveline."
+        ),
+    },
+    # ===== ADDITIONAL BASEBALL PITCHES (advanced grips) =====
+    "cutter": {
+        "label":       "Cutter (Cut Fastball)",
+        "description": (
+            "**How to hold it (plain English):** Start with a four-seam grip, then shift both "
+            "fingers slightly to the **glove side** of the ball (left side for a righty), so "
+            "the middle finger is sitting on the long seam instead of perpendicular to it. "
+            "Thumb tucked underneath on the opposite side. The grip should feel about 80% "
+            "fastball, 20% slider.\n\n"
+            "**Why this works:** The off-center finger pressure puts a slight side-spin "
+            "component on a near-fastball-velocity pitch. Result: a fastball that breaks "
+            "2-6 inches glove-side at the very last moment. Hitters can't square it up because "
+            "the break is short and late. Mariano Rivera's career-defining pitch.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **All phases before release:** Identical to fastball.\n"
+            "- **Release:** Slight extra pressure on the MIDDLE finger and outside of the ball, "
+            "like you're 'shaving' the side of it. **Wrist stays in fastball orientation — "
+            "no twist.**\n"
+            "- **Follow-through:** Same as fastball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T over-supinate** the wrist trying to add break. The cutter is a fastball "
+            "with grip-driven cut, not a mini-slider.\n"
+            "- **DON'T slow down** the arm.\n"
+            "- **DON'T shift the fingers too far off-center** — that turns it into a slider and "
+            "loses 3-5 mph.\n\n"
+            "**Drills to practice this:** Cutter pressure-point reps (alternating four-seam "
+            "and cutter every other pitch in long toss), and 'edge-of-the-seam' grip work."
+        ),
+    },
+    "splitter": {
+        "label":       "Splitter (Split-Finger Fastball)",
+        "description": (
+            "**How to hold it (plain English):** Split your index and middle fingers wide "
+            "around the ball — they should be on the OUTER edges of the horseshoe, not on "
+            "top of the seams. The ball wedges between them like a baseball Y-shape. Thumb "
+            "underneath. Grip is firm but **fingers point straight forward, not pressing in.**\n\n"
+            "**Why this works:** The split-finger position kills most of the spin (the ball "
+            "tumbles instead of spinning cleanly), and gravity takes over. Result: a fastball "
+            "that drops 6-10 inches more than a normal fastball over the same distance. "
+            "Looks like a fastball, dies at the plate.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **All phases:** Identical to fastball.\n"
+            "- **Release:** Let the ball 'fall out' of the split fingers — DON'T push down "
+            "or flick. The grip itself causes the drop.\n"
+            "- **Follow-through:** Same as fastball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T snap the wrist** down at release. That's a forkball, different pitch, "
+            "and the snap stresses the elbow.\n"
+            "- **DON'T grip too tightly** — the fingers need to release cleanly.\n"
+            "- **DON'T throw the splitter if you have small hands** or shorter fingers — the "
+            "split finger position can strain the index-middle finger tendons. Consider a "
+            "circle changeup instead.\n\n"
+            "**Drills to practice this:** Splitter dry reps (no ball, finger-spread feel), "
+            "Y-finger ball drops from the cocked position, and circle stretch warmup before "
+            "any splitter session."
+        ),
+    },
+    "knuckleball": {
+        "label":       "Knuckleball",
+        "description": (
+            "**How to hold it (plain English):** Make a fist around the ball, then **rest the "
+            "tips of your fingernails (or fingertip pads) on the ball** — index, middle, and "
+            "ring fingers pointing straight at the ball, knuckles bent. Some pitchers dig "
+            "fingernails into the seam; others use just the very pad. Thumb underneath for "
+            "stability. The whole point: **at release, you PUSH the ball away with the "
+            "fingernails — no spin imparted.**\n\n"
+            "**Why this works:** A knuckleball thrown with near-zero spin (under 100 rpm) "
+            "tumbles erratically as air pressure shifts around the seams. The result: an "
+            "unpredictable wobbling flight path that even the pitcher can't predict. Hitters "
+            "are guessing as much as you are.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Setup:** Slower, more controlled tempo than a fastball.\n"
+            "- **At release:** Arm comes through at about 65-75% effort. The fingernails "
+            "PUSH the ball out flat — no flicking, no wrist motion, no rolling.\n"
+            "- **Follow-through:** Short — the arm doesn't whip across the body the way a "
+            "fastball does. It's almost a flat push-finish.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T snap the wrist** at all — even a slight wrist motion adds spin and "
+            "ruins the pitch.\n"
+            "- **DON'T throw at fastball intent** — too much velocity adds slight spin from "
+            "the airflow off the fingertips.\n"
+            "- **DON'T expect consistency.** Knuckleballers throw it 70% of the time and "
+            "accept that even great ones walk 4-5 batters per game.\n"
+            "- **DON'T try this without growing/maintaining hard fingernails.** Most knuckleball "
+            "pitchers manicure their nails specifically for grip.\n\n"
+            "**Drills to practice this:** Wall flicks against a foam target (zero spin = stays "
+            "stuck dead center), 30-foot toss with the catcher's mitt as feedback (looking for "
+            "movement), and progressive distance ladder once spin is consistently low."
+        ),
+    },
+    "knuckle_curve": {
+        "label":       "Knuckle Curve",
+        "description": (
+            "**How to hold it (plain English):** Spike your index finger (like a spike slider) "
+            "on the long seam, but the THUMB hooks the OPPOSITE side aggressively. Middle "
+            "finger lays across the top seam. At release, the spike-curl of the index finger "
+            "snaps down with much more force than a standard curve — almost like flicking a "
+            "marble with that one finger.\n\n"
+            "**Why this works:** The spike position gives an additional 'lever' for top-spin "
+            "without requiring the wrist to roll over. Result: a sharper, later-breaking "
+            "curveball than the standard grip. AJ Burnett's signature pitch.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **All phases through cocked:** Same as fastball.\n"
+            "- **Release:** The index spike flicks down at the same instant the middle finger "
+            "pulls down. Wrist stays in delivery plane — does NOT roll over.\n"
+            "- **Follow-through:** Same as a standard curveball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T flick TOO hard with the spike** — a fingernail tear is a real risk.\n"
+            "- **DON'T add wrist roll on top of the spike-flick** — that's stacking stressors.\n"
+            "- **DON'T throw knuckle curves on consecutive pitches in cold weather** — the "
+            "spike position taxes the finger pulley.\n\n"
+            "**Drills to practice this:** Spike-grip soft toss reps, fingernail conditioning "
+            "with a rice bucket, and standard curve / knuckle curve alternation."
+        ),
+    },
+    "vulcan_changeup": {
+        "label":       "Vulcan Changeup (Spock Grip)",
+        "description": (
+            "**How to hold it (plain English):** Like the Star Trek 'live long and prosper' "
+            "hand sign — the ball wedges between your **middle and ring fingers**, which are "
+            "split wide. Index and pinky stay on the outside, almost off the ball. Thumb "
+            "underneath. The split is what gives the changeup its name (resembles the splitter).\n\n"
+            "**Why this works:** The middle-and-ring split kills spin and reduces velocity "
+            "(8-12 mph slower than fastball) with very fastball-like arm action. Better "
+            "deception than a circle change for some pitchers; particularly good for pitchers "
+            "with longer fingers who can't comfortably hold a circle.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **All phases:** Match the fastball exactly.\n"
+            "- **Release:** Ball rolls off the middle and ring fingers cleanly — no "
+            "pronation needed (the grip does the work).\n"
+            "- **Follow-through:** Identical to fastball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T pronate the wrist** like a circle change — the vulcan is grip-driven, "
+            "wrist motion is unnecessary and adds release variability.\n"
+            "- **DON'T let the ball slip** out of the split too early — fingers must stay "
+            "engaged through release.\n"
+            "- **DON'T try this without enough finger length** — small hands can't comfortably "
+            "wedge the ball between middle and ring fingers.\n\n"
+            "**Drills to practice this:** Vulcan grip soft toss, fastball-vulcan alternation, "
+            "and finger-flexibility warmup before any vulcan session."
+        ),
+    },
+    "slurve": {
+        "label":       "Slurve (Slider-Curve Hybrid)",
+        "description": (
+            "**How to hold it (plain English):** A 'compromise' grip between slider and "
+            "curveball. Middle finger sits on the long seam (slider-like), but the wrist "
+            "starts in a slightly more vertical position at the cocked position. At release "
+            "the ball comes off with a combination of side-spin and top-spin — about 60% "
+            "side, 40% down.\n\n"
+            "**Why this works:** Gives a bigger, sweeping break than a slider but with more "
+            "velocity than a curveball (typically 78-82 mph). Great for pitchers whose slider "
+            "doesn't break enough and whose curveball doesn't have enough power.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **All phases through cocked:** Same as fastball.\n"
+            "- **Release:** Middle finger pulls down AND across — combination of slider "
+            "(across) and curve (down) motions in one. Wrist STAYS LOCKED in delivery plane.\n"
+            "- **Follow-through:** Similar to slider; doesn't dip as low as a true curveball.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T add wrist roll** trying to get more sweep — the grip and finger pull "
+            "do the work.\n"
+            "- **DON'T treat the slurve as either a slider or a curveball** — it's its own "
+            "release pattern. Drill it as a distinct pitch.\n"
+            "- **DON'T over-throw it.** Slurves at maximum effort tend to lose break and "
+            "become flat sliders. Throw at 90% intent for best results.\n\n"
+            "**Drills to practice this:** Slurve soft-toss reps with a focus on the diagonal "
+            "pull-across motion; tunnel drill versus a fastball to test deception."
+        ),
+    },
+    "eephus": {
+        "label":       "Eephus (Trick Pitch)",
+        "description": (
+            "**How to hold it (plain English):** Any normal grip works (often fastball or "
+            "curve). The trick is the DELIVERY: arc the ball high into the air at extremely "
+            "low velocity (typically 45-58 mph). Imagine slow-pitch softball or a lob.\n\n"
+            "**Why this works:** When everything else you throw is 80+ mph, a 50-mph rainbow "
+            "is so different that even big-league hitters time it wrong. It's a once-in-a-"
+            "season weapon — overuse kills the effect.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Cocked:** Same as fastball — keep the arm path identical.\n"
+            "- **Release:** Slow the wrist way down at the very end, point the fingertips "
+            "skyward. The ball lofts on a parabolic arc.\n"
+            "- **Follow-through:** Truncated — no full whip across the body.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T tip it** by slowing the arm before release — keep arm speed until "
+            "the wrist breaks the deceleration at the end.\n"
+            "- **DON'T throw it twice in a row** to the same hitter — they'll be ready.\n"
+            "- **DON'T throw it with runners on base** unless you're VERY confident — the "
+            "long flight time invites stolen bases.\n\n"
+            "**Drills to practice this:** Long-toss arc drills (visualize hitting a 20-foot-tall "
+            "target with a rainbow), and tracking practice with batters off live BP."
         ),
     },
 
@@ -7626,7 +7940,24 @@ GRIP_LIBRARY = {
             "**Why this works:** Across the seams gives you four red lines cutting through the air "
             "every revolution, which is what creates the carry and arm-side run that makes a "
             "fastball look like it 'rises' to the hitter even though it's just dropping less than "
-            "gravity alone would cause."
+            "gravity alone would cause.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **Top of K-position:** Arm fully extended overhead, ball facing 3rd base for RHP.\n"
+            "- **9 o'clock (3/4 down):** Arm at 90° to the body, elbow straight, palm facing "
+            "the catcher.\n"
+            "- **6 o'clock (release):** Arm at the side of the hip, **palm facing CATCHER** "
+            "at the moment of release. Hip 'brushes' the inside of the throwing wrist.\n"
+            "- **Follow-through:** Hand snaps up across the chest after release.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T release in front of the hip.** Letting the ball go before the wrist "
+            "reaches 6:00 reduces velocity by 3-6 mph and tips off the pitch.\n"
+            "- **DON'T 'muscle' the arm** through the windmill — the rotation should be loose "
+            "and whip-like. Tension slows the arm by 10%.\n"
+            "- **DON'T look at the ball during the windmill** — head stays locked on the catcher.\n"
+            "- **DON'T let the elbow bend** during the 9:00→6:00 portion — straight arm in the "
+            "downswing is essential for whip velocity.\n\n"
+            "**Drills to practice this:** Wall-front K-position holds, towel windmill drill, "
+            "and brush-at-hip rep work to feel the release point."
         ),
     },
     "softball_rise": {
@@ -7641,11 +7972,29 @@ GRIP_LIBRARY = {
             "the maximum 'rise' effect. The ball physically can't rise (gravity wins), but with "
             "enough backspin it drops about 4-8 inches LESS than the hitter's eyes expect — and "
             "they swing under it. Great rise balls feel like fastballs at the top of the zone that "
-            "won't come down."
+            "won't come down.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **K-position to 9:00:** Identical to fastball.\n"
+            "- **3:00 to 6:00:** Wrist starts to rotate from neutral toward supination "
+            "(palm rolls toward the SKY). The forearm should stay straight.\n"
+            "- **Release (6:00):** Palm facing UP, fingers PUSH up off the bottom of the ball — "
+            "the ball is essentially 'flicked' off the fingertips into the air.\n"
+            "- **Follow-through:** Hand finishes high, palm still facing up.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T snap the wrist up** before the release point — it kills velocity and "
+            "makes the rise hang.\n"
+            "- **DON'T release out in front of the hip** — the rise needs the arm at 6:00 to "
+            "generate proper backspin axis.\n"
+            "- **DON'T add elbow bend** in the late downswing — straight arm is essential.\n"
+            "- **DON'T point fingers backward** at release — fingers should be POINTING TOWARD "
+            "THE CATCHER as the ball leaves.\n\n"
+            "**Drills to practice this:** Rise ball 'flick up' drill (no body, just arm and "
+            "wrist), broom-handle rise drill (visualize cutting up under the broom), and "
+            "tracking the 12:00 spin axis on a Rapsodo if available."
         ),
     },
     "softball_drop": {
-        "label":       "Drop Ball (Peel Drop)",
+        "label":       "Drop Ball — Peel Drop",
         "description": (
             "**How to hold it (plain English):** Same C-grip as the rise ball — index and middle "
             "along the seam — but the release is opposite. At the bottom of your windmill, "
@@ -7655,7 +8004,47 @@ GRIP_LIBRARY = {
             "**Why this works:** Peeling the fingers off the front creates **pure topspin** (6:00 "
             "spin axis), which makes the ball drop FAR more than gravity alone — 6-8\" more drop "
             "than a fastball at the same release point. The hitter sees what looks like a fastball "
-            "but the bottom falls out at the plate."
+            "but the bottom falls out at the plate.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **K-position to 9:00:** Same as fastball.\n"
+            "- **9:00 to 6:00:** Wrist stays NEUTRAL through the downswing (no rotation either "
+            "way).\n"
+            "- **Release (6:00):** Fingers 'peel' off the front of the ball, top of the ball "
+            "rolling forward. Wrist DOES NOT TWIST.\n"
+            "- **Follow-through:** Hand finishes low, almost a 'wave goodbye' motion.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T snap the wrist forward.** The peel is grip-driven; wrist motion adds "
+            "side-spin that ruins the pure topspin axis.\n"
+            "- **DON'T release behind the hip.** Need to be at 6:00 to get clean peel.\n"
+            "- **DON'T pull the elbow back** during the peel — keep arm extended.\n"
+            "- **DON'T confuse the peel drop with the roll drop** (different release; covered "
+            "in the Roll Drop entry).\n\n"
+            "**Drills to practice this:** Wall-target peel drops, slow-mo wrist position holds "
+            "at 6:00, and Rapsodo spin-axis feedback for clean 6:00 topspin."
+        ),
+    },
+    "softball_drop_roll": {
+        "label":       "Drop Ball — Roll Drop",
+        "description": (
+            "**How to hold it (plain English):** Alternative drop-ball grip. Same C-grip as "
+            "the peel drop, but at release the wrist **rolls forward** (like turning over a "
+            "door knob) instead of peeling. The wrist motion adds even more aggressive topspin.\n\n"
+            "**Why this works:** Roll drop produces 2-4 inches MORE drop than peel drop, but "
+            "with slightly less velocity. Better for pitchers who can't comfortably generate "
+            "natural peel-spin; more aggressive break for big-stage strikeout situations.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **K-position to 6:00:** Same as drop ball.\n"
+            "- **Release (6:00):** Wrist ROLLS forward through the release (like turning a "
+            "doorknob clockwise for RHP). Fingers stay on top, ball comes off with maximum "
+            "topspin.\n"
+            "- **Follow-through:** Hand finishes low, palm facing back.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T overdo the roll** — too much wrist motion = elbow stress AND inconsistent "
+            "spin axis.\n"
+            "- **DON'T release before 6:00** — early release sprays the pitch high.\n"
+            "- **DON'T choose roll drop if you've had elbow issues** — peel drop is safer.\n\n"
+            "**Drills to practice this:** Door-knob wrist rolls dry, then with ball; spin-axis "
+            "feedback work."
         ),
     },
     "softball_curve": {
@@ -7668,7 +8057,22 @@ GRIP_LIBRARY = {
             "base for a right-handed pitcher) as the ball leaves your hand.\n\n"
             "**Why this works:** The outward wrist rotation creates a side-spin axis around 8:30, "
             "which curves the ball away from a same-side hitter (in to opposite-side). Movement: "
-            "5-9 inches of glove-side break."
+            "5-9 inches of glove-side break.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **K-position to 9:00:** Same as fastball.\n"
+            "- **9:00 to 6:00:** Forearm begins to pronate slightly — palm rotates toward "
+            "the glove side. Wrist is firm, NOT slack.\n"
+            "- **Release (6:00):** Palm faces THIRD BASE (for RHP). Ball comes off the middle "
+            "finger first, then the index.\n"
+            "- **Follow-through:** Hand finishes wide across the body.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T 'flip' the wrist** at release — pronation is gradual through the "
+            "downswing, not a snap.\n"
+            "- **DON'T release behind the hip** — kills break and accuracy.\n"
+            "- **DON'T grip too tight** — chokes off the natural roll.\n"
+            "- **DON'T add elbow rotation** to compensate — elbow stays clean, wrist does work.\n\n"
+            "**Drills to practice this:** Curve pronation walks (slow-mo focus on palm rotation "
+            "during downswing), wall-target curve reps, and tunneling versus the fastball."
         ),
     },
     "softball_screw": {
@@ -7680,7 +8084,72 @@ GRIP_LIBRARY = {
             "toward first base for a righty) — opposite of the curveball motion.\n\n"
             "**Why this works:** Inward pronation creates a side-spin axis around 3:30 — opposite "
             "of a curveball — so the ball breaks toward the arm side (away from the opposite-side "
-            "hitter, into a same-side hitter). Excellent counter to a curveball-heavy hitter."
+            "hitter, into a same-side hitter). Excellent counter to a curveball-heavy hitter.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **K-position to 9:00:** Identical to fastball.\n"
+            "- **9:00 to 6:00:** Forearm supinates — palm rotates toward 1st base (for RHP).\n"
+            "- **Release (6:00):** Palm faces FIRST BASE. Ball rolls off the inside of the "
+            "fingers.\n"
+            "- **Follow-through:** Hand finishes across the body to the glove side.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T over-supinate** to force break — adds elbow torque.\n"
+            "- **DON'T let the elbow flare out** during pronation — it must stay close to the body.\n"
+            "- **DON'T throw consecutively in cold weather** — supination warmup essential.\n\n"
+            "**Drills to practice this:** Supination walk-throughs, screw pronation timing drills, "
+            "and tunneling against the curveball to confirm opposite break."
+        ),
+    },
+    "softball_changeup": {
+        "label":       "Softball Changeup (Back-of-Hand)",
+        "description": (
+            "**How to hold it (plain English):** **'Back of the hand' grip.** Spread index, "
+            "middle, ring, and pinky fingers across the TOP of the ball, with the ball resting "
+            "in your palm. Thumb stays underneath. The whole hand essentially supports the ball "
+            "in the palm. At the release point of the windmill, **flip your wrist so the BACK "
+            "of your hand faces the catcher** — almost like waving.\n\n"
+            "**Why this works:** The back-of-hand release decelerates the ball by 8-12 mph "
+            "without changing arm speed in the windmill. Looks like a fastball through the "
+            "downswing, dies on the way to the plate. Excellent neutralizer for fastball hitters.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **K-position to 9:00:** Same as fastball — no tell.\n"
+            "- **9:00 to 6:00:** Forearm rotates so the back of the hand begins to face "
+            "forward.\n"
+            "- **Release (6:00):** Back of hand faces CATCHER. Ball rolls slowly off the "
+            "fingers.\n"
+            "- **Follow-through:** Same arm speed as fastball — that's the whole point.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T slow the arm down.** Slower arm = pitcher tip. Pitch fails.\n"
+            "- **DON'T pull the ball out of the windmill plane** — the back-of-hand release "
+            "should happen in the SAME arc as the fastball.\n"
+            "- **DON'T grip too tight** — choking the ball delays release timing.\n\n"
+            "**Drills to practice this:** Back-of-hand wall reps (slow), changeup vs fastball "
+            "tunneling, and speed-blind tossing (catcher closes eyes between pitches to "
+            "confirm changeup mimics fastball through windmill)."
+        ),
+    },
+    "softball_offspeed_knuckle": {
+        "label":       "Softball Knuckle Change",
+        "description": (
+            "**How to hold it (plain English):** Knuckles of index, middle, and ring fingers "
+            "press into the ball (think of a baseball knuckleball but in a windmill context). "
+            "Thumb stabilizes underneath. At release, fingers PUSH the ball out — no spin, no "
+            "snap.\n\n"
+            "**Why this works:** Erratic, low-spin flight (similar to a baseball knuckleball) "
+            "with the velocity-killing effect of a changeup. Excellent counter to hitters timing "
+            "your fastball or rise.\n\n"
+            "**Arm motion — windmill (key positions):**\n"
+            "- **K-position to 9:00:** Same as fastball.\n"
+            "- **9:00 to 6:00:** Wrist locks; do not rotate or pronate.\n"
+            "- **Release (6:00):** Knuckles PUSH the ball out. No flick. No snap.\n"
+            "- **Follow-through:** Truncated; arm doesn't whip across the body.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T snap the wrist** at all — even a tiny snap adds spin.\n"
+            "- **DON'T throw at max effort** — too much velocity causes residual spin from "
+            "the airflow off the knuckles.\n"
+            "- **DON'T expect tight command** — this pitch is for when you need movement chaos, "
+            "not painting corners.\n\n"
+            "**Drills to practice this:** Wall-target knuckle pushes (zero spin = ball stays "
+            "stuck dead center), warmup with rice bucket for finger conditioning."
         ),
     },
     "softball_change": {
@@ -8360,34 +8829,64 @@ button, input, select, textarea {
     margin-left: 0 !important;
 }
 
-/* ===== Lock down stray horizontal scroll on text/KPI elements =====
-   Subheaders, st.metric cards, markdown blocks, and tab labels should
-   never be horizontally scrollable. If their content is too wide for
-   the viewport, it should wrap or truncate — never produce a side-scroll
-   region that the user can swipe and reposition. */
+/* ===== Lock down stray horizontal scroll on text/KPI/tab elements
+   The previous rule only targeted the obvious containers but missed
+   the SCROLLABLE inner divs Streamlit creates inside stMetric +
+   stTabs. This rule cascades into every descendant of those containers,
+   targeting any element that has an overflow:auto/scroll style applied
+   directly. */
 [data-testid="stMetric"],
+[data-testid="stMetric"] *,
 [data-testid="stMetricLabel"],
+[data-testid="stMetricLabel"] *,
 [data-testid="stMetricValue"],
+[data-testid="stMetricValue"] *,
 [data-testid="stMetricDelta"],
+[data-testid="stMetricDelta"] *,
 [data-testid="stMarkdown"],
+[data-testid="stMarkdown"] *,
 [data-testid="stMarkdownContainer"],
+[data-testid="stMarkdownContainer"] *,
 [data-testid="stHeader"],
+[data-testid="stHeader"] *,
 [data-testid="stHeading"],
+[data-testid="stHeading"] *,
 [data-testid="stSubheader"],
+[data-testid="stSubheader"] *,
 [data-testid="stCaption"],
 [data-testid="stText"],
 [data-testid="stTabs"],
-.stTabs [role="tablist"],
-.stMarkdown,
+[data-testid="stTabs"] *,
 .stTabs,
+.stTabs *,
+.stTabs [role="tablist"],
+.stTabs [role="tab"],
+.stMarkdown,
+.stMarkdown *,
 .stText,
-h1, h2, h3, h4, h5, h6, p, span, div.stMarkdown {
+h1, h2, h3, h4, h5, h6, p, span,
+div[data-testid="stVerticalBlock"] > div > h1,
+div[data-testid="stVerticalBlock"] > div > h2,
+div[data-testid="stVerticalBlock"] > div > h3,
+div[data-testid="stVerticalBlock"] > div > h4 {
     overflow-x: hidden !important;
-    overflow-y: visible !important;
     touch-action: pan-y !important;
     overscroll-behavior-x: contain !important;
     word-wrap: break-word !important;
-    word-break: normal;
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+
+/* Hide any leftover horizontal scrollbar visuals on those elements */
+[data-testid="stMetric"]::-webkit-scrollbar,
+[data-testid="stMarkdown"]::-webkit-scrollbar,
+[data-testid="stTabs"]::-webkit-scrollbar,
+.stTabs::-webkit-scrollbar,
+h1::-webkit-scrollbar, h2::-webkit-scrollbar,
+h3::-webkit-scrollbar, h4::-webkit-scrollbar {
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
 }
 
 /* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
@@ -16785,15 +17284,27 @@ def main():
                             st.markdown(_flat_html(chips_html), unsafe_allow_html=True)
 
         # =========================
-        # GRIP LIBRARY (browse all grips)
+        # GRIP LIBRARY (browse all grips) — sport-filtered
         # =========================
-        with st.expander("🤲 Grip Library — browse all grips with plain-English instructions", expanded=False):
+        _is_softball = (athlete_sport == "Softball")
+        _grip_lib_label = ("🤲 Grip Library — softball windmill grips"
+                            if _is_softball else
+                            "🤲 Grip Library — baseball overhand grips")
+        with st.expander(_grip_lib_label + " (plain-English instructions)",
+                          expanded=False):
             st.caption(
                 "Each grip below is described for any coach, player, or parent — "
-                "no jargon. If a baseball term is unfamiliar, check the **Baseball "
-                "Glossary** at the bottom of this tab."
+                "no jargon. If a term is unfamiliar, check the **Glossary** "
+                "at the bottom of this tab."
             )
             for gk, info in GRIP_LIBRARY.items():
+                # Filter by sport: softball grips have keys starting with
+                # "softball_"; everything else is baseball.
+                is_softball_grip = gk.startswith("softball_")
+                if _is_softball and not is_softball_grip:
+                    continue
+                if not _is_softball and is_softball_grip:
+                    continue
                 with st.container(border=True):
                     gcol1, gcol2 = st.columns([1, 1.4])
                     with gcol1:
