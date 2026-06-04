@@ -722,6 +722,154 @@ DRILL_LIBRARY = {
     },
 
     # =========================================================================
+    # TECHNIQUE — PITCH-SPECIFIC DRILLS (tied to grip-library 'common mistakes')
+    # =========================================================================
+    "wrist_lock_drill": {
+        "category": "Technique — Slider / Curve",
+        "phase": "week",
+        "priority": 2,
+        "label": "Wrist Lock Drill (Stop Wrist-Twisting)",
+        "drill": "Athletic-tape wrist brace + slider/curve flat-ground reps with locked wrist",
+        "protocol": "Tape the wrist into a neutral position (palm facing the target). Throw 2×10 sliders at 50% then 2×10 at 80% effort, 2 days this week. Goal: feel the middle finger doing the work — wrist can't twist.",
+        "why": "Wrist twist at release is the #1 youth UCL injury mechanism on sliders and curveballs. The tape gives instant tactile feedback when the wrist tries to break — the body learns to use the middle finger instead.",
+    },
+    "towel_arm_path_drill": {
+        "category": "Technique — Foundation",
+        "phase": "week",
+        "priority": 3,
+        "label": "Towel Drill — Clean Arm Path",
+        "drill": "Hand-towel snap throws focused on arm slot consistency",
+        "protocol": "Hold a small hand towel, mimic full delivery and snap the towel forward. 3 sets × 12 reps, 3 days/week. Listen for the towel snap sound — if it varies, your arm slot is varying.",
+        "why": "Removes the ball as a variable so the arm path gets the only attention. Repeatable arm slot = repeatable release = command. Pros use towel work as a daily warmup.",
+    },
+    "football_throws_slider": {
+        "category": "Technique — Slider",
+        "phase": "week",
+        "priority": 2,
+        "label": "Football Throws — Pure Side Spin",
+        "drill": "Throw an American football to feel side-spin without wrist twist",
+        "protocol": "2 sets × 8 throws at 60 ft, 2 days/week. Focus: the football spirals because of clean middle-finger pull at release. No wrist break.",
+        "why": "A football literally cannot spiral if you twist the wrist — the only way to get clean spin is the middle-finger lever. This is the exact mechanic of a good slider, taught with bigger, more forgiving feedback.",
+    },
+    "spike_slider_ladder": {
+        "category": "Technique — Slider",
+        "phase": "week",
+        "priority": 3,
+        "label": "Spike-Slider Grip Ladder",
+        "drill": "Progressive distance reps with the spike grip",
+        "protocol": "10 reps at 30 ft (soft toss) → 10 reps at 60 ft (long toss) → 10 reps from the mound. 2 days/week. Repeat full ladder each session.",
+        "why": "Builds the spike-grip muscle memory at increasing intent without rushing it. Most pitchers who skip the ladder feel the spike grip 'foreign' on the mound and abandon it after a couple bad pitches.",
+    },
+    "one_knee_curveball": {
+        "category": "Technique — Curveball",
+        "phase": "week",
+        "priority": 2,
+        "label": "One-Knee Curveball Release Reps",
+        "drill": "Drop the back knee; throw curveballs at half effort from one knee",
+        "protocol": "Throwing-side knee on the ground, glove-side leg out front. Throw 3 sets × 8 curveballs at 50 ft. 2 days/week.",
+        "why": "Removes lower-body variables so the arm action and wrist position are isolated. Coaches see immediately whether the curve break is grip+arm-driven or wrist-snap driven.",
+    },
+    "thumb_up_drill": {
+        "category": "Technique — Curveball",
+        "phase": "week",
+        "priority": 3,
+        "label": "Thumb-Up Curveball Drill",
+        "drill": "Start the throw with the thumb pointing UP at the cocked position",
+        "protocol": "Slow-mo dry reps focusing on thumb position throughout the arm path. 2×10 reps before each curveball bullpen session.",
+        "why": "Thumb-up at cocked sets the forearm in the proper supinated plane for a curve — pulling down through the release happens NATURALLY without wrist roll. Cleanest curve mechanic available.",
+    },
+    "fastball_change_alternation": {
+        "category": "Technique — Changeup",
+        "phase": "week",
+        "priority": 2,
+        "label": "Fastball-Changeup Alternation",
+        "drill": "Alternate fastballs and changeups with identical arm speed",
+        "protocol": "Long toss at 75-90 ft. 5 fastballs → 5 changeups → repeat 5 cycles. 3 days/week. Catcher gives feedback if arm speed differs.",
+        "why": "The #1 changeup failure is arm-speed deceleration. Alternation reps train the body to keep arm speed identical regardless of grip. This is the WHOLE pitch.",
+    },
+    "speed_blind_tossing": {
+        "category": "Technique — Changeup",
+        "phase": "week",
+        "priority": 3,
+        "label": "Speed-Blind Tossing (Catcher's Test)",
+        "drill": "Catcher closes eyes between pitches; pitcher mixes fastball/changeup",
+        "protocol": "Bullpen, 20 pitches mixed FB/CH. Catcher closes eyes between pitches and guesses by feel/sound only. Score the success rate at 80% to pass.",
+        "why": "Direct deception test. If a catcher in a controlled setting can guess your changeup from arm action alone, a hitter at game speed certainly will. Brutally honest feedback loop.",
+    },
+    "tunnel_drill_vs_fastball": {
+        "category": "Technique — Sequencing",
+        "phase": "week",
+        "priority": 2,
+        "label": "Tunneling Drill vs Fastball",
+        "drill": "Throw your off-speed pitch on the same release tunnel as your fastball",
+        "protocol": "Hang a small target/towel at the 'commit point' (~25 ft from release). Throw 3 FB then 3 CB/SL — both must pass through the same window before breaking. 2-3 days/week.",
+        "why": "Hitters decide swing/take at the commit point, ~25 ft from release. Pitches that share a tunnel until then are mathematically indistinguishable. Tunneling adds 'invisible' value to existing stuff.",
+    },
+    "pivot_pickoff_drill": {
+        "category": "Technique — Foundation",
+        "phase": "week",
+        "priority": 3,
+        "label": "Pivot Pick-Off Drill",
+        "drill": "Quarter-turn pivot then throw — cleans up the arm path",
+        "protocol": "Quarter-turn glove side, immediate throw to a target 60 ft away. 3 sets × 8 reps with 6oz plyo. 2 days/week.",
+        "why": "Forces the arm to find its slot without windup compensation. Pitchers with arm-path issues see the cleanup transfer to the mound within 2-3 sessions.",
+    },
+    "y_finger_splitter_drops": {
+        "category": "Technique — Splitter",
+        "phase": "week",
+        "priority": 3,
+        "label": "Y-Finger Splitter Drops",
+        "drill": "From the cocked position, 'drop' the ball with split fingers (no follow-through)",
+        "protocol": "Stand, ball at cocked position, just open the split fingers and let the ball fall straight down. 3 sets × 10 reps daily for a week.",
+        "why": "Teaches the feel of the ball 'falling out' of the split position without wrist snap. Once the body grooves the feel, normal arm action layers cleanly on top.",
+    },
+    "fingernail_conditioning": {
+        "category": "Technique — Knuckleball / Knuckle Curve",
+        "phase": "today",
+        "priority": 2,
+        "label": "Fingernail Conditioning (Rice Bucket)",
+        "drill": "Push and grind fingernails through a bucket of dry rice",
+        "protocol": "5 min before any knuckleball/knuckle-curve session. Rotate index, middle, ring fingertip pads through rice.",
+        "why": "Toughens the fingernail bed so the spike/knuckle grip doesn't shred the nail mid-game. Every knuckleballer in MLB does this religiously.",
+    },
+    "softball_k_position_holds": {
+        "category": "Technique — Softball Windmill",
+        "phase": "week",
+        "priority": 2,
+        "label": "K-Position Holds (Wall Front)",
+        "drill": "Walk to a wall, stop at K-position, hold 3 sec, drive forward",
+        "protocol": "Face a wall arm's length away. Step into K-position (arm overhead at 12:00). Hold 3 seconds. Drive forward. 3 sets × 8 reps, 3 days/week.",
+        "why": "Teaches the proper top-of-windmill position. Most rise-ball and command problems trace back to a sloppy K-position. The wall enforces alignment.",
+    },
+    "softball_brush_at_hip": {
+        "category": "Technique — Softball Windmill",
+        "phase": "week",
+        "priority": 2,
+        "label": "Brush-at-Hip Release Reps",
+        "drill": "Practice the release with the wrist physically brushing the inside of the hip",
+        "protocol": "Slow-mo windmill, focus on the wrist touching the hip at release. 2 sets × 10 reps slow + 2 sets × 10 reps half-speed. 3 days/week.",
+        "why": "Brushing the hip ensures the release point is at 6:00 exactly. Releases in front of the hip cost 3-6 mph and tip the pitch to a smart hitter.",
+    },
+    "softball_rise_flick_up": {
+        "category": "Technique — Softball Rise",
+        "phase": "week",
+        "priority": 2,
+        "label": "Rise Ball Flick-Up Drill",
+        "drill": "From a stationary position, flick the ball straight UP off the fingertips",
+        "protocol": "Stand facing a wall. Hold rise ball grip at hip level. Flick the ball straight up so it travels 2-3 feet vertically. 3 sets × 12 reps daily.",
+        "why": "Isolates the wrist supination + fingertip backspin imparting motion. Most rise balls fail not because of the grip but because the pitcher's fingertips don't push up hard enough at release.",
+    },
+    "softball_door_knob_roll": {
+        "category": "Technique — Softball Drop",
+        "phase": "week",
+        "priority": 3,
+        "label": "Door-Knob Wrist Roll (Roll Drop)",
+        "drill": "Mimic the wrist roll at release with a literal door knob",
+        "protocol": "Stand at a door, grip the knob in fastball grip. Slowly rotate the knob in the roll-drop direction (clockwise for RHP). 3 sets × 10 reps daily.",
+        "why": "Embeds the precise wrist motion in muscle memory without throwing reps. Roll drops fail when pitchers over-rotate or under-rotate; the door knob makes the correct motion feel right.",
+    },
+
+    # =========================================================================
     # SOFTBALL-SPECIFIC DRILLS (windmill mechanics)
     # =========================================================================
     "softball_low_rise_spin": {
@@ -8829,12 +8977,10 @@ button, input, select, textarea {
     margin-left: 0 !important;
 }
 
-/* ===== Lock down stray horizontal scroll on text/KPI/tab elements
-   The previous rule only targeted the obvious containers but missed
-   the SCROLLABLE inner divs Streamlit creates inside stMetric +
-   stTabs. This rule cascades into every descendant of those containers,
-   targeting any element that has an overflow:auto/scroll style applied
-   directly. */
+/* ===== Lock down stray horizontal scroll on TEXT + KPI cards only
+   Excludes Tabs entirely — tabs NEED horizontal scroll on mobile
+   when there are more tabs than fit on the screen. The previous rule
+   broke that. */
 [data-testid="stMetric"],
 [data-testid="stMetric"] *,
 [data-testid="stMetricLabel"],
@@ -8848,27 +8994,12 @@ button, input, select, textarea {
 [data-testid="stMarkdownContainer"],
 [data-testid="stMarkdownContainer"] *,
 [data-testid="stHeader"],
-[data-testid="stHeader"] *,
 [data-testid="stHeading"],
-[data-testid="stHeading"] *,
 [data-testid="stSubheader"],
-[data-testid="stSubheader"] *,
 [data-testid="stCaption"],
-[data-testid="stText"],
-[data-testid="stTabs"],
-[data-testid="stTabs"] *,
-.stTabs,
-.stTabs *,
-.stTabs [role="tablist"],
-.stTabs [role="tab"],
 .stMarkdown,
 .stMarkdown *,
-.stText,
-h1, h2, h3, h4, h5, h6, p, span,
-div[data-testid="stVerticalBlock"] > div > h1,
-div[data-testid="stVerticalBlock"] > div > h2,
-div[data-testid="stVerticalBlock"] > div > h3,
-div[data-testid="stVerticalBlock"] > div > h4 {
+h1, h2, h3, h4, h5, h6, p {
     overflow-x: hidden !important;
     touch-action: pan-y !important;
     overscroll-behavior-x: contain !important;
@@ -8877,16 +9008,53 @@ div[data-testid="stVerticalBlock"] > div > h4 {
     scrollbar-width: none;
 }
 
-/* Hide any leftover horizontal scrollbar visuals on those elements */
+/* Hide leftover horizontal scrollbar visuals on text/KPI elements only */
 [data-testid="stMetric"]::-webkit-scrollbar,
 [data-testid="stMarkdown"]::-webkit-scrollbar,
-[data-testid="stTabs"]::-webkit-scrollbar,
-.stTabs::-webkit-scrollbar,
 h1::-webkit-scrollbar, h2::-webkit-scrollbar,
 h3::-webkit-scrollbar, h4::-webkit-scrollbar {
     display: none !important;
     width: 0 !important;
     height: 0 !important;
+}
+
+/* ===== Tabs: EXPLICITLY ALLOW horizontal scroll + visible labels =====
+   Streamlit's tab bar is a flex row that needs to overflow when there
+   are too many tabs to fit the viewport. We make sure that overflow
+   stays enabled and the tab labels can't be truncated/clipped. */
+[data-testid="stTabs"],
+.stTabs {
+    overflow-x: auto !important;
+    overflow-y: visible !important;
+    width: 100% !important;
+    max-width: 100vw !important;
+    -webkit-overflow-scrolling: touch !important;
+    touch-action: pan-x pan-y !important;
+}
+[data-testid="stTabs"] [role="tablist"],
+.stTabs [role="tablist"] {
+    flex-wrap: nowrap !important;
+    overflow-x: auto !important;
+    overflow-y: visible !important;
+    -webkit-overflow-scrolling: touch !important;
+    touch-action: pan-x !important;
+}
+[data-testid="stTabs"] [role="tab"],
+.stTabs [role="tab"] {
+    flex-shrink: 0 !important;
+    white-space: nowrap !important;
+    overflow: visible !important;
+}
+/* Show the scrollbar on the tab strip so users know they can scroll */
+[data-testid="stTabs"]::-webkit-scrollbar,
+.stTabs::-webkit-scrollbar {
+    height: 4px;
+    display: block !important;
+}
+[data-testid="stTabs"]::-webkit-scrollbar-thumb,
+.stTabs::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.4);
+    border-radius: 2px;
 }
 
 /* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
