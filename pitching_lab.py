@@ -9124,26 +9124,18 @@ def _field_dimensions(sport: str) -> dict:
 
 
 def widen_baselines(x: float, y: float,
-                      transition_y: float = 222.0,
+                      transition_y: float = 169.0,
                       max_stretch: float = 1.20) -> tuple:
-    """Stretch X near home plate; taper to 1× by the foul-pole Y so the
-    foul poles and OF wall stay exactly where they are.
-
-    Effect on the chart:
-      - 1st and 3rd baselines bow outward into a gentle curve
-      - 1st and 3rd base markers sit visibly wider apart
-      - Outfield wall arc + foul pole positions unchanged
-      - The chart's overall outside dimensions are preserved
-
-    Defaults: max_stretch=1.20 (20% wider at home), taper to 1× at
-    y=222 (which equals scale_dist(330) — the compressed foul-pole Y).
-    Applied AFTER scale_dist to (x, y) coordinates.
+    """Helper that stretches X near home plate, tapering to 1× at the
+    foul pole Y. Currently unused — kept as a future tool. Aggressive
+    stretching would push bases toward chart edges but at the cost of
+    distorting the chart on desktop too.
     """
     if y is None or x is None:
         return x, y
     if y >= transition_y or y <= 0:
         return x, y
-    t = y / transition_y          # 0 at home, 1 at foul-pole Y
+    t = y / transition_y
     factor = max_stretch * (1 - t) + 1.0 * t
     return x * factor, y
 
@@ -9281,10 +9273,18 @@ def _build_spray_chart_figure(df: pd.DataFrame, sport: str = "Baseball",
     ))
 
     # ----- (2) Dirt infield (skinned infield arc + basepaths) -----
-    # Skinned infield is roughly a 95-110 ft arc from home around the bases
-    # (smaller for softball). Draw it as a sector polygon.
+    # Skinned infield extends from home plate out to past 2nd base.
+    # In real fields the skin radius ≈ 150 ft for baseball (extends
+    # past the bases by ~25 ft past 2nd base). Was bp*1.3 = 117 which
+    # cut off BEFORE 2nd base — a real bug. Now bp*1.7 = 153 (baseball)
+    # so 2nd base (at distance 127 from home) is comfortably inside.
+    # Distance gets compressed via scale_dist so the dirt arc lines up
+    # with the rest of the chart.
     bp = fd["base_path_ft"]
-    skinned_radius = (bp * 1.3 if sport == "Baseball" else bp * 1.25)
+    skinned_radius_raw = (bp * 1.70 if sport == "Baseball" else bp * 1.55)
+    skinned_radius = scale_dist(skinned_radius_raw,
+                                   base_path_ft=base_path_ft,
+                                   compression=COMPRESSION)
     dirt_pts_x, dirt_pts_y = [0], [0]
     for deg in range(-45, 46, 3):
         rad = math.radians(deg)
