@@ -8640,12 +8640,47 @@ def render_grip_variants(grip_key: str):
         )
 
 
-def render_grip_diagram(grip_key: str, height: int = 380):
-    """Render a grip SVG reliably via an iframe component.
+def _grip_photo_url(grip_key: str) -> str | None:
+    """Return a photo URL for the grip if one is configured.
 
-    Streamlit's st.markdown(html, unsafe_allow_html=True) escapes complex SVG
-    when nested inside containers + columns. components.v1.html sidesteps that.
+    Resolution order:
+      1. GRIP_LIBRARY[grip_key]["image_url"] — coach-supplied per grip
+      2. A locally-uploaded file in /grip_photos/{grip_key}.jpg (or .png)
+      3. None — caller falls back to the SVG diagram
+
+    Storing photos locally means coaches can drop their own JPEGs into
+    a `grip_photos/` folder next to the app and they'll auto-show — no
+    code changes needed. Filenames must match the grip_key (e.g.
+    `four_seam_fastball.jpg`).
     """
+    import os
+    info = GRIP_LIBRARY.get(grip_key) or {}
+    url = info.get("image_url")
+    if url:
+        return url
+    # Check the local grip_photos/ directory for a matching file
+    here = os.path.dirname(os.path.abspath(__file__))
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        path = os.path.join(here, "grip_photos", f"{grip_key}{ext}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def render_grip_diagram(grip_key: str, height: int = 380):
+    """Render a grip with PHOTO PREFERRED, SVG fallback.
+
+    Priority:
+      1. If GRIP_LIBRARY[grip_key]["image_url"] is set OR a matching file
+         exists in grip_photos/, show that image.
+      2. Otherwise fall back to the SVG diagram.
+    """
+    photo = _grip_photo_url(grip_key)
+    if photo:
+        # st.image handles both URLs (http/https) and local paths
+        st.image(photo, use_container_width=True)
+        st.caption("Grip photo · for label-only diagram, see the seam map below.")
+        return
     import streamlit.components.v1 as components
     components.html(grip_svg(grip_key), height=height, scrolling=False)
 
