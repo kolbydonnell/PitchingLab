@@ -8977,83 +8977,29 @@ button, input, select, textarea {
     margin-left: 0 !important;
 }
 
-/* ===== Lock down stray horizontal scroll on TEXT + KPI cards only
-   Excludes Tabs entirely — tabs NEED horizontal scroll on mobile
-   when there are more tabs than fit on the screen. The previous rule
-   broke that. */
-[data-testid="stMetric"],
-[data-testid="stMetric"] *,
-[data-testid="stMetricLabel"],
-[data-testid="stMetricLabel"] *,
-[data-testid="stMetricValue"],
-[data-testid="stMetricValue"] *,
-[data-testid="stMetricDelta"],
-[data-testid="stMetricDelta"] *,
-[data-testid="stMarkdown"],
-[data-testid="stMarkdown"] *,
-[data-testid="stMarkdownContainer"],
-[data-testid="stMarkdownContainer"] *,
-[data-testid="stHeader"],
-[data-testid="stHeading"],
-[data-testid="stSubheader"],
-[data-testid="stCaption"],
-.stMarkdown,
-.stMarkdown *,
-h1, h2, h3, h4, h5, h6, p {
-    overflow-x: hidden !important;
-    touch-action: pan-y !important;
-    overscroll-behavior-x: contain !important;
-    word-wrap: break-word !important;
-    -ms-overflow-style: none;
-    scrollbar-width: none;
-}
-
-/* Hide leftover horizontal scrollbar visuals on text/KPI elements only */
-[data-testid="stMetric"]::-webkit-scrollbar,
-[data-testid="stMarkdown"]::-webkit-scrollbar,
-h1::-webkit-scrollbar, h2::-webkit-scrollbar,
-h3::-webkit-scrollbar, h4::-webkit-scrollbar {
-    display: none !important;
-    width: 0 !important;
-    height: 0 !important;
-}
-
-/* ===== Tabs: EXPLICITLY ALLOW horizontal scroll + visible labels =====
-   Streamlit's tab bar is a flex row that needs to overflow when there
-   are too many tabs to fit the viewport. We make sure that overflow
-   stays enabled and the tab labels can't be truncated/clipped. */
-[data-testid="stTabs"],
-.stTabs {
-    overflow-x: auto !important;
-    overflow-y: visible !important;
-    width: 100% !important;
-    max-width: 100vw !important;
-    -webkit-overflow-scrolling: touch !important;
-    touch-action: pan-x pan-y !important;
-}
+/* ===== Tabs — ensure full labels are visible AND horizontal scroll
+   works when there are too many tabs to fit the viewport. */
 [data-testid="stTabs"] [role="tablist"],
 .stTabs [role="tablist"] {
-    flex-wrap: nowrap !important;
     overflow-x: auto !important;
-    overflow-y: visible !important;
+    overflow-y: hidden !important;
+    flex-wrap: nowrap !important;
     -webkit-overflow-scrolling: touch !important;
-    touch-action: pan-x !important;
 }
 [data-testid="stTabs"] [role="tab"],
 .stTabs [role="tab"] {
     flex-shrink: 0 !important;
     white-space: nowrap !important;
-    overflow: visible !important;
+    min-width: max-content !important;
 }
-/* Show the scrollbar on the tab strip so users know they can scroll */
-[data-testid="stTabs"]::-webkit-scrollbar,
-.stTabs::-webkit-scrollbar {
-    height: 4px;
-    display: block !important;
+/* Slim visible scrollbar on the tab strip so users see they can scroll */
+[data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar,
+.stTabs [role="tablist"]::-webkit-scrollbar {
+    height: 3px;
 }
-[data-testid="stTabs"]::-webkit-scrollbar-thumb,
-.stTabs::-webkit-scrollbar-thumb {
-    background: rgba(148, 163, 184, 0.4);
+[data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar-thumb,
+.stTabs [role="tablist"]::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.45);
     border-radius: 2px;
 }
 
