@@ -8696,8 +8696,12 @@ def _baseball_seams_svg() -> str:
 
 
 def grip_svg(grip_key: str) -> str:
-    """Return an inline SVG diagram of the grip viewed from the release perspective."""
-    # Ball body with subtle radial gradient for a 3D feel
+    """Return an inline SVG diagram of the grip viewed from the release
+    perspective. Redesigned to show actual finger shapes wrapping around
+    the ball (per user reference imagery), not abstract circle markers.
+    """
+    # Ball body with subtle radial gradient + a thumb/palm silhouette
+    # peeking from behind so the ball reads as being HELD, not floating.
     ball_outline = """
     <defs>
       <radialGradient id="ballSheen" cx="0.35" cy="0.35" r="0.7">
@@ -8705,70 +8709,135 @@ def grip_svg(grip_key: str) -> str:
         <stop offset="60%" stop-color="#f5f1e8"/>
         <stop offset="100%" stop-color="#e1d8c4"/>
       </radialGradient>
+      <radialGradient id="skinTone" cx="0.5" cy="0.4" r="0.6">
+        <stop offset="0%" stop-color="#f5cda5"/>
+        <stop offset="100%" stop-color="#d9a36a"/>
+      </radialGradient>
+      <linearGradient id="fingerPad" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%" stop-color="#f3c89c"/>
+        <stop offset="100%" stop-color="#c68a52"/>
+      </linearGradient>
     </defs>
+    <!-- Palm silhouette peeking from below/behind the ball -->
+    <path d="M 60 230 Q 90 310 160 320 Q 230 310 260 230 Q 260 280 220 295 Q 160 305 100 295 Q 60 280 60 230 Z"
+          fill="url(#skinTone)" opacity="0.85" stroke="#a87648" stroke-width="1.2"/>
+    <!-- Ball -->
     <circle cx="160" cy="160" r="120" fill="url(#ballSheen)" stroke="#222" stroke-width="2.5"/>
     """
     seams = _baseball_seams_svg()
-    # Each grip overlays finger markers + labels
+
+    # ---- Helper: render a finger-shape on the ball ----
+    # Each finger is a rounded "tongue" shape with a fingernail at the tip.
+    # Args: cx, cy = center of finger pad; angle = orientation (0 = up);
+    # length = finger length; label = letter to show next to fingernail.
+    def _finger(cx, cy, angle=0, length=70, label="", spike=False):
+        import math as _m
+        ang = _m.radians(angle)
+        # End of finger (where the knuckle would be — the part farthest from
+        # the fingertip)
+        bx = cx - length * _m.sin(ang)
+        by = cy + length * _m.cos(ang)
+        # Width tapers from tip (narrower) to base (wider)
+        if spike:
+            # Spiked finger: nail digs into ball, curled up. Draw a smaller
+            # tighter shape with a more pronounced nail.
+            tip_w, base_w = 13, 18
+            nail = (f'<ellipse cx="{cx}" cy="{cy}" rx="6" ry="4" '
+                    f'fill="#fff8e6" stroke="#b8895a" stroke-width="1"/>')
+        else:
+            tip_w, base_w = 17, 22
+            nail = (f'<ellipse cx="{cx}" cy="{cy - 2}" rx="8" ry="5" '
+                    f'fill="#fff8e6" stroke="#b8895a" stroke-width="0.8"/>')
+        # Two side points for the finger body (perpendicular to direction)
+        perp = ang + _m.pi/2
+        tlx = cx + tip_w  * _m.cos(perp)
+        tly = cy + tip_w  * _m.sin(perp)
+        trx = cx - tip_w  * _m.cos(perp)
+        try_ = cy - tip_w  * _m.sin(perp)
+        blx = bx + base_w * _m.cos(perp)
+        bly = by + base_w * _m.sin(perp)
+        brx = bx - base_w * _m.cos(perp)
+        bry = by - base_w * _m.sin(perp)
+        body = (f'<path d="M {tlx:.1f} {tly:.1f} '
+                f'Q {(tlx+blx)/2:.1f} {(tly+bly)/2:.1f} {blx:.1f} {bly:.1f} '
+                f'L {brx:.1f} {bry:.1f} '
+                f'Q {(trx+brx)/2:.1f} {(try_+bry)/2:.1f} {trx:.1f} {try_:.1f} Z" '
+                f'fill="url(#fingerPad)" stroke="#a87648" stroke-width="1.2"/>')
+        lbl = ""
+        if label:
+            lbl = (f'<text x="{cx+22}" y="{cy+5}" font-size="13" '
+                   f'font-weight="bold" fill="#5c3a1a">{label}</text>')
+        return body + nail + lbl
+
+    # Bind helper into local scope for the overlays below
+    finger = _finger
+    # Each grip overlays REAL finger shapes (rounded fingertip pads with
+    # nails) at accurate positions on the ball.
     overlays = {
-        "four_seam_fastball": """
-            <circle cx="130" cy="140" r="18" fill="#2563eb" opacity="0.85"/>
-            <text x="130" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">I</text>
-            <circle cx="190" cy="140" r="18" fill="#2563eb" opacity="0.85"/>
-            <text x="190" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
-            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
-            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
-            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Fingers ACROSS the horseshoe</text>
-        """,
-        "two_seam_fastball": """
-            <circle cx="145" cy="140" r="18" fill="#f97316" opacity="0.85"/>
-            <text x="145" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">I</text>
-            <circle cx="175" cy="140" r="18" fill="#f97316" opacity="0.85"/>
-            <text x="175" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
-            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
-            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
-            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Fingers ALONG the parallel seams</text>
-        """,
-        "slider_standard": """
-            <circle cx="170" cy="140" r="18" fill="#1d4ed8" opacity="0.85"/>
-            <text x="170" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
-            <circle cx="145" cy="145" r="16" fill="#60a5fa" opacity="0.75"/>
-            <text x="145" y="150" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
-            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
-            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
-            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Middle finger on long seam; index rests next to it</text>
-        """,
-        "slider_spike_seam": """
-            <circle cx="180" cy="145" r="18" fill="#1d4ed8" opacity="0.9"/>
-            <text x="180" y="150" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
-            <!-- spiked index = small triangle marker pointing into the seam -->
-            <polygon points="135,125 150,150 120,150" fill="#dc2626" opacity="0.95"/>
-            <text x="135" y="170" text-anchor="middle" fill="#dc2626" font-size="13" font-weight="bold">I (spiked)</text>
-            <circle cx="160" cy="220" r="18" fill="#7c3aed" opacity="0.85"/>
-            <text x="160" y="225" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T</text>
-            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">SPIKE the index finger — knuckle bent, tip into seam</text>
-        """,
-        "curveball": """
-            <circle cx="170" cy="140" r="18" fill="#0891b2" opacity="0.85"/>
-            <text x="170" y="145" text-anchor="middle" fill="white" font-size="14" font-weight="bold">M</text>
-            <circle cx="148" cy="142" r="16" fill="#22d3ee" opacity="0.85"/>
-            <text x="148" y="147" text-anchor="middle" fill="white" font-size="13" font-weight="bold">I</text>
-            <circle cx="155" cy="225" r="18" fill="#0d9488" opacity="0.9"/>
-            <text x="155" y="230" text-anchor="middle" fill="white" font-size="14" font-weight="bold">T*</text>
-            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="14" font-weight="bold">Thumb HOOKS opposite seam — middle pulls down</text>
-        """,
-        "changeup_circle": """
-            <!-- circle ring on the side of the ball -->
-            <ellipse cx="100" cy="170" rx="20" ry="22" fill="none" stroke="#16a34a" stroke-width="4"/>
-            <text x="100" y="175" text-anchor="middle" fill="#16a34a" font-size="12" font-weight="bold">⭕</text>
-            <circle cx="155" cy="130" r="16" fill="#16a34a" opacity="0.75"/>
-            <text x="155" y="135" text-anchor="middle" fill="white" font-size="13" font-weight="bold">M</text>
-            <circle cx="185" cy="135" r="15" fill="#16a34a" opacity="0.6"/>
-            <text x="185" y="140" text-anchor="middle" fill="white" font-size="12" font-weight="bold">R</text>
-            <circle cx="210" cy="155" r="13" fill="#16a34a" opacity="0.5"/>
-            <text x="210" y="160" text-anchor="middle" fill="white" font-size="11" font-weight="bold">P</text>
-            <text x="160" y="305" text-anchor="middle" fill="#333" font-size="13" font-weight="bold">Thumb+index form circle on the side</text>
-        """,
+        "four_seam_fastball":
+            # Index + middle fingers ACROSS the seams (perpendicular).
+            # Thumb underneath on the opposite seam.
+            finger(130, 105, angle=0, length=85, label="I") +
+            finger(190, 105, angle=0, length=85, label="M") +
+            finger(160, 240, angle=180, length=70, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Index + middle ACROSS the '
+            'horseshoe · thumb underneath</text>',
+        "two_seam_fastball":
+            # Index + middle ALONG the parallel narrow seams (closer together)
+            finger(145, 105, angle=0, length=85, label="I") +
+            finger(180, 105, angle=0, length=85, label="M") +
+            finger(160, 240, angle=180, length=70, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Fingers ALONG the parallel '
+            'seams · sit close together</text>',
+        "slider_standard":
+            # Middle finger on the long seam (positioned off-center, leaning
+            # to one side). Index touches next to it.
+            finger(180, 100, angle=-8, length=85, label="M") +
+            finger(150, 110, angle=-12, length=78, label="I") +
+            finger(155, 240, angle=180, length=68, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Middle on long seam · '
+            'index touching · wrist LOCKED</text>',
+        "slider_spike_seam":
+            # Middle finger pulled down on seam, index SPIKED (small + tight)
+            # right next to it.
+            finger(185, 105, angle=-5, length=85, label="M") +
+            finger(150, 130, angle=0, length=42, label="", spike=True) +
+            '<text x="125" y="148" font-size="12" font-weight="bold" '
+            'fill="#b91c1c">I (spiked)</text>' +
+            finger(160, 240, angle=180, length=68, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Index SPIKED (curled, '
+            'tip into seam) · middle pulls down</text>',
+        "curveball":
+            # Middle on long seam, index right beside it, thumb HOOKS the
+            # opposite seam (drawn higher up on the ball).
+            finger(170, 100, angle=-5, length=85, label="M") +
+            finger(148, 110, angle=-8, length=80, label="I") +
+            # Thumb wrapping up on the opposite side (under-curl)
+            finger(150, 250, angle=170, length=72, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Thumb HOOKS opposite seam · '
+            'middle pulls DOWN at release</text>',
+        "changeup_circle":
+            # The defining feature: thumb + index form a CIRCLE on the side.
+            # Middle/ring/pinky lay across the top of the ball.
+            # Draw the circle as an actual OK-sign loop on the left side
+            # of the ball, then the back three fingers across the top.
+            '<ellipse cx="92" cy="170" rx="22" ry="26" fill="none" '
+            'stroke="#a87648" stroke-width="5"/>'
+            '<ellipse cx="92" cy="170" rx="14" ry="18" fill="#f3c89c" '
+            'stroke="#a87648" stroke-width="2"/>'
+            '<text x="92" y="174" text-anchor="middle" font-size="11" '
+            'font-weight="bold" fill="#5c3a1a">OK</text>' +
+            finger(155, 95, angle=-3, length=75, label="M") +
+            finger(190, 100, angle=2, length=72, label="R") +
+            finger(220, 115, angle=18, length=65, label="P") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Thumb + index form circle '
+            'on the side · 3 fingers on top</text>',
 
         # ===== Softball grip overlays =====
         "softball_fastball": """
@@ -8853,6 +8922,119 @@ def grip_svg(grip_key: str) -> str:
             <text x="210" y="144" text-anchor="middle" fill="white" font-size="10" font-weight="bold">P</text>
             <text x="160" y="305" text-anchor="middle" fill="#333" font-size="13" font-weight="bold">Thumb UP · ball rolls out the back of hand</text>
         """,
+        # ===== NEW BASEBALL GRIPS (added in content expansion) =====
+        "cutter":
+            # Like four-seam but shifted slightly to glove side
+            finger(140, 105, angle=-4, length=85, label="I") +
+            finger(180, 105, angle=-4, length=85, label="M") +
+            finger(160, 240, angle=180, length=70, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Four-seam shifted slightly '
+            'GLOVE-SIDE · slight cut on release</text>',
+        "splitter":
+            # Index + middle SPLIT wide on the outer edges of the horseshoe
+            finger(115, 110, angle=-12, length=85, label="I") +
+            finger(205, 110, angle=12, length=85, label="M") +
+            finger(160, 245, angle=180, length=70, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Fingers SPLIT wide around '
+            'the ball · let it fall out</text>',
+        "knuckleball":
+            # Bent fingers / fingertips digging in (small spike shapes)
+            finger(135, 145, angle=0, length=40, label="", spike=True) +
+            '<text x="118" y="160" font-size="10" font-weight="bold" '
+            'fill="#b91c1c">I (nail)</text>' +
+            finger(165, 130, angle=0, length=40, label="", spike=True) +
+            '<text x="180" y="138" font-size="10" font-weight="bold" '
+            'fill="#b91c1c">M (nail)</text>' +
+            finger(195, 145, angle=0, length=40, label="", spike=True) +
+            '<text x="208" y="160" font-size="10" font-weight="bold" '
+            'fill="#b91c1c">R (nail)</text>' +
+            finger(160, 240, angle=180, length=68, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Fingernails PUSH the ball · '
+            'no spin imparted</text>',
+        "knuckle_curve":
+            # Spiked index like a spike slider, but with thumb HOOK like curve
+            finger(180, 105, angle=-5, length=85, label="M") +
+            finger(150, 130, angle=0, length=42, label="", spike=True) +
+            '<text x="125" y="148" font-size="12" font-weight="bold" '
+            'fill="#b91c1c">I (spike)</text>' +
+            finger(150, 250, angle=170, length=72, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Spike index + thumb hook '
+            '· sharper curve break</text>',
+        "vulcan_changeup":
+            # Spock-grip: index+pinky on outside, middle+ring split wide
+            finger(115, 110, angle=-12, length=80, label="I") +
+            finger(150, 100, angle=-3, length=85, label="M") +
+            finger(185, 100, angle=3, length=85, label="R") +
+            finger(220, 115, angle=15, length=78, label="P") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Spock grip · ball wedged '
+            'between middle &amp; ring</text>',
+        "slurve":
+            # Like slider but slightly more wrist-vertical
+            finger(170, 95, angle=-12, length=85, label="M") +
+            finger(143, 110, angle=-15, length=78, label="I") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Slider grip · pulls DOWN + '
+            'across for hybrid break</text>',
+        "eephus":
+            # Any grip — we'll show a four-seam with an arc arrow indicating
+            # the LOB motion.
+            finger(140, 110, angle=0, length=80, label="I") +
+            finger(180, 110, angle=0, length=80, label="M") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            # Big arc above the ball indicating the lob trajectory
+            '<path d="M 60 200 Q 160 30 260 200" fill="none" '
+            'stroke="#d4a634" stroke-width="3" stroke-dasharray="6 4"/>'
+            '<polygon points="252,195 268,200 256,212" fill="#d4a634"/>'
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Any grip · the LOB '
+            'trajectory is the trick</text>',
+        # ===== NEW SOFTBALL GRIPS =====
+        "softball_drop_roll":
+            # Same as peel drop but with wrist-roll arrow
+            finger(158, 100, angle=0, length=70, label="I") +
+            finger(158, 152, angle=0, length=70, label="M") +
+            finger(158, 240, angle=180, length=68, label="T") +
+            # Doorknob/roll arrow on the side
+            '<path d="M 245 130 A 30 30 0 1 1 245 170" fill="none" '
+            'stroke="#7c3aed" stroke-width="3"/>'
+            '<polygon points="240,165 248,178 256,168" fill="#7c3aed"/>'
+            '<text x="278" y="155" font-size="10" font-weight="bold" '
+            'fill="#7c3aed">ROLL</text>' +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Same grip · wrist ROLLS '
+            'forward at release</text>',
+        "softball_changeup":
+            # Back-of-hand: all four fingers across top, thumb under
+            finger(130, 100, angle=-8, length=78, label="I") +
+            finger(160, 95, angle=0, length=80, label="M") +
+            finger(190, 100, angle=8, length=78, label="R") +
+            finger(218, 115, angle=18, length=70, label="P") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">All 4 fingers across top · '
+            'back of hand faces catcher at release</text>',
+        "softball_offspeed_knuckle":
+            # Bent knuckles digging into ball (same style as baseball knuckler)
+            finger(135, 145, angle=0, length=40, label="", spike=True) +
+            '<text x="118" y="160" font-size="10" font-weight="bold" '
+            'fill="#b91c1c">I (nail)</text>' +
+            finger(165, 130, angle=0, length=40, label="", spike=True) +
+            '<text x="180" y="138" font-size="10" font-weight="bold" '
+            'fill="#b91c1c">M (nail)</text>' +
+            finger(195, 145, angle=0, length=40, label="", spike=True) +
+            '<text x="208" y="160" font-size="10" font-weight="bold" '
+            'fill="#b91c1c">R (nail)</text>' +
+            finger(160, 240, angle=180, length=68, label="T") +
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Knuckles PUSH the ball · '
+            'zero spin · erratic flight</text>',
     }
     overlay = overlays.get(grip_key, "")
     return f"""
@@ -17167,19 +17349,23 @@ def main():
         def render_drill_card(d):
             badge_icon, badge_color = CATEGORY_BADGES.get(d["category"], ("•", "#666"))
             with st.container(border=True):
-                # Top accent strip in category color (4px solid bar)
-                st.markdown(
-                    f"<div style='height:4px; background:{badge_color}; "
-                    f"margin:-1rem -1rem 12px -1rem; border-radius:6px 6px 0 0;'></div>",
-                    unsafe_allow_html=True,
-                )
+                # NOTE: the old design used a 4px top accent bar via a
+                # negative-margin div, which overflowed and caused visual
+                # overlaps on mobile when scrolling. Replaced with a clean
+                # left-edge color stripe via box-shadow inset on a header
+                # block — no negative margins, no overflow risk.
                 # Header row: category badge + drill label
                 st.markdown(
-                    f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'>"
-                    f"<span style='background:{badge_color};color:white;padding:3px 11px;"
-                    f"border-radius:14px;font-size:11px;font-weight:700;letter-spacing:0.04em;'>"
+                    f"<div style='display:flex;align-items:center;gap:10px;"
+                    f"margin-bottom:10px;padding-left:10px;"
+                    f"border-left:4px solid {badge_color};border-radius:2px;"
+                    f"flex-wrap:wrap;'>"
+                    f"<span style='background:{badge_color};color:white;"
+                    f"padding:3px 11px;border-radius:14px;font-size:11px;"
+                    f"font-weight:700;letter-spacing:0.04em;white-space:nowrap;'>"
                     f"{badge_icon} {d['category'].upper()}</span>"
-                    f"<span style='font-size:17px;font-weight:700;color:#1a2150;'>{d['label']}</span>"
+                    f"<span style='font-size:17px;font-weight:700;"
+                    f"color:#f1f5f9;'>{d['label']}</span>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
