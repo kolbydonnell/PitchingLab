@@ -8640,6 +8640,35 @@ def render_grip_variants(grip_key: str):
         )
 
 
+# ----- Wikipedia article URLs that have real grip photos -----
+# Each article has photos of the grip — clicking opens it in a new tab.
+# Stable URLs we don't have to verify image hashes for.
+GRIP_WIKI_URLS = {
+    "four_seam_fastball":     "https://en.wikipedia.org/wiki/Four-seam_fastball",
+    "two_seam_fastball":      "https://en.wikipedia.org/wiki/Two-seam_fastball",
+    "slider_standard":        "https://en.wikipedia.org/wiki/Slider",
+    "slider_spike_seam":      "https://en.wikipedia.org/wiki/Slider",
+    "curveball":              "https://en.wikipedia.org/wiki/Curveball",
+    "changeup_circle":        "https://en.wikipedia.org/wiki/Circle_changeup",
+    "cutter":                 "https://en.wikipedia.org/wiki/Cutter_(baseball)",
+    "splitter":               "https://en.wikipedia.org/wiki/Split-finger_fastball",
+    "knuckleball":            "https://en.wikipedia.org/wiki/Knuckleball",
+    "knuckle_curve":          "https://en.wikipedia.org/wiki/Knuckle_curve",
+    "vulcan_changeup":        "https://en.wikipedia.org/wiki/Changeup",
+    "slurve":                 "https://en.wikipedia.org/wiki/Slurve",
+    "eephus":                 "https://en.wikipedia.org/wiki/Eephus_pitch",
+    "softball_fastball":      "https://en.wikipedia.org/wiki/Fastpitch_softball",
+    "softball_rise":          "https://en.wikipedia.org/wiki/Rise_ball",
+    "softball_drop":          "https://en.wikipedia.org/wiki/Fastpitch_softball",
+    "softball_drop_roll":     "https://en.wikipedia.org/wiki/Fastpitch_softball",
+    "softball_curve":         "https://en.wikipedia.org/wiki/Fastpitch_softball",
+    "softball_screw":         "https://en.wikipedia.org/wiki/Screwball",
+    "softball_changeup":      "https://en.wikipedia.org/wiki/Changeup",
+    "softball_change":        "https://en.wikipedia.org/wiki/Fastpitch_softball",
+    "softball_offspeed_knuckle": "https://en.wikipedia.org/wiki/Knuckleball",
+}
+
+
 def _grip_photo_url(grip_key: str) -> str | None:
     """Return a photo URL for the grip if one is configured.
 
@@ -17645,6 +17674,21 @@ def main():
                     with gcol1:
                         st.markdown(f"### {info['label']}")
                         render_grip_diagram(gk, height=340)
+                        # Open-in-Wikipedia link gives the user instant
+                        # access to real grip photos. Falls back gracefully
+                        # if no wiki URL is configured for this grip.
+                        wiki_url = GRIP_WIKI_URLS.get(gk)
+                        if wiki_url:
+                            st.markdown(
+                                f"<a href='{wiki_url}' target='_blank' "
+                                f"style='display:inline-flex;align-items:center;"
+                                f"gap:6px;background:#1e293b;color:#60a5fa;"
+                                f"padding:6px 12px;border-radius:6px;"
+                                f"font-size:12px;font-weight:600;"
+                                f"text-decoration:none;border:1px solid "
+                                f"#334155;margin-top:6px;'>"
+                                f"📷 View real grip photos on Wikipedia →</a>",
+                                unsafe_allow_html=True)
                     with gcol2:
                         st.markdown(info["description"])
 
