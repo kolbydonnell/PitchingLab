@@ -15880,6 +15880,455 @@ def render_login_or_landing() -> bool:
     return True
 
 
+# =============================================================================
+# PITCH SHAPING + STRATEGY TABS (per user spec: build a pitch, build a plan)
+# =============================================================================
+# Core philosophy baked into the suggestions: a pitcher only TRULY has a pitch
+# when they can throw it COMFORTABLY and CONSISTENTLY for a STRIKE in the
+# spot they want, with sound MECHANICS. Every recommendation is gated by
+# that 4-criteria standard and stays inside biomechanical safety bounds.
+
+# ---- Direction-of-effect rules: HOW to shape a pitch ----
+# For each pitch type, what knobs the pitcher can turn to add or subtract
+# vertical / horizontal break, in priority order (safest first). Each
+# entry is a plain-English suggestion + which grip/drill keys to reference.
+PITCH_SHAPING_RULES = {
+    "Four-Seam Fastball": {
+        "v_break_up": [
+            ("Improve spin efficiency",
+             "More true backspin (12:00 tilt) = more carry. Currently efficient "
+             "spin RPM × velocity gives you ride. Focus on clean release off the "
+             "index + middle fingertips with the wrist STRAIGHT.",
+             ["four_seam_fastball"], ["towel_arm_path_drill"]),
+            ("Get behind the ball at release",
+             "Hand position has to be DIRECTLY behind the ball at release "
+             "(palm facing catcher). If your hand cuts to the side, you bleed "
+             "carry into gyro.",
+             ["four_seam_fastball"], ["pivot_pickoff_drill"]),
+        ],
+        "v_break_down": [
+            ("Switch to two-seam pressure (index-heavy)",
+             "Same arm action — just transfer slightly more pressure to the "
+             "index finger. The pitch will sink and run arm-side.",
+             ["two_seam_fastball"], []),
+        ],
+        "h_break_arm": [
+            ("Move to two-seam grip",
+             "Run + sink toward arm-side. Index along the seam, slight "
+             "index-finger pressure at release.",
+             ["two_seam_fastball"], []),
+        ],
+        "h_break_glove": [
+            ("Try a cutter grip",
+             "Same fastball arm action, fingers shifted ~1/4\" to the glove side. "
+             "Adds 2-6\" of late glove-side cut at near-fastball velocity.",
+             ["cutter"], []),
+        ],
+        "velo_up": [
+            ("Extend further at release",
+             "Long stride + reach out front. Pros average extension > 6.2 ft.",
+             [], ["low_extension"] if False else []),
+            ("Tighten hip-shoulder separation",
+             "More rubber-band torque = more velo. Aim for 50°+ at foot-plant.",
+             [], ["low_hip_shoulder_separation"]),
+        ],
+        "safety": "Fastball is the lowest-stress pitch. Just don't pat the ball UP out of the glove — that's the only common fastball injury pattern.",
+    },
+    "Slider Strike-Getter": {
+        "h_break_glove": [
+            ("Switch to spike-seam grip",
+             "Spiked index finger creates more natural sweep. Wrist stays "
+             "LOCKED — never twist sideways to force break (#1 elbow stress on a slider).",
+             ["slider_spike_seam"], ["wrist_lock_drill", "spike_slider_ladder"]),
+            ("Move middle finger further off-center",
+             "Slide the middle finger toward the outer third of the long seam. "
+             "More finger-on-edge = more sweep at release.",
+             ["slider_standard"], ["football_throws_slider"]),
+        ],
+        "v_break_down": [
+            ("Add a slurve element",
+             "Combine slider grip with slight curveball pull-down at release. "
+             "Gives you ~3-5 extra inches of down break for ~2 mph less velocity.",
+             ["slurve"], ["one_knee_curveball"]),
+        ],
+        "velo_up": [
+            ("Throw at fastball intent",
+             "Most velo-low sliders come from soft-arm 'guiding' the pitch. "
+             "Throw it like a fastball; let the grip do the cutting.",
+             [], ["football_throws_slider"]),
+        ],
+        "safety": "Slider safety = wrist locked, elbow above shoulder. Twisting the wrist sideways at release is the #1 UCL injury mechanism in HS pitchers.",
+    },
+    "Curveball": {
+        "v_break_down": [
+            ("Snap the middle finger DOWN through release",
+             "Top spin comes from pulling the middle finger down — NOT from "
+             "rolling the wrist over. Wrist roll is the most common youth UCL "
+             "stress mechanism.",
+             ["curveball"], ["thumb_up_drill", "one_knee_curveball"]),
+            ("Try a knuckle-curve grip",
+             "Spiked index gives extra top-spin without wrist roll. Sharper, "
+             "later break at the cost of a slightly more taxing grip.",
+             ["knuckle_curve"], ["fingernail_conditioning"]),
+        ],
+        "h_break_glove": [
+            ("Slurve transition",
+             "Tilt the wrist slightly more vertical at cocked position — break "
+             "becomes 60% down, 40% across.",
+             ["slurve"], []),
+        ],
+        "safety": "NEVER roll the wrist over to force break. That's the lone curveball-related elbow injury cause in youth pitchers. The middle-finger pull does the work.",
+    },
+    "Changeup": {
+        "v_break_down": [
+            ("Stay on circle grip, throw at FASTBALL intent",
+             "Sink comes from grip + pronation at release. Slowing the arm "
+             "down is the #1 changeup failure mode.",
+             ["changeup_circle"], ["fastball_change_alternation"]),
+            ("Try vulcan grip if you have long fingers",
+             "Middle/ring split kills more spin = more sink. Better for "
+             "longer-fingered pitchers.",
+             ["vulcan_changeup"], []),
+        ],
+        "velo_down": [
+            ("More pronation at release",
+             "Stronger wrist pronation kills more velocity. The grip already "
+             "does most of the work — small adjustments compound.",
+             ["changeup_circle"], ["speed_blind_tossing"]),
+        ],
+        "safety": "Changeup is among the lowest-stress pitches. ONLY danger zone is slowing the arm down — that telegraphs the pitch AND can introduce odd mechanics.",
+    },
+}
+
+
+def _arsenal_summary(df) -> list:
+    """Aggregate metrics per pitch type for the shaping tab."""
+    if df is None or len(df) == 0 or "Pitch_Type" not in df.columns:
+        return []
+    out = []
+    grouped = df.groupby("Pitch_Type")
+    for ptype, g in grouped:
+        out.append({
+            "pitch_type":    ptype,
+            "count":         len(g),
+            "avg_velo":      round(g["Velocity_mph"].dropna().mean(), 1)
+                              if "Velocity_mph" in g.columns
+                                 and g["Velocity_mph"].notna().any() else None,
+            "avg_spin":      int(round(g["Total_Spin_rpm"].dropna().mean()))
+                              if "Total_Spin_rpm" in g.columns
+                                 and g["Total_Spin_rpm"].notna().any() else None,
+            "avg_v_break":   round(g["Vert_Break_in"].dropna().mean(), 1)
+                              if "Vert_Break_in" in g.columns
+                                 and g["Vert_Break_in"].notna().any() else None,
+            "avg_h_break":   round(g["Horiz_Break_in"].dropna().mean(), 1)
+                              if "Horiz_Break_in" in g.columns
+                                 and g["Horiz_Break_in"].notna().any() else None,
+            "spin_eff":      round(g["Spin_Efficiency_pct"].dropna().mean(), 1)
+                              if "Spin_Efficiency_pct" in g.columns
+                                 and g["Spin_Efficiency_pct"].notna().any() else None,
+        })
+    return out
+
+
+def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
+                                  athlete_sport, athlete_level):
+    """Pitch Shaping tab — shape what you have, master before you add."""
+    st.markdown(
+        "<div style='font-size:11px;letter-spacing:0.12em;font-weight:700;"
+        "color:#d4a634;text-transform:uppercase;margin-bottom:4px;'>"
+        "Pitch Shaping</div>"
+        "<div style='font-size:22px;font-weight:800;color:#f1f5f9;"
+        "margin-bottom:8px;line-height:1.2;'>"
+        "Build the arsenal you actually own</div>",
+        unsafe_allow_html=True)
+
+    # ----- 4-criteria principle (the rule that gates "you own this pitch") -----
+    st.markdown(
+        "<div style='background:#1e293b;border:1px solid #334155;"
+        "border-left:4px solid #d4a634;border-radius:10px;padding:16px 20px;"
+        "margin:14px 0;'>"
+        "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+        "color:#d4a634;text-transform:uppercase;margin-bottom:6px;'>"
+        "The 4-criteria rule</div>"
+        "<div style='color:#cbd5e1;font-size:14px;line-height:1.7;'>"
+        "<b>You only truly have a pitch when:</b><br>"
+        "&nbsp;&nbsp;1. You can throw it <b>comfortably</b> (no forced effort)<br>"
+        "&nbsp;&nbsp;2. You can throw it <b>consistently for a strike</b><br>"
+        "&nbsp;&nbsp;3. You can put it <b>where you want</b> (real command)<br>"
+        "&nbsp;&nbsp;4. Your <b>mechanics stay sound</b> while you do it<br>"
+        "Until a pitch passes all 4, the recommendation is to KEEP REFINING it "
+        "before adding a new one to the arsenal."
+        "</div></div>",
+        unsafe_allow_html=True)
+
+    # ----- Arsenal summary -----
+    arsenal = _arsenal_summary(df)
+    if not arsenal:
+        st.info(
+            "No pitch data yet — upload a session or run a sample bullpen "
+            "first, then come back to shape your arsenal.")
+        return
+
+    st.subheader("Your current arsenal")
+    st.caption("Metrics aggregated from your most recent session. Tap a "
+                "pitch to open the shaping tools.")
+    pitch_names = [a["pitch_type"] for a in arsenal]
+    pitch_picker = st.selectbox(
+        "Pick a pitch to shape", pitch_names,
+        key="shape_pitch_picker")
+    selected = next(a for a in arsenal if a["pitch_type"] == pitch_picker)
+
+    # Metric cards
+    mc = st.columns(5)
+    mc[0].metric("Velocity",
+                  f"{selected['avg_velo']} mph"
+                  if selected['avg_velo'] else "—")
+    mc[1].metric("Spin",
+                  f"{selected['avg_spin']} rpm"
+                  if selected['avg_spin'] else "—")
+    mc[2].metric("Vert Break",
+                  f"{selected['avg_v_break']:+.1f}\""
+                  if selected['avg_v_break'] is not None else "—")
+    mc[3].metric("Horiz Break",
+                  f"{selected['avg_h_break']:+.1f}\""
+                  if selected['avg_h_break'] is not None else "—")
+    mc[4].metric("Spin Eff",
+                  f"{selected['spin_eff']}%"
+                  if selected['spin_eff'] is not None else "—")
+
+    st.divider()
+    st.subheader("Shape this pitch")
+    st.caption("Tell us what you want to change. We'll give you a "
+                "biomechanically-safe path to get there.")
+
+    shape_cols = st.columns(3)
+    with shape_cols[0]:
+        delta_v = st.slider(
+            "Vertical break change (in)",
+            min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
+            help="+ = more carry/rise · − = more drop",
+            key=f"shape_dv_{pitch_picker}")
+    with shape_cols[1]:
+        delta_h = st.slider(
+            "Horizontal break change (in)",
+            min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
+            help="+ = more arm-side run · − = more glove-side cut",
+            key=f"shape_dh_{pitch_picker}")
+    with shape_cols[2]:
+        delta_velo = st.slider(
+            "Velocity change (mph)",
+            min_value=-4.0, max_value=4.0, value=0.0, step=0.5,
+            help="Realistic shaping range — bigger jumps need mechanics work.",
+            key=f"shape_dv_velo_{pitch_picker}")
+
+    # Pull the matching shaping rules (fuzzy match on pitch type name)
+    rules_key = next(
+        (k for k in PITCH_SHAPING_RULES if k.lower() in pitch_picker.lower()),
+        None)
+    rules = PITCH_SHAPING_RULES.get(rules_key, {})
+
+    # Suggestions based on the deltas
+    suggestions = []
+    if delta_v > 0 and rules.get("v_break_up"):
+        suggestions.extend([("More carry", *s) for s in rules["v_break_up"]])
+    if delta_v < 0 and rules.get("v_break_down"):
+        suggestions.extend([("More drop", *s) for s in rules["v_break_down"]])
+    if delta_h > 0 and rules.get("h_break_arm"):
+        suggestions.extend([("Arm-side", *s) for s in rules["h_break_arm"]])
+    if delta_h < 0 and rules.get("h_break_glove"):
+        suggestions.extend([("Glove-side", *s) for s in rules["h_break_glove"]])
+    if delta_velo > 0 and rules.get("velo_up"):
+        suggestions.extend([("More velo", *s) for s in rules["velo_up"]])
+    if delta_velo < 0 and rules.get("velo_down"):
+        suggestions.extend([("Less velo", *s) for s in rules["velo_down"]])
+
+    if not suggestions:
+        st.info(
+            "Move a slider above to ask for a specific change in break or velo. "
+            "We'll surface the safest grip + drill recommendations to get you "
+            "there.")
+    else:
+        st.markdown("**Suggestions (safest paths first):**")
+        for direction, title, why, grip_keys, drill_keys in suggestions:
+            with st.container(border=True):
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:10px;"
+                    f"margin-bottom:6px;'>"
+                    f"<span style='background:#3b82f6;color:white;padding:2px 9px;"
+                    f"border-radius:12px;font-size:10px;font-weight:700;"
+                    f"letter-spacing:0.06em;'>{direction.upper()}</span>"
+                    f"<span style='font-size:15px;font-weight:700;color:#f1f5f9;'>"
+                    f"{title}</span></div>"
+                    f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;'>"
+                    f"{why}</div>",
+                    unsafe_allow_html=True)
+                if grip_keys:
+                    st.caption(
+                        "Grip references: " + ", ".join(
+                            GRIP_LIBRARY.get(k, {}).get("label", k)
+                            for k in grip_keys))
+                if drill_keys:
+                    st.caption(
+                        "Drills to practice: " + ", ".join(
+                            DRILL_LIBRARY.get(k, {}).get("label", k)
+                            for k in drill_keys))
+
+    if rules.get("safety"):
+        st.markdown(
+            f"<div style='background:#1e293b;border-left:4px solid #ef4444;"
+            f"border-radius:8px;padding:12px 16px;margin-top:14px;'>"
+            f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+            f"color:#ef4444;text-transform:uppercase;margin-bottom:4px;'>"
+            f"Biomech safety</div>"
+            f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;'>"
+            f"{rules['safety']}</div></div>",
+            unsafe_allow_html=True)
+
+    st.divider()
+    # Embed the grip library here (it moved off Action Plan)
+    _is_sb = (athlete_sport == "Softball")
+    with st.expander("Grip Library — every grip in your sport",
+                       expanded=False):
+        st.caption(
+            "Each grip below describes how to hold the ball, the arm motion, "
+            "common mistakes to avoid, and which drills teach it cleanly."
+        )
+        for gk, info in GRIP_LIBRARY.items():
+            is_sb_grip = gk.startswith("softball_")
+            if _is_sb and not is_sb_grip:  continue
+            if not _is_sb and is_sb_grip:  continue
+            with st.container(border=True):
+                gc1, gc2 = st.columns([1, 1.4])
+                with gc1:
+                    st.markdown(f"### {info['label']}")
+                    render_grip_diagram(gk, height=340)
+                    _wiki = GRIP_WIKI_URLS.get(gk)
+                    if _wiki:
+                        st.markdown(
+                            f"<a href='{_wiki}' target='_blank' "
+                            f"style='display:inline-flex;align-items:center;"
+                            f"gap:6px;background:#1e293b;color:#60a5fa;"
+                            f"padding:6px 12px;border-radius:6px;font-size:12px;"
+                            f"font-weight:600;text-decoration:none;border:1px "
+                            f"solid #334155;margin-top:6px;'>"
+                            f"📷 View real grip photos on Wikipedia →</a>",
+                            unsafe_allow_html=True)
+                with gc2:
+                    st.markdown(info["description"])
+
+
+def _render_pitch_strategy_intro(df, athlete_hand, athlete_sport):
+    """Strategy tab intro — the 4-questions framework + matchup advice."""
+    st.markdown(
+        "<div style='font-size:11px;letter-spacing:0.12em;font-weight:700;"
+        "color:#d4a634;text-transform:uppercase;margin-bottom:4px;'>"
+        "Strategy</div>"
+        "<div style='font-size:22px;font-weight:800;color:#f1f5f9;"
+        "margin-bottom:8px;line-height:1.2;'>"
+        "Develop a pitching mindset</div>",
+        unsafe_allow_html=True)
+
+    # ----- The 4 self-questions framework -----
+    st.markdown(
+        "<div style='background:#1e293b;border:1px solid #334155;"
+        "border-radius:10px;padding:18px 22px;margin:14px 0;'>"
+        "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+        "color:#d4a634;text-transform:uppercase;margin-bottom:8px;'>"
+        "When you're getting hit — ask yourself these 4 questions IN ORDER</div>"
+        "<div style='color:#cbd5e1;font-size:14px;line-height:1.8;'>"
+        "<b style='color:#3b82f6;'>1. Count Quality:</b> Am I giving up hits "
+        "in HITTER counts (1-0, 2-0, 2-1, 3-1) or PITCHER counts (0-1, 0-2, "
+        "1-2)? If behind in the count, work AHEAD before anything else.<br>"
+        "<b style='color:#3b82f6;'>2. Execution:</b> Am I hitting my spots? "
+        "If location is off — fix fastball command FIRST. Everything else "
+        "tunnels off the fastball.<br>"
+        "<b style='color:#3b82f6;'>3. Sequence:</b> Is my pattern backwards? "
+        "Am I throwing hittable pitches in 2-strike counts when I need my "
+        "nastiest stuff? Reverse the sequence.<br>"
+        "<b style='color:#3b82f6;'>4. Pattern Recognition:</b> Are hitters "
+        "ONTO me? If they're sitting on a specific pitch — completely flip "
+        "the script. Different first-pitch, different put-away."
+        "</div></div>",
+        unsafe_allow_html=True)
+
+    # ----- Quick reference: count leverage strategy -----
+    with st.expander("Count Leverage — what to throw when",
+                       expanded=False):
+        st.markdown(
+            "**Pitcher counts (0-1, 0-2, 1-2):** EXPAND the zone. Elevate "
+            "fastballs above the hands; spin breakers off the plate. Make "
+            "the hitter chase. You don't need a strike here.\n\n"
+            "**Even counts (1-1, 2-2):** ATTACK with your best put-away. Live "
+            "on the edges, not the heart. Mix speeds to break their timing.\n\n"
+            "**Hitter counts (1-0, 2-0, 2-1, 3-1):** TRUST your fastball "
+            "command first. A heart-of-plate fastball at the hitter's worst "
+            "level (low + away to a pull hitter, in on the hands to an "
+            "extension hitter) beats a hung breaker every time.\n\n"
+            "**3-0 / 3-1:** Throw a STRIKE. They're taking 95% of the time. "
+            "Fastball middle is the right pitch."
+        )
+
+    # ----- Matchup advice (RHB vs LHB) -----
+    with st.expander("Matchup advice — RHB vs LHB",
+                       expanded=False):
+        is_lefty = (athlete_hand == "Left")
+        if is_lefty:
+            st.markdown(
+                "**You're LHP. Here's what to lean on:**\n\n"
+                "**vs LHH (same-side):** Lean on glove-side break — slider, "
+                "cutter, curveball. The platoon advantage is yours. Start "
+                "the breaker at the hitter's belt buckle; it ends up off the "
+                "outer edge.\n\n"
+                "**vs RHH (opposite-side):** Changeup is gold — it fades "
+                "AWAY from a RHH. Mix in front-hip running fastballs. AVOID "
+                "leaving the slider middle to RHH — they see it for hours."
+            )
+        else:
+            st.markdown(
+                "**You're RHP. Here's what to lean on:**\n\n"
+                "**vs RHH (same-side):** Lean on glove-side break — slider, "
+                "cutter, curveball. Platoon advantage is yours. Start the "
+                "breaker at the hitter's belt buckle; it ends off the outer "
+                "edge for a chase swing.\n\n"
+                "**vs LHH (opposite-side):** Changeup is gold — it fades "
+                "AWAY from a LHH. Mix in front-hip running fastballs. AVOID "
+                "leaving the slider middle to LHH — they see it for hours."
+            )
+
+    # ----- Pitch-to-contact philosophy -----
+    with st.expander("Pitch to contact — when strikeouts aren't the goal",
+                       expanded=False):
+        st.markdown(
+            "**Goal:** earn outs in 3 pitches or fewer. Stay in the game "
+            "longer, keep pitch count low.\n\n"
+            "- Live in the **bottom half of the zone** with sinkers and "
+            "two-seamers — induces ground balls.\n"
+            "- Throw your **strike-getter early in the count** — first-pitch "
+            "strikes lower batter OPS by ~100 points.\n"
+            "- Save the chase pitch for 2 strikes — don't waste it 1-1 hoping "
+            "for a chase that's not coming.\n"
+            "- Trust your defense. A 7-pitch ground ball out is better than "
+            "a 7-pitch strikeout."
+        )
+
+    # ----- Eye-level and sequencing -----
+    with st.expander("Eye-level changes — keeping the hitter guessing",
+                       expanded=False):
+        st.markdown(
+            "**The principle:** the hitter's brain adapts to the visual plane "
+            "of recent pitches. Disrupt that plane.\n\n"
+            "- **High fastball → low breaker:** classic 'up the ladder' "
+            "sequence. Hitter raises the eye-level; the breaker dives at "
+            "the knees.\n"
+            "- **Low sinker → high four-seam:** flip it. Sinker low for "
+            "called strike. Then four-seam at the top of the zone — looks "
+            "like it's rising.\n"
+            "- **Inside fastball → away changeup:** changes the hitter's "
+            "horizontal plane AND speed at the same time. Brutal sequence "
+            "for a heavy pull hitter."
+        )
+
+
 def main():
     st.set_page_config(
         page_title="Diamond Sports Lab",
@@ -16768,10 +17217,19 @@ def main():
     st.divider()
 
     # -------- Tabs --------
-    tab_overview, tab_per_pitch, tab_history, tab_tunneling, tab_alignment, tab_action = st.tabs(
+    # "Tunneling" → renamed "Strategy" (sequencing, count leverage,
+    # matchups, adjustment playbook — tunneling lives as a subtab).
+    # New "Pitch Shaping" tab houses arsenal metrics + shape-this-pitch
+    # advisory + grips + drills — the grip library now lives here.
+    (tab_overview, tab_per_pitch, tab_history,
+     tab_shaping, tab_strategy, tab_alignment, tab_action) = st.tabs(
         ["Overview", "Per-Pitch Detail", "History",
-         "Tunneling", "Alignment Quality", "Action Plan"]
+         "Pitch Shaping", "Strategy",
+         "Alignment Quality", "Action Plan"]
     )
+    # Backward-compat alias so existing 'with tab_tunneling:' block keeps
+    # working — it's now the Tunneling sub-section of the Strategy tab.
+    tab_tunneling = tab_strategy
 
     # ---- Overview tab ----
     with tab_overview:
@@ -17187,8 +17645,15 @@ def main():
                                     del st.session_state["_saved_fingerprint"]
                                 st.rerun()
 
-    # ---- Pitch Tunneling tab ----
-    with tab_tunneling:
+    # ---- Pitch Shaping tab ----
+    with tab_shaping:
+        _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
+                                       athlete_sport, athlete_level)
+
+    # ---- Strategy tab (Tunneling sub-section + sequencing + matchups) ----
+    with tab_strategy:
+        _render_pitch_strategy_intro(df, athlete_hand, athlete_sport)
+        st.divider()
         st.subheader("Pitch Tunneling — pair sequencing tool")
         st.caption(
             "Pick the **starting pitch**, click anywhere on the zone to place it, "
