@@ -9248,13 +9248,14 @@ button, input, select, textarea {
 }
 
 /* =====================================================================
-   GLOBAL: hide stray scrollbar visuals on cards / containers / text
-   blocks. Scroll behavior is preserved (touch-action: pan-y, content
-   still scrolls if it overflows) — only the visual scrollbar chrome
-   is hidden, which was making bordered containers and KPI cards look
-   "wonky" with little gray slivers along the edges.
+   FORCE TEXT TO WRAP — fixes the "have to scroll inside the box to see
+   the rest of the sentence" bug. Scoped to text-bearing containers ONLY
+   (no blanket div rules) so chart/image overflow stays intact.
    ===================================================================== */
 [data-testid="stMetric"],
+[data-testid="stMetricLabel"],
+[data-testid="stMetricValue"],
+[data-testid="stMetricDelta"],
 [data-testid="stMarkdown"],
 [data-testid="stMarkdownContainer"],
 [data-testid="stHeader"],
@@ -9262,19 +9263,25 @@ button, input, select, textarea {
 [data-testid="stSubheader"],
 [data-testid="stCaption"],
 [data-testid="stText"],
-[data-testid="stVerticalBlockBorderWrapper"],
-[data-testid="stVerticalBlock"],
-[data-testid="stHorizontalBlock"],
-[data-testid="stExpander"],
-[data-testid="stExpander"] details,
-[data-testid="stElementContainer"],
-[data-testid="stContainer"],
-.stMetric, .stMarkdown, .stText,
-.stMetric *, .stMarkdown *, .stText *,
-h1, h2, h3, h4, h5, h6, p, span, div {
+[data-testid="stMetric"] *,
+[data-testid="stMarkdown"] *,
+[data-testid="stMarkdownContainer"] *,
+.stMetric, .stMetric *,
+.stMarkdown, .stMarkdown *,
+.stText, .stText *,
+h1, h2, h3, h4, h5, h6, p {
+    /* TEXT WRAPS — no internal scroll on text containers */
+    overflow-x: visible !important;
+    overflow-y: visible !important;
+    white-space: normal !important;
+    word-wrap: break-word !important;
+    overflow-wrap: anywhere !important;
+    text-overflow: clip !important;
+    max-width: 100% !important;
     scrollbar-width: none;
     -ms-overflow-style: none;
 }
+/* Hide any leftover webkit scrollbar visuals on those elements */
 [data-testid="stMetric"]::-webkit-scrollbar,
 [data-testid="stMarkdown"]::-webkit-scrollbar,
 [data-testid="stMarkdownContainer"]::-webkit-scrollbar,
@@ -9293,11 +9300,11 @@ p::-webkit-scrollbar, span::-webkit-scrollbar, div::-webkit-scrollbar {
     width:  0 !important;
 }
 
-/* Tighter padding on bordered containers — fixes "wonky" spacing on
-   stacked drill cards / KPI rows on phone. */
+/* Tighter padding on bordered containers (drill cards, KPI rows etc.) */
 [data-testid="stVerticalBlockBorderWrapper"] {
-    padding: 12px 14px !important;
-    margin-bottom: 8px !important;
+    padding: 14px 16px !important;
+    margin-bottom: 10px !important;
+    overflow: visible !important;
 }
 
 /* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
