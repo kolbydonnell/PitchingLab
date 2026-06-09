@@ -9223,14 +9223,15 @@ button, input, select, textarea {
     margin-left: 0 !important;
 }
 
-/* ===== Tabs — ensure full labels are visible AND horizontal scroll
-   works when there are too many tabs to fit the viewport. */
+/* ===== Tabs — full labels visible + horizontal scroll when needed,
+   but NO visible scrollbar (it was reading as 'wonky' on the phone). */
 [data-testid="stTabs"] [role="tablist"],
 .stTabs [role="tablist"] {
     overflow-x: auto !important;
     overflow-y: hidden !important;
     flex-wrap: nowrap !important;
     -webkit-overflow-scrolling: touch !important;
+    scrollbar-width: none !important;
 }
 [data-testid="stTabs"] [role="tab"],
 .stTabs [role="tab"] {
@@ -9238,15 +9239,65 @@ button, input, select, textarea {
     white-space: nowrap !important;
     min-width: max-content !important;
 }
-/* Slim visible scrollbar on the tab strip so users see they can scroll */
+/* Hide the tab-strip scrollbar visuals — the scroll still works on swipe */
 [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar,
 .stTabs [role="tablist"]::-webkit-scrollbar {
-    height: 3px;
+    display: none !important;
+    height: 0 !important;
+    width:  0 !important;
 }
-[data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar-thumb,
-.stTabs [role="tablist"]::-webkit-scrollbar-thumb {
-    background: rgba(148, 163, 184, 0.45);
-    border-radius: 2px;
+
+/* =====================================================================
+   GLOBAL: hide stray scrollbar visuals on cards / containers / text
+   blocks. Scroll behavior is preserved (touch-action: pan-y, content
+   still scrolls if it overflows) — only the visual scrollbar chrome
+   is hidden, which was making bordered containers and KPI cards look
+   "wonky" with little gray slivers along the edges.
+   ===================================================================== */
+[data-testid="stMetric"],
+[data-testid="stMarkdown"],
+[data-testid="stMarkdownContainer"],
+[data-testid="stHeader"],
+[data-testid="stHeading"],
+[data-testid="stSubheader"],
+[data-testid="stCaption"],
+[data-testid="stText"],
+[data-testid="stVerticalBlockBorderWrapper"],
+[data-testid="stVerticalBlock"],
+[data-testid="stHorizontalBlock"],
+[data-testid="stExpander"],
+[data-testid="stExpander"] details,
+[data-testid="stElementContainer"],
+[data-testid="stContainer"],
+.stMetric, .stMarkdown, .stText,
+.stMetric *, .stMarkdown *, .stText *,
+h1, h2, h3, h4, h5, h6, p, span, div {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+[data-testid="stMetric"]::-webkit-scrollbar,
+[data-testid="stMarkdown"]::-webkit-scrollbar,
+[data-testid="stMarkdownContainer"]::-webkit-scrollbar,
+[data-testid="stVerticalBlock"]::-webkit-scrollbar,
+[data-testid="stHorizontalBlock"]::-webkit-scrollbar,
+[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar,
+[data-testid="stExpander"]::-webkit-scrollbar,
+[data-testid="stElementContainer"]::-webkit-scrollbar,
+.stMetric::-webkit-scrollbar,
+.stMarkdown::-webkit-scrollbar,
+h1::-webkit-scrollbar, h2::-webkit-scrollbar,
+h3::-webkit-scrollbar, h4::-webkit-scrollbar,
+p::-webkit-scrollbar, span::-webkit-scrollbar, div::-webkit-scrollbar {
+    display: none !important;
+    height: 0 !important;
+    width:  0 !important;
+}
+
+/* Tighter padding on bordered containers — fixes "wonky" spacing on
+   stacked drill cards / KPI rows on phone. */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    padding: 12px 14px !important;
+    margin-bottom: 8px !important;
 }
 
 /* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
