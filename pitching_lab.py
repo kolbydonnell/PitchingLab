@@ -9188,21 +9188,24 @@ button, input, select, textarea {
    The fix: force every wrapper to be EXACTLY 100vw and
    `box-sizing: border-box` so internal padding can't push it narrower.
    ============================================================== */
-.stApp, .main, section.main, div.main, .block-container,
+/* Lock the OUTER app shell to viewport width (prevents the iOS rotation
+   shrink bug). Don't constrain INNER wrappers — that was clipping text. */
+.stApp, .main, section.main, .block-container {
+    max-width: 100vw !important;
+    width: 100vw !important;
+    box-sizing: border-box !important;
+}
+/* Inner wrappers just get box-sizing so padding doesn't push them past
+   their parent. No overflow controls here — let text wrap naturally. */
 [data-testid="stAppViewContainer"],
 [data-testid="stMain"],
 [data-testid="stMainBlockContainer"],
 [data-testid="stVerticalBlock"],
 [data-testid="stHorizontalBlock"],
 [data-testid="stElementContainer"],
-[data-testid="stImage"],
 [data-testid="column"] {
-    max-width: 100vw !important;
     box-sizing: border-box !important;
-    overflow-x: hidden;
-}
-.stApp, .main, section.main, .block-container {
-    width: 100vw !important;
+    max-width: 100% !important;
 }
 
 /* Static chart images — pin DIRECTLY to viewport width so the value
@@ -9248,63 +9251,24 @@ button, input, select, textarea {
 }
 
 /* =====================================================================
-   FORCE TEXT TO WRAP — fixes the "have to scroll inside the box to see
-   the rest of the sentence" bug. Scoped to text-bearing containers ONLY
-   (no blanket div rules) so chart/image overflow stays intact.
+   MINIMAL TEXT WRAP — single rule, scoped to direct text hosts only.
+   Earlier passes were layering competing !important rules and creating
+   the wonky scroll behavior the user was seeing. The fix: ONE simple
+   rule that just says "text wraps" — let the browser do the rest.
    ===================================================================== */
-[data-testid="stMetric"],
-[data-testid="stMetricLabel"],
-[data-testid="stMetricValue"],
-[data-testid="stMetricDelta"],
 [data-testid="stMarkdown"],
 [data-testid="stMarkdownContainer"],
-[data-testid="stHeader"],
-[data-testid="stHeading"],
-[data-testid="stSubheader"],
+[data-testid="stMetric"],
 [data-testid="stCaption"],
-[data-testid="stText"],
-[data-testid="stMetric"] *,
-[data-testid="stMarkdown"] *,
-[data-testid="stMarkdownContainer"] *,
-.stMetric, .stMetric *,
-.stMarkdown, .stMarkdown *,
-.stText, .stText *,
-h1, h2, h3, h4, h5, h6, p {
-    /* TEXT WRAPS — no internal scroll on text containers */
-    overflow-x: visible !important;
-    overflow-y: visible !important;
-    white-space: normal !important;
-    word-wrap: break-word !important;
-    overflow-wrap: anywhere !important;
-    text-overflow: clip !important;
-    max-width: 100% !important;
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-}
-/* Hide any leftover webkit scrollbar visuals on those elements */
-[data-testid="stMetric"]::-webkit-scrollbar,
-[data-testid="stMarkdown"]::-webkit-scrollbar,
-[data-testid="stMarkdownContainer"]::-webkit-scrollbar,
-[data-testid="stVerticalBlock"]::-webkit-scrollbar,
-[data-testid="stHorizontalBlock"]::-webkit-scrollbar,
-[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar,
-[data-testid="stExpander"]::-webkit-scrollbar,
-[data-testid="stElementContainer"]::-webkit-scrollbar,
-.stMetric::-webkit-scrollbar,
-.stMarkdown::-webkit-scrollbar,
-h1::-webkit-scrollbar, h2::-webkit-scrollbar,
-h3::-webkit-scrollbar, h4::-webkit-scrollbar,
-p::-webkit-scrollbar, span::-webkit-scrollbar, div::-webkit-scrollbar {
-    display: none !important;
-    height: 0 !important;
-    width:  0 !important;
-}
-
-/* Tighter padding on bordered containers (drill cards, KPI rows etc.) */
-[data-testid="stVerticalBlockBorderWrapper"] {
-    padding: 14px 16px !important;
-    margin-bottom: 10px !important;
+.stMarkdown {
     overflow: visible !important;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+/* Flex containers wrap by default (prevents inline display:flex from
+   pushing badge+title off the side of a card) */
+div[style*="display:flex"] {
+    flex-wrap: wrap !important;
 }
 
 /* ===== WHEEL SCROLL PASS-THROUGH (CSS layer) =====
@@ -16368,61 +16332,86 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                 unsafe_allow_html=True)
 
             if rule_entries:
-                # Direct shaping suggestions for THIS pitch
+                # Direct shaping suggestions — emit a SINGLE custom HTML
+                # div per card. No st.container, no flex, no nesting that
+                # could constrain width. Plain block-level layout with
+                # explicit word-wrap so long sentences ALWAYS wrap.
                 for title, why, grip_keys, drill_keys in rule_entries:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"<div style='display:flex;align-items:center;gap:10px;"
-                            f"margin-bottom:6px;'>"
-                            f"<span style='background:#3b82f6;color:white;padding:2px 9px;"
-                            f"border-radius:12px;font-size:10px;font-weight:700;"
-                            f"letter-spacing:0.06em;'>SHAPE THIS PITCH</span>"
-                            f"<span style='font-size:15px;font-weight:700;"
-                            f"color:#f1f5f9;'>{title}</span></div>"
-                            f"<div style='color:#cbd5e1;font-size:13px;"
-                            f"line-height:1.6;'>{why}</div>",
-                            unsafe_allow_html=True)
-                        if grip_keys:
-                            st.caption(
-                                "Grip refs: " + ", ".join(
-                                    GRIP_LIBRARY.get(k, {}).get("label", k)
-                                    for k in grip_keys))
-                        if drill_keys:
-                            st.caption(
-                                "Drills: " + ", ".join(
-                                    DRILL_LIBRARY.get(k, {}).get("label", k)
-                                    for k in drill_keys))
+                    grip_line = ("<div style='color:#94a3b8;font-size:11px;"
+                                  "margin-top:8px;word-break:break-word;'>"
+                                  "Grip refs: " + ", ".join(
+                                      GRIP_LIBRARY.get(k, {}).get("label", k)
+                                      for k in grip_keys) +
+                                  "</div>") if grip_keys else ""
+                    drill_line = ("<div style='color:#94a3b8;font-size:11px;"
+                                   "margin-top:4px;word-break:break-word;'>"
+                                   "Drills: " + ", ".join(
+                                       DRILL_LIBRARY.get(k, {}).get("label", k)
+                                       for k in drill_keys) +
+                                   "</div>") if drill_keys else ""
+                    st.markdown(
+                        f"<div style='background:#1e293b;border:1px solid "
+                        f"#334155;border-radius:10px;padding:14px 16px;"
+                        f"margin-bottom:10px;width:100%;box-sizing:border-box;'>"
+                        f"<div style='display:inline-block;background:#3b82f6;"
+                        f"color:white;padding:3px 10px;border-radius:12px;"
+                        f"font-size:10px;font-weight:700;letter-spacing:0.06em;"
+                        f"margin-bottom:8px;'>SHAPE THIS PITCH</div>"
+                        f"<div style='font-size:16px;font-weight:700;"
+                        f"color:#f1f5f9;margin-bottom:6px;word-wrap:break-word;"
+                        f"overflow-wrap:anywhere;white-space:normal;'>"
+                        f"{title}</div>"
+                        f"<div style='color:#cbd5e1;font-size:13px;"
+                        f"line-height:1.6;word-wrap:break-word;"
+                        f"overflow-wrap:anywhere;white-space:normal;'>"
+                        f"{why}</div>"
+                        f"{grip_line}{drill_line}"
+                        f"</div>",
+                        unsafe_allow_html=True)
             else:
                 # NO shaping rules for this direction on this pitch →
                 # surface alternative pitches that natively do this.
                 alts = ALT_PITCHES_FOR_DIRECTION.get(alt_key, [])
                 st.markdown(
-                    f"<div style='background:#1e293b;border-left:4px solid "
-                    f"#d4a634;border-radius:8px;padding:14px 18px;'>"
+                    f"<div style='background:#1e293b;border:1px solid #334155;"
+                    f"border-left:4px solid #d4a634;border-radius:10px;"
+                    f"padding:14px 16px;margin-bottom:10px;width:100%;"
+                    f"box-sizing:border-box;'>"
                     f"<div style='color:#f1f5f9;font-size:14px;font-weight:600;"
-                    f"margin-bottom:6px;'>A <b>{pitch_picker}</b> isn't "
-                    f"naturally suited for that change.</div>"
-                    f"<div style='color:#cbd5e1;font-size:13px;'>"
+                    f"margin-bottom:6px;word-wrap:break-word;'>"
+                    f"A {pitch_picker} isn't naturally suited for that change."
+                    f"</div>"
+                    f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;"
+                    f"word-wrap:break-word;'>"
                     f"Pitchers who want <b>{dir_label.lower()}</b> usually "
-                    f"reach for a different pitch type:</div></div>",
+                    f"reach for a different pitch type:"
+                    f"</div></div>",
                     unsafe_allow_html=True)
                 for alt_label, alt_grip, alt_blurb in alts:
-                    with st.container(border=True):
-                        st.markdown(
-                            f"<div style='display:flex;align-items:center;gap:10px;"
-                            f"margin-bottom:4px;'>"
-                            f"<span style='background:#16a34a;color:white;"
-                            f"padding:2px 9px;border-radius:12px;font-size:10px;"
-                            f"font-weight:700;letter-spacing:0.06em;'>"
-                            f"TRY THIS INSTEAD</span>"
-                            f"<span style='font-size:15px;font-weight:700;"
-                            f"color:#f1f5f9;'>{alt_label}</span></div>"
-                            f"<div style='color:#cbd5e1;font-size:13px;"
-                            f"line-height:1.6;'>{alt_blurb}</div>",
-                            unsafe_allow_html=True)
-                        if alt_grip:
-                            st.caption(
-                                f"Grip: {GRIP_LIBRARY.get(alt_grip, {}).get('label', alt_grip)}")
+                    grip_line = (f"<div style='color:#94a3b8;font-size:11px;"
+                                  f"margin-top:8px;word-break:break-word;'>"
+                                  f"Grip: "
+                                  f"{GRIP_LIBRARY.get(alt_grip, {}).get('label', alt_grip)}"
+                                  f"</div>") if alt_grip else ""
+                    st.markdown(
+                        f"<div style='background:#1e293b;border:1px solid "
+                        f"#334155;border-radius:10px;padding:14px 16px;"
+                        f"margin-bottom:10px;width:100%;box-sizing:border-box;'>"
+                        f"<div style='display:inline-block;background:#16a34a;"
+                        f"color:white;padding:3px 10px;border-radius:12px;"
+                        f"font-size:10px;font-weight:700;letter-spacing:0.06em;"
+                        f"margin-bottom:8px;'>TRY THIS INSTEAD</div>"
+                        f"<div style='font-size:16px;font-weight:700;"
+                        f"color:#f1f5f9;margin-bottom:6px;word-wrap:break-word;"
+                        f"overflow-wrap:anywhere;white-space:normal;'>"
+                        f"{alt_label}</div>"
+                        f"<div style='color:#cbd5e1;font-size:13px;"
+                        f"line-height:1.6;word-wrap:break-word;"
+                        f"overflow-wrap:anywhere;white-space:normal;'>"
+                        f"{alt_blurb}</div>"
+                        f"{grip_line}"
+                        f"</div>",
+                        unsafe_allow_html=True)
 
     if rules.get("safety"):
         st.markdown(
