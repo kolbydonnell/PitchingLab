@@ -15888,6 +15888,58 @@ def render_login_or_landing() -> bool:
 # spot they want, with sound MECHANICS. Every recommendation is gated by
 # that 4-criteria standard and stays inside biomechanical safety bounds.
 
+# ---- "If you want X, throw this pitch" map ----
+# When a coach asks for a change that's outside what a pitch can reasonably
+# produce, surface OTHER pitches that natively deliver it. Keyed by
+# direction → list of (pitch_label, grip_key, one-liner).
+ALT_PITCHES_FOR_DIRECTION = {
+    "more_arm_break":     [
+        ("Two-Seam Sinker", "two_seam_fastball",
+         "Run + sink toward your arm side at near-fastball velocity."),
+        ("Circle Changeup", "changeup_circle",
+         "Fade away from opposite-side hitters with grip-driven movement."),
+        ("Screwball (softball)", "softball_screw",
+         "Inward wrist pronation makes the ball break arm-side."),
+    ],
+    "more_glove_break":   [
+        ("Cutter", "cutter",
+         "Late glove-side cut, ~2-6\" of break at near-fastball velocity."),
+        ("Slider (Spike-Seam)", "slider_spike_seam",
+         "Big sweeping glove-side break with the safest mechanic."),
+        ("Slurve", "slurve",
+         "Slider/curve hybrid — wider sweep + downward bite."),
+    ],
+    "more_drop":          [
+        ("Curveball (12-6)", "curveball",
+         "Pure topspin = falling-off-table drop."),
+        ("Splitter", "splitter",
+         "Looks like a fastball, dies at the plate."),
+        ("Knuckle Curve", "knuckle_curve",
+         "Sharper, later-breaking curve thanks to the spike grip."),
+        ("Rise Ball (softball)", "softball_rise",
+         "Inverted — DOES NOT drop. If you want LESS drop instead of more, this is the answer."),
+    ],
+    "more_carry":         [
+        ("Four-Seam Fastball", "four_seam_fastball",
+         "Maximum carry comes from clean backspin off a 4-seam grip."),
+        ("Rise Ball (softball)", "softball_rise",
+         "The 'doesn't drop' pitch — backspin axis at 12:00."),
+    ],
+    "more_velo":          [
+        ("Four-Seam Fastball", "four_seam_fastball",
+         "Your peak velo pitch — anything 4+ mph slower needs different mechanics."),
+    ],
+    "less_velo":          [
+        ("Circle Changeup", "changeup_circle",
+         "8-12 mph slower than fastball, same arm action."),
+        ("Splitter", "splitter",
+         "5-8 mph slower with extra drop."),
+        ("Eephus", "eephus",
+         "The 50 mph lob — once a game, max."),
+    ],
+}
+
+
 # ---- Direction-of-effect rules: HOW to shape a pitch ----
 # For each pitch type, what knobs the pitcher can turn to add or subtract
 # vertical / horizontal break, in priority order (safest first). Each
@@ -15990,13 +16042,83 @@ PITCH_SHAPING_RULES = {
              "longer-fingered pitchers.",
              ["vulcan_changeup"], []),
         ],
+        "h_break_arm": [
+            ("Strengthen the pronation at release",
+             "Circle change naturally fades arm-side. More pronation = more "
+             "fade. Think 'shake hands with the catcher' through release.",
+             ["changeup_circle"], ["fastball_change_alternation",
+                                     "speed_blind_tossing"]),
+            ("Off-center the grip toward the inside",
+             "Shift fingers slightly toward your throwing-arm side. Adds 2-3\" "
+             "of extra arm-side run.",
+             ["changeup_circle"], []),
+        ],
+        "h_break_glove": [
+            ("Honestly — try a different pitch",
+             "A changeup with glove-side break is fighting its own design "
+             "(circle grip + pronation = arm-side movement). For glove-side "
+             "movement at off-speed velocity, look at a slurve or a slow "
+             "curveball.",
+             [], []),
+        ],
         "velo_down": [
             ("More pronation at release",
              "Stronger wrist pronation kills more velocity. The grip already "
              "does most of the work — small adjustments compound.",
              ["changeup_circle"], ["speed_blind_tossing"]),
+            ("Vulcan grip",
+             "Wider finger split between middle and ring kills more spin AND "
+             "subtracts more velocity than circle change.",
+             ["vulcan_changeup"], []),
+        ],
+        "velo_up": [
+            ("Honestly — that's a fastball",
+             "A changeup is DEFINED by being slower than your fastball. "
+             "If you want more velo, work fastball command instead.",
+             [], []),
         ],
         "safety": "Changeup is among the lowest-stress pitches. ONLY danger zone is slowing the arm down — that telegraphs the pitch AND can introduce odd mechanics.",
+    },
+    "Sinker": {
+        "v_break_down": [
+            ("More index-finger pressure at release",
+             "Heavier index-finger pressure tilts the spin axis sideways = "
+             "more sink. Small adjustments compound.",
+             ["two_seam_fastball"], []),
+            ("Shift to splitter grip",
+             "If you want true 'bottom drops out' sink, the splitter does it "
+             "with less effort.",
+             ["splitter"], ["y_finger_splitter_drops"]),
+        ],
+        "h_break_arm": [
+            ("Throw at fastball intent",
+             "Sinkers fail when pitchers try to manipulate them. Trust the grip.",
+             ["two_seam_fastball"], []),
+        ],
+        "h_break_glove": None,
+        "safety": "Sinker = same stress as fastball. Just don't 'turn over' the wrist to force sink — the index-finger pressure does the work.",
+    },
+    "Cutter": {
+        "h_break_glove": [
+            ("More middle-finger pressure",
+             "The cutter's break comes from grip + slight middle-finger weight "
+             "at release. Wrist stays FASTBALL-orientation — no twist.",
+             ["cutter"], ["wrist_lock_drill"]),
+            ("Shift fingers further to glove side",
+             "Moving fingers ~1/4\" more off-center on the seam adds 2-3\" of "
+             "late cut at the cost of 1-2 mph.",
+             ["cutter"], []),
+        ],
+        "safety": "The cutter is safer than a slider but the same warning applies — DON'T twist the wrist trying to force more break.",
+    },
+    "Splitter": {
+        "v_break_down": [
+            ("Spread fingers wider",
+             "Wider Y between index/middle = less spin = more drop. Has a "
+             "finger-flexibility ceiling; don't push it past comfort.",
+             ["splitter"], ["y_finger_splitter_drops"]),
+        ],
+        "safety": "Splitter taxes the index-middle finger pulley. If you have small hands, choose circle change instead.",
     },
 }
 
@@ -16098,28 +16220,62 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
 
     st.divider()
     st.subheader("Shape this pitch")
-    st.caption("Tell us what you want to change. We'll give you a "
-                "biomechanically-safe path to get there.")
+    st.caption(
+        "Pick exactly what you want to change about this pitch. The labels "
+        "below the slider show what each end means."
+    )
 
-    shape_cols = st.columns(3)
-    with shape_cols[0]:
-        delta_v = st.slider(
-            "Vertical break change (in)",
-            min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
-            help="+ = more carry/rise · − = more drop",
-            key=f"shape_dv_{pitch_picker}")
-    with shape_cols[1]:
-        delta_h = st.slider(
-            "Horizontal break change (in)",
-            min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
-            help="+ = more arm-side run · − = more glove-side cut",
-            key=f"shape_dh_{pitch_picker}")
-    with shape_cols[2]:
-        delta_velo = st.slider(
-            "Velocity change (mph)",
-            min_value=-4.0, max_value=4.0, value=0.0, step=0.5,
-            help="Realistic shaping range — bigger jumps need mechanics work.",
-            key=f"shape_dv_velo_{pitch_picker}")
+    # ----- Vertical break slider with explicit end labels -----
+    st.markdown(
+        "**Vertical break** — do you want the pitch to drop more, or carry more?")
+    delta_v = st.slider(
+        " ", min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
+        format="%+.1f\"",
+        key=f"shape_dv_{pitch_picker}",
+        label_visibility="collapsed",
+    )
+    st.markdown(
+        "<div style='display:flex;justify-content:space-between;"
+        "font-size:11px;color:#94a3b8;margin-top:-12px;margin-bottom:14px;'>"
+        "<span>← more DROP (sinks more)</span>"
+        "<span>more CARRY / RISE →</span></div>",
+        unsafe_allow_html=True)
+
+    # ----- Horizontal break slider with explicit end labels -----
+    hand_is_right = (athlete_hand or "Right") != "Left"
+    arm_word   = "RIGHT" if hand_is_right else "LEFT"
+    glove_word = "LEFT"  if hand_is_right else "RIGHT"
+    st.markdown(
+        f"**Horizontal break** — do you want the pitch to run more arm-side "
+        f"({arm_word.lower()}) or cut more glove-side ({glove_word.lower()})?")
+    delta_h = st.slider(
+        " ", min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
+        format="%+.1f\"",
+        key=f"shape_dh_{pitch_picker}",
+        label_visibility="collapsed",
+    )
+    st.markdown(
+        f"<div style='display:flex;justify-content:space-between;"
+        f"font-size:11px;color:#94a3b8;margin-top:-12px;margin-bottom:14px;'>"
+        f"<span>← more GLOVE-SIDE cut (toward {glove_word})</span>"
+        f"<span>more ARM-SIDE run (toward {arm_word}) →</span></div>",
+        unsafe_allow_html=True)
+
+    # ----- Velocity slider with explicit end labels -----
+    st.markdown(
+        "**Velocity** — do you want this pitch faster or slower?")
+    delta_velo = st.slider(
+        " ", min_value=-4.0, max_value=4.0, value=0.0, step=0.5,
+        format="%+.1f mph",
+        key=f"shape_dv_velo_{pitch_picker}",
+        label_visibility="collapsed",
+    )
+    st.markdown(
+        "<div style='display:flex;justify-content:space-between;"
+        "font-size:11px;color:#94a3b8;margin-top:-12px;margin-bottom:14px;'>"
+        "<span>← SLOWER (less velo)</span>"
+        "<span>FASTER (more velo) →</span></div>",
+        unsafe_allow_html=True)
 
     # Pull the matching shaping rules (fuzzy match on pitch type name)
     rules_key = next(
@@ -16127,51 +16283,88 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
         None)
     rules = PITCH_SHAPING_RULES.get(rules_key, {})
 
-    # Suggestions based on the deltas
-    suggestions = []
-    if delta_v > 0 and rules.get("v_break_up"):
-        suggestions.extend([("More carry", *s) for s in rules["v_break_up"]])
-    if delta_v < 0 and rules.get("v_break_down"):
-        suggestions.extend([("More drop", *s) for s in rules["v_break_down"]])
-    if delta_h > 0 and rules.get("h_break_arm"):
-        suggestions.extend([("Arm-side", *s) for s in rules["h_break_arm"]])
-    if delta_h < 0 and rules.get("h_break_glove"):
-        suggestions.extend([("Glove-side", *s) for s in rules["h_break_glove"]])
-    if delta_velo > 0 and rules.get("velo_up"):
-        suggestions.extend([("More velo", *s) for s in rules["velo_up"]])
-    if delta_velo < 0 and rules.get("velo_down"):
-        suggestions.extend([("Less velo", *s) for s in rules["velo_down"]])
+    # Each direction the user asked for → (rule_key, direction_label,
+    # alt_pitches_key for the cross-pitch fallback)
+    requested = []
+    if delta_v >  0.4: requested.append(("v_break_up",   "More carry",     "more_carry"))
+    if delta_v < -0.4: requested.append(("v_break_down", "More drop",      "more_drop"))
+    if delta_h >  0.4: requested.append(("h_break_arm",  "More arm-side",  "more_arm_break"))
+    if delta_h < -0.4: requested.append(("h_break_glove","More glove-side","more_glove_break"))
+    if delta_velo >  0.4: requested.append(("velo_up",   "More velo",      "more_velo"))
+    if delta_velo < -0.4: requested.append(("velo_down", "Less velo",      "less_velo"))
 
-    if not suggestions:
+    if not requested:
         st.info(
-            "Move a slider above to ask for a specific change in break or velo. "
-            "We'll surface the safest grip + drill recommendations to get you "
-            "there.")
+            "Move a slider above to ask for a specific change. The labels "
+            "tell you exactly what each direction does. We'll surface the "
+            "safest grip + drill paths to get you there."
+        )
     else:
-        st.markdown("**Suggestions (safest paths first):**")
-        for direction, title, why, grip_keys, drill_keys in suggestions:
-            with st.container(border=True):
+        for rule_key, dir_label, alt_key in requested:
+            rule_entries = rules.get(rule_key)
+            st.markdown(
+                f"<div style='font-size:11px;letter-spacing:0.10em;"
+                f"font-weight:700;color:#d4a634;text-transform:uppercase;"
+                f"margin-top:18px;margin-bottom:6px;'>"
+                f"You asked for: {dir_label.upper()}</div>",
+                unsafe_allow_html=True)
+
+            if rule_entries:
+                # Direct shaping suggestions for THIS pitch
+                for title, why, grip_keys, drill_keys in rule_entries:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<div style='display:flex;align-items:center;gap:10px;"
+                            f"margin-bottom:6px;'>"
+                            f"<span style='background:#3b82f6;color:white;padding:2px 9px;"
+                            f"border-radius:12px;font-size:10px;font-weight:700;"
+                            f"letter-spacing:0.06em;'>SHAPE THIS PITCH</span>"
+                            f"<span style='font-size:15px;font-weight:700;"
+                            f"color:#f1f5f9;'>{title}</span></div>"
+                            f"<div style='color:#cbd5e1;font-size:13px;"
+                            f"line-height:1.6;'>{why}</div>",
+                            unsafe_allow_html=True)
+                        if grip_keys:
+                            st.caption(
+                                "Grip refs: " + ", ".join(
+                                    GRIP_LIBRARY.get(k, {}).get("label", k)
+                                    for k in grip_keys))
+                        if drill_keys:
+                            st.caption(
+                                "Drills: " + ", ".join(
+                                    DRILL_LIBRARY.get(k, {}).get("label", k)
+                                    for k in drill_keys))
+            else:
+                # NO shaping rules for this direction on this pitch →
+                # surface alternative pitches that natively do this.
+                alts = ALT_PITCHES_FOR_DIRECTION.get(alt_key, [])
                 st.markdown(
-                    f"<div style='display:flex;align-items:center;gap:10px;"
-                    f"margin-bottom:6px;'>"
-                    f"<span style='background:#3b82f6;color:white;padding:2px 9px;"
-                    f"border-radius:12px;font-size:10px;font-weight:700;"
-                    f"letter-spacing:0.06em;'>{direction.upper()}</span>"
-                    f"<span style='font-size:15px;font-weight:700;color:#f1f5f9;'>"
-                    f"{title}</span></div>"
-                    f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;'>"
-                    f"{why}</div>",
+                    f"<div style='background:#1e293b;border-left:4px solid "
+                    f"#d4a634;border-radius:8px;padding:14px 18px;'>"
+                    f"<div style='color:#f1f5f9;font-size:14px;font-weight:600;"
+                    f"margin-bottom:6px;'>A <b>{pitch_picker}</b> isn't "
+                    f"naturally suited for that change.</div>"
+                    f"<div style='color:#cbd5e1;font-size:13px;'>"
+                    f"Pitchers who want <b>{dir_label.lower()}</b> usually "
+                    f"reach for a different pitch type:</div></div>",
                     unsafe_allow_html=True)
-                if grip_keys:
-                    st.caption(
-                        "Grip references: " + ", ".join(
-                            GRIP_LIBRARY.get(k, {}).get("label", k)
-                            for k in grip_keys))
-                if drill_keys:
-                    st.caption(
-                        "Drills to practice: " + ", ".join(
-                            DRILL_LIBRARY.get(k, {}).get("label", k)
-                            for k in drill_keys))
+                for alt_label, alt_grip, alt_blurb in alts:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<div style='display:flex;align-items:center;gap:10px;"
+                            f"margin-bottom:4px;'>"
+                            f"<span style='background:#16a34a;color:white;"
+                            f"padding:2px 9px;border-radius:12px;font-size:10px;"
+                            f"font-weight:700;letter-spacing:0.06em;'>"
+                            f"TRY THIS INSTEAD</span>"
+                            f"<span style='font-size:15px;font-weight:700;"
+                            f"color:#f1f5f9;'>{alt_label}</span></div>"
+                            f"<div style='color:#cbd5e1;font-size:13px;"
+                            f"line-height:1.6;'>{alt_blurb}</div>",
+                            unsafe_allow_html=True)
+                        if alt_grip:
+                            st.caption(
+                                f"Grip: {GRIP_LIBRARY.get(alt_grip, {}).get('label', alt_grip)}")
 
     if rules.get("safety"):
         st.markdown(
@@ -16183,6 +16376,118 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
             f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;'>"
             f"{rules['safety']}</div></div>",
             unsafe_allow_html=True)
+
+    st.divider()
+    # =============================================================
+    # LEARN A NEW PITCH FROM THE GROUND UP
+    # =============================================================
+    st.subheader("Learn a new pitch from the ground up")
+    st.caption(
+        "Want to add something to your arsenal? Pick what you want to learn. "
+        "You'll get the grip, the arm action, the common mistakes to dodge, "
+        "and a 4-week progression that earns you the pitch under the "
+        "4-criteria rule above."
+    )
+
+    # Build the catalog filtered by sport
+    _is_sb_new = (athlete_sport == "Softball")
+    _learnable = []
+    for gk, info in GRIP_LIBRARY.items():
+        is_sb_g = gk.startswith("softball_")
+        if _is_sb_new and not is_sb_g: continue
+        if not _is_sb_new and is_sb_g: continue
+        _learnable.append((gk, info["label"]))
+
+    # Exclude the ones the athlete already throws (best-effort match)
+    _arsenal_labels = {a["pitch_type"].lower() for a in arsenal}
+    _learnable = [(k, lab) for (k, lab) in _learnable
+                    if lab.lower().split(" (")[0] not in _arsenal_labels]
+
+    if not _learnable:
+        st.info("You already throw every grip in your sport's catalog — "
+                "focus on getting each pitch under the 4-criteria rule "
+                "before adding more.")
+    else:
+        new_pitch_label = st.selectbox(
+            "Pick a pitch to learn",
+            options=[lab for (_, lab) in _learnable],
+            key="new_pitch_picker")
+        new_pitch_key = next(k for (k, lab) in _learnable
+                              if lab == new_pitch_label)
+        new_info = GRIP_LIBRARY[new_pitch_key]
+
+        # Step 1: grip + arm motion
+        st.markdown("**Step 1 — Learn the grip and the arm motion**")
+        ng1, ng2 = st.columns([1, 1.4])
+        with ng1:
+            render_grip_diagram(new_pitch_key, height=340)
+            _wiki = GRIP_WIKI_URLS.get(new_pitch_key)
+            if _wiki:
+                st.markdown(
+                    f"<a href='{_wiki}' target='_blank' "
+                    f"style='display:inline-flex;align-items:center;gap:6px;"
+                    f"background:#1e293b;color:#60a5fa;padding:6px 12px;"
+                    f"border-radius:6px;font-size:12px;font-weight:600;"
+                    f"text-decoration:none;border:1px solid #334155;"
+                    f"margin-top:6px;'>"
+                    f"📷 View real grip photos on Wikipedia →</a>",
+                    unsafe_allow_html=True)
+        with ng2:
+            st.markdown(new_info["description"])
+
+        # Step 2: 4-week safe progression ladder
+        st.divider()
+        st.markdown("**Step 2 — 4-week progression (safe, build slow)**")
+        st.markdown(
+            "Run this every other day, never on consecutive days. STOP and "
+            "back up a week if the pitch feels uncomfortable in the arm.\n\n"
+            "**Week 1 — DRY MECHANICS:** Mirror-only reps. 3 sets × 10 reps "
+            "of the grip and full delivery without a ball. Goal: the grip "
+            "feels natural BEFORE you add ball mass.\n\n"
+            "**Week 2 — SOFT TOSS at 30 ft:** Use the new grip with light "
+            "effort. 2 sets × 10 reps × 2 days. Catcher gives feedback on "
+            "movement and arm action. Discard reps where the wrist tries "
+            "to compensate.\n\n"
+            "**Week 3 — LONG TOSS at 60 ft:** 2 sets × 10 reps × 2 days. "
+            "Throw at 75% intent. Movement should start to appear here. "
+            "If it doesn't, go back to Week 2 and check the grip.\n\n"
+            "**Week 4 — BULLPEN OFF THE MOUND:** 25 pitches alternating "
+            "with your existing fastball. Now you're tunneling. Mechanics "
+            "must match the fastball arm action.")
+
+        # Step 3: 4-criteria checklist
+        st.divider()
+        st.markdown("**Step 3 — When do you 'have' this pitch?**")
+        st.markdown(
+            "Run through this checklist every couple of weeks. Don't add "
+            "ANOTHER new pitch until every box is checked.")
+        st.markdown(
+            "- [ ] **Comfort:** No forced effort, no arm soreness afterward\n"
+            "- [ ] **Consistency:** Same shape and velocity 8/10 throws\n"
+            "- [ ] **Strikes:** 60%+ for strikes when you're trying to "
+            "throw a strike\n"
+            "- [ ] **Command:** You can put it on the corner you wanted "
+            "(not just 'in the zone')\n"
+            "- [ ] **Mechanics:** Arm slot, hip-shoulder sep, lead-knee "
+            "block all match your fastball form")
+
+        # Step 4: biomechanical safety
+        st.divider()
+        new_rules_key = next(
+            (k for k in PITCH_SHAPING_RULES
+              if k.lower() in new_pitch_label.lower()), None)
+        new_safety = (PITCH_SHAPING_RULES.get(new_rules_key, {})
+                        .get("safety"))
+        if new_safety:
+            st.markdown(
+                f"<div style='background:#1e293b;border-left:4px solid #ef4444;"
+                f"border-radius:8px;padding:12px 16px;margin-top:8px;'>"
+                f"<div style='font-size:11px;letter-spacing:0.10em;"
+                f"font-weight:700;color:#ef4444;text-transform:uppercase;"
+                f"margin-bottom:4px;'>Biomech safety while learning</div>"
+                f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;'>"
+                f"{new_safety}</div></div>",
+                unsafe_allow_html=True)
 
     st.divider()
     # Embed the grip library here (it moved off Action Plan)
