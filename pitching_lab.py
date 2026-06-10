@@ -7352,14 +7352,13 @@ def compute_real_baseline(athlete_id: int, lookback: int = 6) -> dict:
 # =============================================================================
 # Standard strike zone bounds (rough): plate is 17" wide = 0.71 ft each side
 # of center; vertical zone is ~knees (1.5 ft) to letters (3.5 ft).
-SZ_X_MIN, SZ_X_MAX = -0.71, 0.71
-SZ_Z_MIN, SZ_Z_MAX = 1.5, 3.5
+SZ_X_MIN, SZ_X_MAX = -0.71, 0.71   # 17" plate width = 1.42 ft
+SZ_Z_MIN, SZ_Z_MAX = 1.55, 3.42    # ABS-style ~22" zone for an average 6 ft batter
 # Plot ranges: keep a margin around the strike zone but stay tight enough
 # that the rendered aspect ratio looks correct on phones and desktop.
-# Data ratio (X:Z) here = 3.4 : 4.2 ≈ 0.81 (taller than wide), which is
-# how a real strike zone reads to a hitter (~17" wide × 24" tall).
-SZ_PLOT_X_RANGE = (-1.7, 1.7)
-SZ_PLOT_Z_RANGE = (0.4, 4.6)
+# Real MLB zone is ~17" wide × 22" tall — ratio ≈ 0.77 (taller than wide).
+SZ_PLOT_X_RANGE = (-1.6, 1.6)
+SZ_PLOT_Z_RANGE = (0.5, 4.5)
 
 
 def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
@@ -7381,10 +7380,11 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
                       line=dict(color="lightgray", width=1), layer="below")
         fig.add_shape(type="line", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=z, y1=z,
                       line=dict(color="lightgray", width=1), layer="below")
-    # Home plate at the bottom
+    # Home plate at the bottom — positioned just inside the new
+    # plot Z range so it's visible.
     fig.add_shape(
         type="path",
-        path=f"M -0.71 0.05 L 0.71 0.05 L 0.50 -0.10 L 0 -0.25 L -0.50 -0.10 Z",
+        path=f"M -0.71 0.90 L 0.71 0.90 L 0.50 0.75 L 0 0.60 L -0.50 0.75 Z",
         line=dict(color="black", width=1.5),
         fillcolor="rgba(220,220,220,0.6)", layer="below",
     )
@@ -7443,18 +7443,23 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
             name=ptype,
         ))
 
-    # NOTE: no scaleanchor — at 900×550 chart dimensions, locking the
-    # y/x pixel ratio to 1:1 forces Plotly to extend the visible range
-    # to ±10 ft on both axes (because the chart pixels aren't square).
-    # Letting each axis honor its explicit `range` independently keeps
-    # the data tight in the strike-zone area on every device.
+    # scaleanchor='x' + scaleratio=1 locks the data:pixel ratio so the
+    # strike zone box keeps its real-world proportions (17"×24" = 0.71
+    # ratio, taller than wide) regardless of how the container resizes.
+    # SAFE NOW because the new portrait plot range (3.4×4.2 ft) is
+    # already close to the rendered aspect ratio — Plotly won't have to
+    # extend a range to fit, the way the old square-data + landscape-PNG
+    # combo did.
     fig.update_layout(
         xaxis=dict(title="Plate Side (ft) — catcher's view",
                    range=SZ_PLOT_X_RANGE, zeroline=False, showgrid=False,
-                   fixedrange=True, autorange=False),
+                   fixedrange=True, autorange=False,
+                   constrain="domain"),
         yaxis=dict(title="Height (ft)",
                    range=SZ_PLOT_Z_RANGE, zeroline=False, showgrid=False,
-                   fixedrange=True, autorange=False),
+                   fixedrange=True, autorange=False,
+                   scaleanchor="x", scaleratio=1,
+                   constrain="domain"),
         height=700,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=20, r=20, t=40, b=40),
@@ -11188,15 +11193,19 @@ def _build_hit_quality_zone_figure(df: pd.DataFrame) -> "go.Figure":
             name=outcome.replace("_", " ").title(),
         ))
 
-    # No scaleanchor — see note in _build_strike_zone_figure.
+    # scaleanchor='x' + scaleratio=1 locks the data:pixel ratio so the
+    # strike zone keeps its real-world 17"×22" proportions.
     fig.update_layout(
         xaxis=dict(title="Plate Side (ft)", range=SZ_PLOT_X_RANGE,
                     zeroline=False, showgrid=False,
-                    fixedrange=True, autorange=False),
+                    fixedrange=True, autorange=False,
+                    constrain="domain"),
         yaxis=dict(title="Height (ft)", range=SZ_PLOT_Z_RANGE,
                     zeroline=False, showgrid=False,
-                    fixedrange=True, autorange=False),
-        height=560,
+                    fixedrange=True, autorange=False,
+                    scaleanchor="x", scaleratio=1,
+                    constrain="domain"),
+        height=700,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=20, r=20, t=40, b=40),
         plot_bgcolor="white",
