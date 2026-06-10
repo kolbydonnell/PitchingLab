@@ -7361,8 +7361,25 @@ SZ_PLOT_X_RANGE = (-1.6, 1.6)
 SZ_PLOT_Z_RANGE = (0.5, 4.5)
 
 
-def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
-    """Construct an interactive strike-zone scatter plot."""
+def _build_strike_zone_figure(df: pd.DataFrame,
+                                  sport: str = "Baseball") -> "go.Figure":
+    """Construct an interactive strike-zone scatter plot.
+
+    `sport` controls ball-marker size. A regulation softball (~3.8"
+    diameter) is ~32% bigger than a baseball (~2.9"), so the markers
+    scale up proportionally relative to the same 17"-wide zone.
+    """
+    # Ball-marker sizing — scaled to the real ball : 17"-zone ratio.
+    # Baseball: 2.9" / 17" ≈ 17.1% → 52 px on a 560-wide PNG.
+    # Softball: 3.82" / 17" ≈ 22.5% → 68 px on the same PNG.
+    if (sport or "Baseball").lower().startswith("softball"):
+        _ball_px = 68
+        _ring_px = 78
+        _text_px = 18
+    else:
+        _ball_px = 52
+        _ring_px = 62
+        _text_px = 16
     fig = go.Figure()
 
     # --- Strike zone box (3x3 grid for visual reference) ---
@@ -7404,9 +7421,10 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
                     x=[row["Strike_Zone_Side"]],
                     y=[row["Strike_Zone_Height"]],
                     mode="markers",
-                    # Ring sized to encircle the new baseball-sized
-                    # marker (size=44 + 4px halo on each side).
-                    marker=dict(size=52, color="rgba(0,0,0,0)",
+                    # Ring sized to encircle the new ball-sized marker
+                    # with an 8px halo (so the colored outline reads
+                    # clearly without crowding the next marker).
+                    marker=dict(size=_ring_px, color="rgba(0,0,0,0)",
                                 line=dict(color=ring, width=4)),
                     showlegend=False,
                     hoverinfo="skip",
@@ -7435,16 +7453,15 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
         fig.add_trace(go.Scatter(
             x=g["Strike_Zone_Side"], y=g["Strike_Zone_Height"],
             mode="markers+text",
-            # Marker sized to a real baseball (~2.9" diameter) relative
-            # to the 17" strike zone width — 17% of zone = ~44 px on a
-            # 560-wide PNG with ~213 px wide zone box. Visually matches
-            # Statcast pitch charts where each dot reads as "a ball in
-            # the zone."
-            marker=dict(size=44, color=color,
+            # Marker sized to a real ball relative to the 17" strike
+            # zone width — see _ball_px / _ring_px computed above.
+            # Baseball: ~52 px (17% of zone) · Softball: ~68 px (22%)
+            marker=dict(size=_ball_px, color=color,
                           line=dict(width=2, color="black")),
             text=[str(int(p)) for p in g["Pitch_Num"]],
             textposition="middle center",
-            textfont=dict(color="white", size=15, family="Arial Black"),
+            textfont=dict(color="white", size=_text_px,
+                            family="Arial Black"),
             customdata=g[["Pitch_Num"]].values,
             hovertemplate="%{hovertext}<extra></extra>",
             hovertext=hover,
@@ -9019,6 +9036,88 @@ GRIP_COMPARISON = {
         "pick_if":        "You want a one-time-per-season disruptor.",
         "avoid_if":       "Runners on base, batters with extreme uppercut swings, or any 3-ball count.",
     },
+    # ===== SOFTBALL FAMILY =====
+    "softball_fastball": {
+        "velocity_band":  "Top of your velo (58-64 mph range typical).",
+        "movement":       "Mild arm-side run with light carry.",
+        "difficulty":     "Easy to grip, lifetime to command at the corners.",
+        "pros":           ["Sets the tunnel for every other windmill pitch", "Best in-zone strike-getter at any count", "Easiest pitch on the arm in your arsenal"],
+        "cons":           ["Predictable shape — barreled if left middle", "Doesn't move late", "Top-velocity HS hitters can catch up"],
+        "pick_if":        "You need a strike, want to elevate, or are setting up an offspeed.",
+        "avoid_if":       "You're trying to induce ground balls — drop ball is better.",
+    },
+    "softball_rise": {
+        "velocity_band":  "Within 2 mph of fastball.",
+        "movement":       "STAYS UP — backspin (12:00 axis) makes it drop 4-8\" less than the eye expects.",
+        "difficulty":     "Hard — the wrist flick is unique to the rise.",
+        "pros":           ["Devastating swing-and-miss at the top of the zone", "Pairs perfectly with a drop ball for a vertical tunnel", "Most underdeveloped pitch in HS softball — instant edge if you can throw it"],
+        "cons":           ["Most common 'never works in a game' pitch — feel takes 6+ months", "If the axis tilts, it becomes a flat fastball", "Wrong release point = walks"],
+        "pick_if":        "You can spin a clean 12:00 axis and want the rise/drop combo.",
+        "avoid_if":       "Your fastball command isn't already solid — fastball first.",
+    },
+    "softball_drop": {
+        "velocity_band":  "Within 2 mph of fastball.",
+        "movement":       "Peels off the FRONT of the fingers — topspin (6:00 axis) drops 6-8\" more than gravity.",
+        "difficulty":     "Easier than rise — the peel release feels natural.",
+        "pros":           ["Best ground-ball pitch in softball", "Easier to develop than the rise", "Pairs with rise for vertical tunneling"],
+        "cons":           ["Less swing-and-miss than rise at the upper-level", "If you don't peel cleanly, it's a flat fastball", "Front-finger pressure can wear the index callus"],
+        "pick_if":        "You want a reliable ground-ball pitch you can land for strikes.",
+        "avoid_if":       "You're chasing strikeouts — the drop induces contact more than misses.",
+    },
+    "softball_drop_roll": {
+        "velocity_band":  "Within 2 mph of fastball.",
+        "movement":       "Same drop shape as peel drop but with a slight wrist roll for more late dive.",
+        "difficulty":     "Moderate — the wrist roll is a separate skill from peel.",
+        "pros":           ["Sharper late drop than peel for some pitchers", "Pairs with the peel as a 'two-look' drop ball menu"],
+        "cons":           ["The roll adds elbow stress vs peel", "Some coaches insist peel-only for arm safety"],
+        "pick_if":        "Your peel drop has flattened — try the roll variant for more bite.",
+        "avoid_if":       "You have any elbow soreness — peel drop is the safer choice.",
+    },
+    "softball_curve": {
+        "velocity_band":  "4-6 mph below fastball.",
+        "movement":       "Glove-side break with neutral vertical — like a baseball slider.",
+        "difficulty":     "Moderate — the wrist supination is the key.",
+        "pros":           ["Plus chase pitch with 2 strikes vs same-side hitters", "Same arm action as fastball — late identification", "Easier than rise to develop"],
+        "cons":           ["Predictable if overused — hitters track the spin axis easily", "Without a screwball, opposite-side hitters get more comfortable"],
+        "pick_if":        "You face mostly same-side hitters and need a chase pitch.",
+        "avoid_if":       "You already have a sharp drop ball — they tunnel similarly.",
+    },
+    "softball_screw": {
+        "velocity_band":  "4-6 mph below fastball.",
+        "movement":       "Arm-side break — the mirror image of the curve.",
+        "difficulty":     "Hard — the inside-out wrist rotation is unusual.",
+        "pros":           ["Devastating vs opposite-side hitters (jams their hands)", "Rare pitch — most HS hitters haven't seen it", "Pairs with curve to attack both batter boxes"],
+        "cons":           ["The wrist rotation is uncomfortable for many pitchers", "Adds shoulder stress vs other softball pitches", "Hard to land for early-count strikes"],
+        "pick_if":        "You face plenty of opposite-side hitters and want a glove-hand weapon.",
+        "avoid_if":       "Your shoulder has barked at you — screw is the highest-stress softball pitch.",
+    },
+    "softball_changeup": {
+        "velocity_band":  "10-14 mph below fastball.",
+        "movement":       "Mild arm-side fade with light sink.",
+        "difficulty":     "Easy to start, hard to disguise the velocity loss.",
+        "pros":           ["Best timing-disrupter in softball", "Big velocity gap takes hitters off-balance", "Same arm action as fastball when thrown right"],
+        "cons":           ["Easy to telegraph by slowing the windmill", "Without good fastball command, the changeup feels like a freebie", "Catchers struggle to block the late dive"],
+        "pick_if":        "You want a primary offspeed for setting up the fastball.",
+        "avoid_if":       "Your fastball isn't consistently a strike — establish that first.",
+    },
+    "softball_change": {
+        "velocity_band":  "12-15 mph below fastball.",
+        "movement":       "Late dive with arm-side fade.",
+        "difficulty":     "Hard — the backhand release inverts your normal mechanics.",
+        "pros":           ["Biggest velocity gap available in softball", "Late dive earns chase swings", "Same arm path as fastball through the windmill"],
+        "cons":           ["The backhand grip is uncomfortable until you commit to it", "If the flip isn't clean, the ball sails", "Wrist injury risk if you don't lock the elbow"],
+        "pick_if":        "Your standard changeup has lost its velocity edge.",
+        "avoid_if":       "You're brand-new to changeups — try the standard first.",
+    },
+    "softball_offspeed_knuckle": {
+        "velocity_band":  "12-16 mph below fastball.",
+        "movement":       "Random — low spin invites movement variation.",
+        "difficulty":     "Moderate — feel takes time but mechanics are simple.",
+        "pros":           ["Adds randomness on top of the velo drop", "Easy on the arm", "Catches hitters who've tracked your spin axes all game"],
+        "cons":           ["Unpredictable — sometimes it's a meatball", "Catchers can't track it either", "Easy to lose in the dirt with runners on"],
+        "pick_if":        "You want a third offspeed look beyond your standard changeup.",
+        "avoid_if":       "Runners on base or any 3-ball count — the lack of control is a liability.",
+    },
 }
 
 # =====================================================================
@@ -9196,6 +9295,95 @@ GRIP_ARSENAL_INTEGRATION = {
         "- Never with runners on base. Never to extreme uppercut hitters.\n\n"
         "**Pairs best with:** Itself, used surprisingly — no follow-up needed.\n\n"
         "**Game-ready timeline:** 1–2 weeks of long-toss arc work."
+    ),
+    # ===== SOFTBALL FAMILY =====
+    "softball_fastball": (
+        "**Arsenal role:** Foundation. Every other pitch tunnels off the windmill arm path.\n\n"
+        "**When to throw it:**\n"
+        "- 0-0 and 1-0 — get ahead with a strike at the knees or low-outside.\n"
+        "- 3-1, 3-2 — your most repeatable strike when you can't afford a walk.\n"
+        "- Avoid grooving middle of the plate to power hitters.\n\n"
+        "**Pairs best with:** changeup (velocity tunnel), rise (vertical eye-change), "
+        "drop (vertical eye-change).\n\n"
+        "**Game-ready timeline:** Day one — this is your anchor pitch."
+    ),
+    "softball_rise": (
+        "**Arsenal role:** Late-count put-away vs same-side hitters AND a tunneling "
+        "partner to the drop ball.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 — start at the belt, finish at the letters for the swing-and-miss.\n"
+        "- After a drop ball — flip the hitter's eye level from low to high.\n"
+        "- Avoid 2-1 / 3-1 if your rise tends to drift up out of the zone.\n\n"
+        "**Pairs best with:** drop ball (vertical tunnel), fastball (sets the perceived "
+        "release height), changeup (timing disruption after a rise misses).\n\n"
+        "**Game-ready timeline:** 6–12 months for most pitchers. Don't add another pitch "
+        "until the rise rotates correctly 8/10 times."
+    ),
+    "softball_drop": (
+        "**Arsenal role:** Primary ground-ball pitch — induces weak contact.\n\n"
+        "**When to throw it:**\n"
+        "- 1-1, 2-1, 2-2 in any matchup — start belt-high, finish at the knees.\n"
+        "- Bases loaded / double-play situations — the drop is your best friend.\n"
+        "- Avoid 0-2 in big spots if you can't bury it just below the zone.\n\n"
+        "**Pairs best with:** rise ball (vertical eye-change), fastball (perceived release "
+        "match), changeup (timing).\n\n"
+        "**Game-ready timeline:** 3–6 months for the peel grip to feel natural."
+    ),
+    "softball_drop_roll": (
+        "**Arsenal role:** Alternative drop variant for pitchers whose peel has flattened.\n\n"
+        "**When to throw it:**\n"
+        "- Same situations as the peel drop — this is a 'sharper bite' version.\n"
+        "- Especially in 2-strike counts where you need a put-away dive.\n\n"
+        "**Pairs best with:** Same as peel drop — fastball, rise, changeup.\n\n"
+        "**Game-ready timeline:** 4–8 weeks for pitchers transitioning from peel."
+    ),
+    "softball_curve": (
+        "**Arsenal role:** Glove-side breaker — primary chase pitch vs same-side hitters.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 vs same-side hitters — start at the belt, finish off the corner.\n"
+        "- 1-1 to steal a count when the hitter is sitting fastball.\n"
+        "- Avoid back-to-back curves to the same hitter — they'll track the axis.\n\n"
+        "**Pairs best with:** fastball (tunneling), screwball (paired breakers for both "
+        "boxes), drop ball (vertical contrast).\n\n"
+        "**Game-ready timeline:** 3–6 months."
+    ),
+    "softball_screw": (
+        "**Arsenal role:** Opposite-side weapon — jams the hands of opposite-handed hitters.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 vs opposite-side hitters — start middle, end inside.\n"
+        "- 2-1 when the hitter has shown they can lay off the curve.\n"
+        "- Avoid early-count usage until you can land it for strikes consistently.\n\n"
+        "**Pairs best with:** fastball (tunneling), curveball (mirror weapon for the "
+        "opposite box), changeup (timing disruption).\n\n"
+        "**Game-ready timeline:** 6–10 months — the wrist rotation is hard."
+    ),
+    "softball_changeup": (
+        "**Arsenal role:** Primary offspeed — disrupts hitter timing.\n\n"
+        "**When to throw it:**\n"
+        "- 1-1, 1-2, 2-2 in any matchup — the velo gap is the weapon.\n"
+        "- 0-0 occasionally — first-pitch changeup steals strikes when hitters sit fastball.\n"
+        "- Avoid back-to-back changeups — the second one almost always gets hit hard.\n\n"
+        "**Pairs best with:** fastball (velo tunnel), rise (timing + vertical), drop (timing + sink).\n\n"
+        "**Game-ready timeline:** 2–4 months."
+    ),
+    "softball_change": (
+        "**Arsenal role:** Premium late-count put-away offspeed.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 — late dive earns the chase swing.\n"
+        "- Vs aggressive hitters who have laid off the standard changeup.\n"
+        "- Avoid full counts — the backhand release is harder to land for strikes.\n\n"
+        "**Pairs best with:** fastball (tunneling), rise (vertical eye-change after dive).\n\n"
+        "**Game-ready timeline:** 6–10 months — backhand mechanics take time."
+    ),
+    "softball_offspeed_knuckle": (
+        "**Arsenal role:** Third offspeed look — for advanced pitchers who already have "
+        "a solid standard changeup.\n\n"
+        "**When to throw it:**\n"
+        "- Late in the game when hitters have seen your usual changeup.\n"
+        "- 1-1 to steal a strike with the unexpected look.\n"
+        "- Avoid runners on base — control is less predictable.\n\n"
+        "**Pairs best with:** standard changeup (two changeup looks), fastball (tunneling).\n\n"
+        "**Game-ready timeline:** 4–8 months."
     ),
 }
 
@@ -16510,6 +16698,8 @@ ALT_PITCHES_FOR_DIRECTION = {
          "Fade away from opposite-side hitters with grip-driven movement."),
         ("Screwball (softball)", "softball_screw",
          "Inward wrist pronation makes the ball break arm-side."),
+        ("Softball Changeup", "softball_changeup",
+         "Natural arm-side fade with a 10-14 mph velocity drop."),
     ],
     "more_glove_break":   [
         ("Cutter", "cutter",
@@ -16518,6 +16708,8 @@ ALT_PITCHES_FOR_DIRECTION = {
          "Big sweeping glove-side break with the safest mechanic."),
         ("Slurve", "slurve",
          "Slider/curve hybrid — wider sweep + downward bite."),
+        ("Curveball (softball)", "softball_curve",
+         "Supination-driven glove-side break for softball pitchers."),
     ],
     "more_drop":          [
         ("Curveball (12-6)", "curveball",
@@ -16526,6 +16718,8 @@ ALT_PITCHES_FOR_DIRECTION = {
          "Looks like a fastball, dies at the plate."),
         ("Knuckle Curve", "knuckle_curve",
          "Sharper, later-breaking curve thanks to the spike grip."),
+        ("Drop Ball (softball)", "softball_drop",
+         "Peel release imparts topspin — the maximum-drop pitch in softball."),
         ("Rise Ball (softball)", "softball_rise",
          "Inverted — DOES NOT drop. If you want LESS drop instead of more, this is the answer."),
     ],
@@ -16538,6 +16732,8 @@ ALT_PITCHES_FOR_DIRECTION = {
     "more_velo":          [
         ("Four-Seam Fastball", "four_seam_fastball",
          "Your peak velo pitch — anything 4+ mph slower needs different mechanics."),
+        ("Softball Fastball", "softball_fastball",
+         "Your peak velo pitch in softball — every other pitch sits below it."),
     ],
     "less_velo":          [
         ("Circle Changeup", "changeup_circle",
@@ -16548,6 +16744,10 @@ ALT_PITCHES_FOR_DIRECTION = {
          "5-8 mph slower with extra drop."),
         ("Three-Finger Changeup", "three_finger_change",
          "8-12 mph drop with no spread-finger stress. Great starter changeup."),
+        ("Softball Changeup", "softball_changeup",
+         "10-14 mph drop with arm-side fade — the softball offspeed staple."),
+        ("Backhand Change (softball)", "softball_change",
+         "Premium late-count put-away for softball pitchers — 12-15 mph drop."),
     ],
 }
 
@@ -16746,7 +16946,312 @@ PITCH_SHAPING_RULES = {
         ],
         "safety": "Splitter taxes the index-middle finger pulley. If you have small hands, choose circle change instead.",
     },
+    # ===== SOFTBALL PITCHES =====
+    "Softball Fastball": {
+        "v_break_up": [
+            ("Tighten the backspin axis",
+             "Clean 12:30 spin from a horseshoe-orientation grip adds carry. "
+             "Wrist stays neutral through the 6:00 release.",
+             ["softball_fastball"], []),
+            ("Brush the hip at release",
+             "Late hip contact extends the arm path → more backspin RPM. "
+             "If your wrist breaks early, carry drops.",
+             ["softball_fastball"], []),
+        ],
+        "v_break_down": [
+            ("Shift to a drop ball look",
+             "If you want SINK instead of carry, the drop ball does it natively. "
+             "Same windmill, different release.",
+             ["softball_drop"], []),
+        ],
+        "h_break_arm": [
+            ("Add a touch of pronation at release",
+             "Subtle inward wrist rotation adds 2-4 inches of arm-side run "
+             "without changing the pitch identity.",
+             ["softball_fastball"], []),
+        ],
+        "h_break_glove": [
+            ("Build a curveball alongside",
+             "The fastball doesn't naturally cut glove-side. For glove-side "
+             "break at near-fastball velo, add a curveball.",
+             ["softball_curve"], []),
+        ],
+        "velo_up": [
+            ("Long-arm at 9:00 → snap at 6:00",
+             "Straight elbow through the downswing + brush-at-hip at release. "
+             "Any bend in the arm or short release point bleeds velocity.",
+             ["softball_fastball"], []),
+            ("Strengthen the post leg drive",
+             "Windmill velocity comes from the legs more than the arm. "
+             "Stronger drive off the pitcher's mound = more arm whip.",
+             [], []),
+        ],
+        "velo_down": [
+            ("Throw a changeup instead",
+             "Slowing the fastball intentionally is a tell. Use the changeup "
+             "for velocity disruption.",
+             ["softball_changeup"], []),
+        ],
+        "safety": "Softball fastball is the safest pitch in the arsenal. Only watch for elbow snap at release — the windmill should be loose whip, not muscled.",
+    },
+    "Rise Ball": {
+        "v_break_up": [
+            ("Pure 12:00 backspin axis",
+             "The whole pitch depends on the spin axis. ANY tilt below 11:30 "
+             "or above 12:30 kills the rise. Drill the axis with a Rapsodo or "
+             "tilt-board.",
+             ["softball_rise"], []),
+            ("Flick UP at release, palm to sky",
+             "Fingers PUSH up off the bottom of the ball at 6:00. Wrist "
+             "supinates AFTER the brush — never before.",
+             ["softball_rise"], []),
+            ("More spin rate",
+             "Rise needs 2000+ rpm to hold up. Grip pressure + clean finger "
+             "release at the very last instant maximizes RPM.",
+             ["softball_rise"], []),
+        ],
+        "v_break_down": [
+            ("Throw a drop ball instead",
+             "Drop is the inverse pitch — if you want DOWN movement, drop is "
+             "your weapon. The rise is committed to staying up.",
+             ["softball_drop"], []),
+        ],
+        "h_break_arm": [
+            ("Slight pronation at release",
+             "If you want arm-side movement on a rise, you'll get it from "
+             "subtle inward rotation. But too much tilts the axis away from "
+             "12:00 and the rise dies.",
+             ["softball_rise"], []),
+        ],
+        "h_break_glove": [
+            ("Slight supination at release",
+             "Light outward rotation adds some glove-side angle. Same caution "
+             "as arm-side — too much breaks the rise.",
+             ["softball_rise"], []),
+        ],
+        "velo_up": [
+            ("Throw at fastball intent",
+             "Most rise balls lose velo because pitchers slow the arm trying "
+             "to FEEL the wrist flick. Trust the grip and throw normally.",
+             ["softball_rise"], []),
+        ],
+        "safety": "Rise ball stresses the wrist and forearm more than other pitches because of the flick release. Limit to 25% of total pitches in a session until the flick feels automatic.",
+    },
+    "Drop Ball": {
+        "v_break_down": [
+            ("Cleaner front-finger peel",
+             "Fingers come OFF the top of the ball cleanly at release. If "
+             "they linger or roll, the topspin axis tilts and you lose drop.",
+             ["softball_drop"], []),
+            ("Try the roll variant",
+             "If the peel drop has flattened, the wrist-roll version adds a "
+             "few more inches of late dive — small elbow-stress tradeoff.",
+             ["softball_drop_roll"], []),
+            ("Spin rate matters less than axis",
+             "Drop works at 1700-2100 rpm IF the axis is clean 6:00. Don't "
+             "chase higher spin — chase the right axis.",
+             ["softball_drop"], []),
+        ],
+        "v_break_up": [
+            ("Throw a fastball or rise instead",
+             "Drop is committed to falling. For CARRY, use the fastball or, "
+             "if you have it, the rise ball.",
+             ["softball_fastball", "softball_rise"], []),
+        ],
+        "h_break_arm": [
+            ("Slight pronation at release",
+             "Light inward rotation adds arm-side run on the drop. Don't push "
+             "it past 5 inches of horizontal or the topspin axis tilts.",
+             ["softball_drop"], []),
+        ],
+        "h_break_glove": [
+            ("Curveball alongside for glove-side",
+             "The drop won't break glove-side cleanly. Build a curve for "
+             "that direction.",
+             ["softball_curve"], []),
+        ],
+        "velo_up": [
+            ("Throw at fastball intent",
+             "Velo on the drop matches the fastball when the arm doesn't "
+             "slow down. The peel release is the only difference.",
+             ["softball_drop"], []),
+        ],
+        "safety": "Peel drop is one of the safer softball pitches. Only watch for index callus wear from the front-finger pressure.",
+    },
+    "Softball Curveball": {
+        "h_break_glove": [
+            ("Stronger supination at release",
+             "Outward wrist rotation drives the glove-side break. The wrist "
+             "is what creates the break — not the grip.",
+             ["softball_curve"], []),
+            ("Move grip slightly off-center to glove side",
+             "Subtle grip shift adds 2-3 inches of horizontal break without "
+             "changing the release mechanic.",
+             ["softball_curve"], []),
+        ],
+        "v_break_down": [
+            ("Tilt the wrist more vertical",
+             "Steeper wrist angle at release pulls the break diagonal — adds "
+             "some drop to the horizontal sweep.",
+             ["softball_curve"], []),
+        ],
+        "h_break_arm": [
+            ("Build a screwball alongside",
+             "The curve goes glove-side. For arm-side break at offspeed velo, "
+             "you need the screwball.",
+             ["softball_screw"], []),
+        ],
+        "velo_up": [
+            ("Throw at fastball intent",
+             "Soft-arm curveballs hang. The supination does the breaking — "
+             "the arm should still throw the windmill normally.",
+             ["softball_curve"], []),
+        ],
+        "safety": "Curveball is moderate stress on the wrist/forearm because of the supination. Limit to 25-30% usage in a session.",
+    },
+    "Screwball": {
+        "h_break_arm": [
+            ("Stronger pronation at release",
+             "Inward wrist rotation drives the arm-side break. This is the "
+             "MIRROR of the curveball.",
+             ["softball_screw"], []),
+            ("Slight grip shift toward arm side",
+             "Off-centering the grip 1/4 inch toward the arm side adds 2-3 "
+             "inches of horizontal break.",
+             ["softball_screw"], []),
+        ],
+        "v_break_down": [
+            ("Tilt the wrist more vertical at release",
+             "Adds drop to the screw — diagonal break instead of pure horizontal.",
+             ["softball_screw"], []),
+        ],
+        "h_break_glove": [
+            ("Build a curveball alongside",
+             "Screw goes arm-side. Curveball is the glove-side answer.",
+             ["softball_curve"], []),
+        ],
+        "velo_up": [
+            ("Throw at fastball intent",
+             "Soft-arm screwballs spin sideways without breaking. The "
+             "pronation does the work — the arm still throws normal velocity.",
+             ["softball_screw"], []),
+        ],
+        "safety": "Screwball is the HIGHEST-stress softball pitch on the elbow because of the pronation. Limit to 15-20% usage; do NOT use back-to-back days.",
+    },
+    "Softball Change-Up": {
+        "velo_down": [
+            ("Push deeper into the palm",
+             "Standard changeup grip pushed deeper into the palm kills more "
+             "velocity. Same arm action, more grip suck.",
+             ["softball_changeup"], []),
+            ("Try the backhand change",
+             "The backhand release inverts the wrist for a bigger velocity "
+             "drop — 12-15 mph off fastball is typical.",
+             ["softball_change"], []),
+        ],
+        "h_break_arm": [
+            ("Light pronation at release",
+             "Standard changeup naturally fades arm-side. More pronation = "
+             "more fade, but slowly — too much tips the pitch.",
+             ["softball_changeup"], []),
+        ],
+        "v_break_down": [
+            ("Switch to the backhand change",
+             "Backhand release adds late dive on top of the velocity drop. "
+             "Same arm action as fastball.",
+             ["softball_change"], []),
+        ],
+        "h_break_glove": [
+            ("Curveball is the glove-side answer at offspeed velo",
+             "The changeup commits to arm-side fade. For glove-side movement "
+             "at lower velocity, build a curve alongside.",
+             ["softball_curve"], []),
+        ],
+        "velo_up": [
+            ("Throw at fastball intent",
+             "Most velo-low changeups come from soft-arm guiding. Throw it "
+             "like the fastball — the grip does the slowing.",
+             ["softball_changeup"], []),
+        ],
+        "safety": "Standard changeup is low-stress. The backhand change variant adds wrist stress because of the inversion — limit to 15% usage if your wrist isn't conditioned.",
+    },
 }
+
+
+def _resolve_shaping_rule(pitch_type: str, sport: str = "Baseball") -> str | None:
+    """Find the right PITCH_SHAPING_RULES key for the (pitch_type, sport).
+
+    The picker may be called "Curveball" for both baseball and softball
+    pitchers. This helper prefers SPORT-SPECIFIC keys first so a softball
+    "Curveball" routes to "Softball Curveball" and a baseball "Curveball"
+    routes to "Curveball" (baseball default).
+    """
+    if not pitch_type:
+        return None
+    pt_low = pitch_type.strip().lower()
+    is_softball = (sport or "Baseball").lower() == "softball"
+
+    # 1) Sport-specific aliases FIRST — so "Curveball" in softball context
+    # routes to "Softball Curveball" instead of getting the baseball one
+    # via exact match.
+    if is_softball:
+        sb_aliases = {
+            "rise ball":          "Rise Ball",
+            "rise":               "Rise Ball",
+            "drop ball":          "Drop Ball",
+            "drop":               "Drop Ball",
+            "screwball":          "Screwball",
+            "screw":              "Screwball",
+            "softball fastball":  "Softball Fastball",
+            "fastball":           "Softball Fastball",
+            "curveball":          "Softball Curveball",
+            "curve":              "Softball Curveball",
+            "change-up":          "Softball Change-Up",
+            "changeup":           "Softball Change-Up",
+            "change":             "Softball Change-Up",
+        }
+        for alias, key in sb_aliases.items():
+            if alias in pt_low and key in PITCH_SHAPING_RULES:
+                return key
+
+    # 2) Exact match
+    for k in PITCH_SHAPING_RULES:
+        if k.lower() == pt_low:
+            return k
+
+    # 3) Substring match — bias toward sport-appropriate keys
+    candidates = [k for k in PITCH_SHAPING_RULES
+                    if k.lower() in pt_low or pt_low in k.lower()]
+    if candidates:
+        if is_softball:
+            sb_keys = [k for k in candidates
+                        if any(s in k for s in ("Softball", "Rise", "Drop", "Screw", "Change-Up"))]
+            if sb_keys:
+                return sb_keys[0]
+            return candidates[0]
+        else:
+            bb_keys = [k for k in candidates
+                        if not any(s in k for s in ("Softball", "Rise", "Drop Ball", "Screw"))]
+            if bb_keys:
+                return bb_keys[0]
+            return candidates[0]
+
+    # 4) Word-overlap fallback — match by first word ("Slider Chase"
+    # → "Slider Strike-Getter"). Helps catch variant names like
+    # "Slider Chase" that map to the closest known family.
+    first_word = pt_low.split()[0] if pt_low else ""
+    if first_word and len(first_word) >= 4:
+        for k in PITCH_SHAPING_RULES:
+            if first_word in k.lower():
+                if is_softball and any(s in k for s in ("Softball", "Rise", "Drop", "Screw", "Change-Up")):
+                    return k
+                if not is_softball and not any(s in k for s in ("Softball", "Rise", "Drop Ball", "Screw")):
+                    return k
+        # If no sport-preferred match, accept any
+        for k in PITCH_SHAPING_RULES:
+            if first_word in k.lower():
+                return k
+    return None
 
 
 def _arsenal_summary(df) -> list:
@@ -16866,6 +17371,55 @@ PITCH_TARGETS = {
         "mlb_baseline":   {"velo": 70, "spin": 350, "v_break": 0, "h_break": 0},
         "movement_goal":  "Random — low spin invites the wind.",
     },
+    # ===== SOFTBALL PITCHES =====
+    "Softball Fastball": {
+        "v_break_ideal":  (-1, 3),
+        "h_break_ideal":  (6, 11),
+        "velo_ideal":     (58, 64),
+        "spin_ideal":     (1500, 2000),
+        "mlb_baseline":   {"velo": 61, "spin": 1750, "v_break": 0.5, "h_break": 8.5},
+        "movement_goal":  "Clean backspin carry with arm-side run.",
+    },
+    "Rise Ball": {
+        "v_break_ideal":  (4, 9),
+        "h_break_ideal":  (-2, 2),
+        "velo_ideal":     (56, 62),
+        "spin_ideal":     (1900, 2400),
+        "mlb_baseline":   {"velo": 59, "spin": 2150, "v_break": 6.5, "h_break": 0},
+        "movement_goal":  "Maximum CARRY — pure 12:00 backspin holds the ball up.",
+    },
+    "Drop Ball": {
+        "v_break_ideal":  (-8, -3),
+        "h_break_ideal":  (-2, 3),
+        "velo_ideal":     (55, 61),
+        "spin_ideal":     (1600, 2100),
+        "mlb_baseline":   {"velo": 58, "spin": 1850, "v_break": -5.5, "h_break": 0.5},
+        "movement_goal":  "Maximum DROP — 6:00 topspin dies at the plate.",
+    },
+    "Curveball (softball)": {
+        "v_break_ideal":  (-2, 2),
+        "h_break_ideal":  (-9, -5),
+        "velo_ideal":     (54, 59),
+        "spin_ideal":     (1500, 2000),
+        "mlb_baseline":   {"velo": 56.5, "spin": 1750, "v_break": 0, "h_break": -7},
+        "movement_goal":  "Glove-side break with mostly neutral vertical.",
+    },
+    "Screwball": {
+        "v_break_ideal":  (-2, 2),
+        "h_break_ideal":  (5, 9),
+        "velo_ideal":     (54, 59),
+        "spin_ideal":     (1500, 2000),
+        "mlb_baseline":   {"velo": 56.5, "spin": 1750, "v_break": 0, "h_break": 7},
+        "movement_goal":  "Arm-side break — the curve in reverse.",
+    },
+    "Change-Up": {
+        "v_break_ideal":  (-4, -1),
+        "h_break_ideal":  (3, 7),
+        "velo_ideal":     (44, 50),
+        "spin_ideal":     (900, 1300),
+        "mlb_baseline":   {"velo": 47, "spin": 1100, "v_break": -2.5, "h_break": 5},
+        "movement_goal":  "10-14 mph below fastball with mild arm-side fade.",
+    },
 }
 
 
@@ -16882,7 +17436,18 @@ def _resolve_pitch_target(pitch_type):
     for key in PITCH_TARGETS:
         if key.lower() in low or low in key.lower():
             return key, PITCH_TARGETS[key]
-    # Family-based guess
+    # ----- Softball-family guesses (check FIRST so "Curveball" in
+    # softball context picks the softball curve, not the baseball one) -----
+    if "rise" in low:      return "Rise Ball", PITCH_TARGETS["Rise Ball"]
+    if "drop" in low:      return "Drop Ball", PITCH_TARGETS["Drop Ball"]
+    if "screw" in low:     return "Screwball", PITCH_TARGETS["Screwball"]
+    if "softball_change" in low or low in ("change-up", "softball change-up"):
+        return "Change-Up", PITCH_TARGETS["Change-Up"]
+    if "softball_fastball" in low or low == "softball fastball":
+        return "Softball Fastball", PITCH_TARGETS["Softball Fastball"]
+    if "softball_curve" in low or "curveball (softball)" in low:
+        return "Curveball (softball)", PITCH_TARGETS["Curveball (softball)"]
+    # ----- Baseball-family guesses -----
     if "slider" in low:    return "Slider",   PITCH_TARGETS["Slider"]
     if "sweeper" in low:   return "Sweeper",  PITCH_TARGETS["Sweeper"]
     if "change" in low:    return "Changeup", PITCH_TARGETS["Changeup"]
@@ -16948,6 +17513,30 @@ def compute_stuff_plus(velo, spin, v_break, h_break, pitch_type, hand_is_right=T
             # Arm-side break + extra drop both help
             score += max(0, (h_adj - base_h_adj)) * 1.4
             score += max(0, (base["v_break"] - v_break)) * 1.6
+        # ----- Softball-specific branches -----
+        elif key == "Rise Ball":
+            # Reward CARRY (positive vbreak above baseline) — the
+            # whole point of a rise ball is staying up.
+            score += max(0, (v_break - base["v_break"])) * 3.5
+            # Penalize horizontal drift — pure 12:00 backspin is the goal.
+            score -= abs(h_adj - base_h_adj) * 0.5
+        elif key == "Drop Ball":
+            # Reward extra DROP (more negative vbreak).
+            score += max(0, (base["v_break"] - v_break)) * 3.0
+        elif key == "Curveball (softball)":
+            # Reward bigger glove-side break (more negative h_adj).
+            score += max(0, (base_h_adj - h_adj)) * 2.5
+        elif key == "Screwball":
+            # Reward bigger arm-side break (more positive h_adj).
+            score += max(0, (h_adj - base_h_adj)) * 2.5
+        elif key == "Change-Up":
+            # Softball changeup: reward velo gap, arm-side fade, slight drop.
+            score += max(0, (h_adj - base_h_adj)) * 1.4
+            score += max(0, (base["v_break"] - v_break)) * 1.6
+        elif key == "Softball Fastball":
+            # Reward carry and arm-side run.
+            score += max(0, (v_break - base["v_break"])) * 2.0
+            score += max(0, (h_adj - base_h_adj)) * 1.2
     return int(round(max(60, min(140, score))))
 
 
@@ -17531,10 +18120,10 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
             f"</div>",
             unsafe_allow_html=True)
 
-    # Pull the matching shaping rules (fuzzy match on pitch type name)
-    rules_key = next(
-        (k for k in PITCH_SHAPING_RULES if k.lower() in pitch_picker.lower()),
-        None)
+    # Pull the matching shaping rules — sport-aware so "Curveball" goes
+    # to the softball entry for softball pitchers and the baseball entry
+    # for baseball pitchers.
+    rules_key = _resolve_shaping_rule(pitch_picker, athlete_sport)
     rules = PITCH_SHAPING_RULES.get(rules_key, {})
 
     # Each direction the user asked for → (rule_key, direction_label,
@@ -17891,9 +18480,7 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
 
         # Step 4: biomechanical safety
         st.divider()
-        new_rules_key = next(
-            (k for k in PITCH_SHAPING_RULES
-              if k.lower() in new_pitch_label.lower()), None)
+        new_rules_key = _resolve_shaping_rule(new_pitch_label, athlete_sport)
         new_safety = (PITCH_SHAPING_RULES.get(new_rules_key, {})
                         .get("safety"))
         if new_safety:
@@ -19110,10 +19697,10 @@ def main():
         # =====================================================
         st.subheader("Strike Zone Map")
         if df["Strike_Zone_Side"].notna().any():
-            sz_fig = _build_strike_zone_figure(df)
-            # Render portrait (taller than wide) so the strike zone box
-            # keeps its real 17"×24" plate-to-letters aspect ratio. PNG
-            # dims ~ 0.81 ratio to match SZ_PLOT_X_RANGE / SZ_PLOT_Z_RANGE.
+            sz_fig = _build_strike_zone_figure(df, sport=athlete_sport)
+            # Render portrait so the strike zone box keeps its real
+            # 17"×22" plate-to-letters aspect ratio. Ball markers scale
+            # by sport (softball 32% bigger than baseball).
             render_static_chart(sz_fig, key="strike_zone_chart",
                                   width_px=560, height_px=700)
 
