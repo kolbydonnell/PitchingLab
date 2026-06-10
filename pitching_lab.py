@@ -17107,13 +17107,15 @@ def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
         ),
     )
 
-    # Render to PNG (mobile stability — consistent with rest of app)
+    # Return both the figure (for interactive fallback) and an attempt
+    # at a PNG (preferred for mobile rotation stability). Caller picks.
+    png = None
     try:
         png = pio.to_image(fig, format="png", width=width, height=height,
                               scale=2)
-        return png
     except Exception:
-        return None
+        png = None
+    return {"fig": fig, "png": png}
 
 
 def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
@@ -17246,6 +17248,29 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
     arm_word   = "ARM-SIDE"
     glove_word = "GLOVE-SIDE"
 
+    # Slider ranges — wide enough to reach the ideal zone AND let the
+    # pitcher dream a little. We anchor at current and extend at least
+    # ±15", farther if the ideal zone for this pitch type is far from
+    # the player's current value (e.g., a changeup currently at -2" h
+    # break needs to be able to reach +16" arm-side run).
+    def _slider_bounds(current, ideal_range, min_pad=15, edge_pad=6):
+        """Return (lo, hi) covering current ±min_pad AND the ideal zone."""
+        lo_target = current - min_pad
+        hi_target = current + min_pad
+        if ideal_range:
+            lo_target = min(lo_target, ideal_range[0] - edge_pad)
+            hi_target = max(hi_target, ideal_range[1] + edge_pad)
+        return float(round(lo_target)), float(round(hi_target))
+
+    v_lo, v_hi = _slider_bounds(
+        cur_v, target["v_break_ideal"] if target else None)
+    h_lo, h_hi = _slider_bounds(
+        cur_h, target["h_break_ideal"] if target else None)
+    velo_lo, velo_hi = _slider_bounds(
+        cur_velo,
+        target["velo_ideal"] if target else None,
+        min_pad=8, edge_pad=3)
+
     sc1, sc2 = st.columns([1, 1])
     with sc1:
         st.markdown(
@@ -17253,8 +17278,8 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
             unsafe_allow_html=True)
         tgt_v = st.slider(
             " ",
-            min_value=float(round(cur_v - 10)),
-            max_value=float(round(cur_v + 10)),
+            min_value=v_lo,
+            max_value=v_hi,
             value=float(round(cur_v, 1)),
             step=0.5,
             format="%+.1f\"",
@@ -17274,8 +17299,8 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
             unsafe_allow_html=True)
         tgt_h = st.slider(
             " ",
-            min_value=float(round(cur_h - 10)),
-            max_value=float(round(cur_h + 10)),
+            min_value=h_lo,
+            max_value=h_hi,
             value=float(round(cur_h, 1)),
             step=0.5,
             format="%+.1f\"",
@@ -17295,8 +17320,8 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
         unsafe_allow_html=True)
     tgt_velo = st.slider(
         " ",
-        min_value=float(round(cur_velo - 6)),
-        max_value=float(round(cur_velo + 6)),
+        min_value=velo_lo,
+        max_value=velo_hi,
         value=float(round(cur_velo, 1)),
         step=0.5,
         format="%.1f mph",
@@ -17318,14 +17343,24 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
 
     # ----- 4-quadrant movement chart -----
     st.markdown("**Movement chart — where this pitch lives now vs. target**")
-    png = _render_pitch_movement_chart(
+    chart = _render_pitch_movement_chart(
         cur_v, cur_h, tgt_v, tgt_h,
         pitch_picker, hand_is_right,
         width=720, height=520)
-    if png:
-        st.image(png, width=720)
+    if chart and chart.get("png"):
+        # Preferred path: static PNG (mobile rotation stability).
+        st.image(chart["png"], use_container_width=True)
+    elif chart and chart.get("fig") is not None:
+        # Kaleido isn't available — render the interactive figure so the
+        # chart still shows. Disable the modebar for a cleaner look.
+        st.plotly_chart(
+            chart["fig"],
+            use_container_width=True,
+            config={"displayModeBar": False, "staticPlot": True})
     else:
-        st.info("Movement chart unavailable (plotly/kaleido missing).")
+        st.info(
+            "Movement chart unavailable — plotly isn't installed. "
+            "Run `pip install plotly kaleido` and reload.")
 
     # ----- Stuff+ comparison (current vs target) -----
     stuff_tgt = compute_stuff_plus(
