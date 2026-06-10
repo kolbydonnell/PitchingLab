@@ -7354,8 +7354,12 @@ def compute_real_baseline(athlete_id: int, lookback: int = 6) -> dict:
 # of center; vertical zone is ~knees (1.5 ft) to letters (3.5 ft).
 SZ_X_MIN, SZ_X_MAX = -0.71, 0.71
 SZ_Z_MIN, SZ_Z_MAX = 1.5, 3.5
-SZ_PLOT_X_RANGE = (-2.5, 2.5)
-SZ_PLOT_Z_RANGE = (0.0, 5.0)
+# Plot ranges: keep a margin around the strike zone but stay tight enough
+# that the rendered aspect ratio looks correct on phones and desktop.
+# Data ratio (X:Z) here = 3.4 : 4.2 ≈ 0.81 (taller than wide), which is
+# how a real strike zone reads to a hitter (~17" wide × 24" tall).
+SZ_PLOT_X_RANGE = (-1.7, 1.7)
+SZ_PLOT_Z_RANGE = (0.4, 4.6)
 
 
 def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
@@ -7451,7 +7455,7 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
         yaxis=dict(title="Height (ft)",
                    range=SZ_PLOT_Z_RANGE, zeroline=False, showgrid=False,
                    fixedrange=True, autorange=False),
-        height=550,
+        height=700,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=20, r=20, t=40, b=40),
         plot_bgcolor="white",
@@ -17118,6 +17122,112 @@ def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
     return {"fig": fig, "png": png}
 
 
+# =====================================================================
+# PITCH DEVELOPMENT PLAN — items the pitcher chose to work on from the
+# Pitch Shaping tab. Shows up at the top of the Action Plan tab so
+# every practice session is anchored to the pitches they want to
+# develop. Stored in session_state — survives navigation but resets
+# on app restart (good for now; can persist to DB later).
+# =====================================================================
+def _dev_plan_items_key(athlete_name: str) -> str:
+    """Session-state key scoped to the current athlete so two athletes
+    on the same device don't share each other's plans."""
+    return f"dev_plan_items::{(athlete_name or 'default').lower()}"
+
+
+def _dev_plan_get_items(athlete_name: str) -> list:
+    return st.session_state.get(_dev_plan_items_key(athlete_name), [])
+
+
+def _dev_plan_add_item(athlete_name: str, item: dict) -> bool:
+    """Append a development item. Dedupes by `id`. Returns True if added."""
+    key = _dev_plan_items_key(athlete_name)
+    items = list(st.session_state.get(key, []))
+    if any(existing.get("id") == item.get("id") for existing in items):
+        return False
+    item.setdefault("added_at", datetime.now(timezone.utc).isoformat())
+    item.setdefault("status", "active")
+    items.append(item)
+    st.session_state[key] = items
+    return True
+
+
+def _dev_plan_remove_item(athlete_name: str, item_id: str):
+    key = _dev_plan_items_key(athlete_name)
+    items = [i for i in st.session_state.get(key, [])
+              if i.get("id") != item_id]
+    st.session_state[key] = items
+
+
+def _dev_plan_toggle_status(athlete_name: str, item_id: str):
+    key = _dev_plan_items_key(athlete_name)
+    items = list(st.session_state.get(key, []))
+    for i in items:
+        if i.get("id") == item_id:
+            i["status"] = ("done" if i.get("status") != "done"
+                            else "active")
+    st.session_state[key] = items
+
+
+def _render_dev_plan_card(athlete_name: str, item: dict):
+    """Render a single development-plan card with action buttons."""
+    is_done = (item.get("status") == "done")
+    badge_bg, badge_label = ((("#10b981", "ACTIVE"))
+                              if not is_done else (("#64748b", "DONE")))
+    type_label = ("LEARN NEW PITCH" if item.get("type") == "learn"
+                    else "SHAPE PITCH")
+    type_color = ("#fbbf24" if item.get("type") == "learn"
+                    else "#3b82f6")
+    grip_refs = item.get("grip_refs", [])
+    drill_refs = item.get("drill_refs", [])
+    grip_line = (f"<div style='color:#94a3b8;font-size:11px;margin-top:6px;'>"
+                  f"Grip refs: "
+                  f"{', '.join(GRIP_LIBRARY.get(k, {}).get('label', k) for k in grip_refs)}"
+                  f"</div>") if grip_refs else ""
+    drill_line = (f"<div style='color:#94a3b8;font-size:11px;margin-top:2px;'>"
+                   f"Drills: "
+                   f"{', '.join(DRILL_LIBRARY.get(k, {}).get('label', k) for k in drill_refs)}"
+                   f"</div>") if drill_refs else ""
+
+    st.markdown(
+        f"<div style='background:#1e293b;border:1px solid #334155;"
+        f"border-left:4px solid {type_color};border-radius:10px;"
+        f"padding:14px 16px;margin-bottom:10px;width:100%;"
+        f"box-sizing:border-box;{'opacity:0.6;' if is_done else ''}'>"
+        f"<div style='display:flex;gap:8px;align-items:center;"
+        f"margin-bottom:8px;flex-wrap:wrap;'>"
+        f"<span style='background:{type_color};color:white;padding:3px 10px;"
+        f"border-radius:12px;font-size:10px;font-weight:700;"
+        f"letter-spacing:0.06em;'>{type_label}</span>"
+        f"<span style='background:{badge_bg};color:white;padding:3px 10px;"
+        f"border-radius:12px;font-size:10px;font-weight:700;"
+        f"letter-spacing:0.06em;'>{badge_label}</span>"
+        f"<span style='color:#94a3b8;font-size:11px;'>for "
+        f"<b style='color:#f1f5f9;'>{item.get('pitch', '—')}</b></span>"
+        f"</div>"
+        f"<div style='font-size:15px;font-weight:700;color:#f1f5f9;"
+        f"margin-bottom:6px;word-wrap:break-word;'>{item.get('title', '')}</div>"
+        f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;"
+        f"word-wrap:break-word;'>{item.get('description', '')}</div>"
+        f"{grip_line}{drill_line}"
+        f"</div>",
+        unsafe_allow_html=True)
+
+    bc1, bc2, _ = st.columns([1, 1, 3])
+    with bc1:
+        if st.button(("Mark active" if is_done else "Mark done"),
+                      key=f"dev_done_{item['id']}",
+                      use_container_width=True):
+            _dev_plan_toggle_status(athlete_name, item["id"])
+            st.rerun()
+    with bc2:
+        if st.button("Remove",
+                      key=f"dev_remove_{item['id']}",
+                      use_container_width=True):
+            _dev_plan_remove_item(athlete_name, item["id"])
+            st.rerun()
+
+
 def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                                   athlete_sport, athlete_level):
     """Pitch Shaping tab — shape what you have, master before you add."""
@@ -17439,7 +17549,7 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                 # div per card. No st.container, no flex, no nesting that
                 # could constrain width. Plain block-level layout with
                 # explicit word-wrap so long sentences ALWAYS wrap.
-                for title, why, grip_keys, drill_keys in rule_entries:
+                for s_idx, (title, why, grip_keys, drill_keys) in enumerate(rule_entries):
                     grip_line = ("<div style='color:#94a3b8;font-size:11px;"
                                   "margin-top:8px;word-break:break-word;'>"
                                   "Grip refs: " + ", ".join(
@@ -17471,6 +17581,33 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                         f"{grip_line}{drill_line}"
                         f"</div>",
                         unsafe_allow_html=True)
+                    # "Add to Action Plan" button — pushes this exact
+                    # suggestion into the athlete's development plan so
+                    # it shows up at the top of the Action Plan tab.
+                    item_id = (f"shape::{pitch_picker}::{rule_key}::"
+                                f"{title}").replace(" ", "_")
+                    existing = any(i.get("id") == item_id
+                                    for i in _dev_plan_get_items(athlete_name))
+                    add_label = ("In your action plan ✓"
+                                  if existing else "+ Add to action plan")
+                    if st.button(add_label,
+                                  key=f"add_shape_{rule_key}_{s_idx}_{pitch_picker}",
+                                  disabled=existing,
+                                  use_container_width=False):
+                        _dev_plan_add_item(athlete_name, {
+                            "id":          item_id,
+                            "type":        "shape",
+                            "pitch":       pitch_picker,
+                            "title":       title,
+                            "description": why,
+                            "grip_refs":   list(grip_keys),
+                            "drill_refs":  list(drill_keys),
+                            "direction":   dir_label,
+                        })
+                        st.success(
+                            f"Added '{title}' to your action plan. "
+                            "Open the Action Plan tab to see it.")
+                        st.rerun()
             else:
                 # NO shaping rules for this direction on this pitch →
                 # surface alternative pitches that natively do this.
@@ -17779,6 +17916,54 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                 f"font-size:13px;line-height:1.7;word-wrap:break-word;"
                 f"overflow-wrap:anywhere;'>{_at}</div>",
                 unsafe_allow_html=True)
+
+        # ----- Add the new pitch's full 4-week development plan to
+        # the athlete's action plan -----
+        learn_item_id = f"learn::{new_pitch_key}"
+        learn_existing = any(i.get("id") == learn_item_id
+                              for i in _dev_plan_get_items(athlete_name))
+        learn_label = ("In your action plan ✓"
+                        if learn_existing
+                        else f"+ Add '{new_pitch_label}' to my action plan")
+        st.markdown(
+            "<div style='margin-top:14px;'></div>",
+            unsafe_allow_html=True)
+        if st.button(learn_label,
+                      key=f"add_learn_{new_pitch_key}",
+                      disabled=learn_existing,
+                      type="primary",
+                      use_container_width=True):
+            _dev_plan_add_item(athlete_name, {
+                "id":          learn_item_id,
+                "type":        "learn",
+                "pitch":       new_pitch_label,
+                "title":       f"Learn {new_pitch_label} (4-week progression)",
+                "description": (
+                    "Run the 4-week safe progression: Week 1 dry mechanics, "
+                    "Week 2 soft toss at 30 ft, Week 3 long toss at 60 ft, "
+                    "Week 4 bullpen with fastball alternation. Don't add "
+                    "another pitch until the 4-criteria checklist passes."),
+                "grip_refs":   [new_pitch_key],
+                "drill_refs":  [],
+                "weeks":       [
+                    ("Week 1 — Dry mechanics",
+                     "Mirror-only reps. 3 sets × 10 reps of the grip and full "
+                     "delivery without a ball."),
+                    ("Week 2 — Soft toss at 30 ft",
+                     "2 sets × 10 reps × 2 days. Catcher gives feedback on "
+                     "movement and arm action."),
+                    ("Week 3 — Long toss at 60 ft",
+                     "2 sets × 10 reps × 2 days. 75% intent. Movement should "
+                     "start to appear."),
+                    ("Week 4 — Bullpen",
+                     "25 pitches alternating with your existing fastball. "
+                     "Tunnel the new pitch off fastball arm action."),
+                ],
+            })
+            st.success(
+                f"Added '{new_pitch_label}' to your action plan. "
+                "Open the Action Plan tab to see the 4-week progression.")
+            st.rerun()
 
     st.divider()
     # Embed the grip library here (it moved off Action Plan)
@@ -18907,7 +19092,11 @@ def main():
         st.subheader("Strike Zone Map")
         if df["Strike_Zone_Side"].notna().any():
             sz_fig = _build_strike_zone_figure(df)
-            render_static_chart(sz_fig, key="strike_zone_chart", height_px=550)
+            # Render portrait (taller than wide) so the strike zone box
+            # keeps its real 17"×24" plate-to-letters aspect ratio. PNG
+            # dims ~ 0.81 ratio to match SZ_PLOT_X_RANGE / SZ_PLOT_Z_RANGE.
+            render_static_chart(sz_fig, key="strike_zone_chart",
+                                  width_px=560, height_px=700)
 
             st.caption(
                 "Green-outlined dots = positive outliers (above-average pitches). "
@@ -19534,6 +19723,38 @@ def main():
                         unsafe_allow_html=True,
                     )
                 st.caption(f"Why this fired: _{d['trigger']}_")
+
+        # =========================
+        # PITCH DEVELOPMENT PLAN — items the athlete added from the
+        # Pitch Shaping tab + new-pitch trainer. Shows at the top so
+        # every practice anchors on the pitches they're developing.
+        # =========================
+        _dev_items = _dev_plan_get_items(athlete_name)
+        if _dev_items:
+            st.subheader("Pitch Development Plan")
+            _active = [i for i in _dev_items if i.get("status") != "done"]
+            _done   = [i for i in _dev_items if i.get("status") == "done"]
+            st.caption(
+                f"{len(_active)} active · {len(_done)} completed. These are "
+                "the shaping suggestions and new pitches you added from the "
+                "Pitch Shaping tab — work on them during this week's drills.")
+            for item in _active:
+                _render_dev_plan_card(athlete_name, item)
+                # If it's a "learn" item, expand the 4-week progression
+                # right here so the athlete sees what to do this week.
+                if item.get("type") == "learn" and item.get("weeks"):
+                    with st.expander(
+                        "Show the 4-week progression",
+                        expanded=False):
+                        for wk_title, wk_body in item["weeks"]:
+                            st.markdown(f"**{wk_title}** — {wk_body}")
+            if _done:
+                with st.expander(
+                    f"Completed items ({len(_done)})",
+                    expanded=False):
+                    for item in _done:
+                        _render_dev_plan_card(athlete_name, item)
+            st.divider()
 
         # =========================
         # 5-DAY STRUCTURED WEEKLY PLAN
