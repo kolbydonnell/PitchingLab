@@ -16755,6 +16755,367 @@ def _arsenal_summary(df) -> list:
     return out
 
 
+# =====================================================================
+# PITCH TARGETS — ideal break/velo/spin ranges per pitch type
+# Used by the movement chart to draw the "aim here" zone and by the
+# Stuff+ calculation to score the pitch's quality vs MLB baseline.
+# v_break sign: positive = carry/rise, negative = drop.
+# h_break sign: positive = arm-side (right for RHP), negative = glove-side.
+# =====================================================================
+PITCH_TARGETS = {
+    "Four-Seam Fastball": {
+        "v_break_ideal":  (14, 19),
+        "h_break_ideal":  (-5, 5),
+        "velo_ideal":     (90, 96),
+        "spin_ideal":     (2200, 2500),
+        "mlb_baseline":   {"velo": 94, "spin": 2300, "v_break": 16, "h_break": -2},
+        "movement_goal":  "Maximize CARRY (ride). Horizontal break near zero.",
+    },
+    "Two-Seam Fastball": {
+        "v_break_ideal":  (6, 12),
+        "h_break_ideal":  (8, 16),
+        "velo_ideal":     (88, 94),
+        "spin_ideal":     (2050, 2300),
+        "mlb_baseline":   {"velo": 92, "spin": 2150, "v_break": 9, "h_break": 12},
+        "movement_goal":  "Arm-side run with mild sink — heavy ball.",
+    },
+    "Sinker": {
+        "v_break_ideal":  (2, 8),
+        "h_break_ideal":  (10, 18),
+        "velo_ideal":     (88, 94),
+        "spin_ideal":     (1950, 2200),
+        "mlb_baseline":   {"velo": 93, "spin": 2050, "v_break": 5, "h_break": 14},
+        "movement_goal":  "Drop + run. Lower spin = more sink.",
+    },
+    "Cutter": {
+        "v_break_ideal":  (6, 14),
+        "h_break_ideal":  (-6, -1),
+        "velo_ideal":     (84, 92),
+        "spin_ideal":     (2200, 2500),
+        "mlb_baseline":   {"velo": 89, "spin": 2350, "v_break": 8, "h_break": -3},
+        "movement_goal":  "Tight late cut, mostly horizontal glove-side.",
+    },
+    "Slider": {
+        "v_break_ideal":  (-3, 4),
+        "h_break_ideal":  (-10, -3),
+        "velo_ideal":     (80, 87),
+        "spin_ideal":     (2350, 2700),
+        "mlb_baseline":   {"velo": 84, "spin": 2500, "v_break": 0, "h_break": -7},
+        "movement_goal":  "Tight glove-side break, minor vertical.",
+    },
+    "Sweeper": {
+        "v_break_ideal":  (-2, 5),
+        "h_break_ideal":  (-22, -12),
+        "velo_ideal":     (78, 85),
+        "spin_ideal":     (2400, 2800),
+        "mlb_baseline":   {"velo": 82, "spin": 2600, "v_break": 1, "h_break": -16},
+        "movement_goal":  "WIDE horizontal sweep. Low vertical.",
+    },
+    "Curveball": {
+        "v_break_ideal":  (-18, -10),
+        "h_break_ideal":  (-8, 0),
+        "velo_ideal":     (74, 82),
+        "spin_ideal":     (2400, 2800),
+        "mlb_baseline":   {"velo": 79, "spin": 2600, "v_break": -13, "h_break": -4},
+        "movement_goal":  "12-to-6 drop. Glove-side bend optional.",
+    },
+    "Changeup": {
+        "v_break_ideal":  (3, 10),
+        "h_break_ideal":  (8, 16),
+        "velo_ideal":     (80, 87),
+        "spin_ideal":     (1500, 1900),
+        "mlb_baseline":   {"velo": 84, "spin": 1750, "v_break": 6, "h_break": 12},
+        "movement_goal":  "Fade + sink. 8-12 mph below fastball.",
+    },
+    "Splitter": {
+        "v_break_ideal":  (-2, 6),
+        "h_break_ideal":  (4, 12),
+        "velo_ideal":     (82, 88),
+        "spin_ideal":     (1200, 1700),
+        "mlb_baseline":   {"velo": 86, "spin": 1450, "v_break": 2, "h_break": 8},
+        "movement_goal":  "Late dive. Low spin = big drop.",
+    },
+    "Knuckleball": {
+        "v_break_ideal":  (-6, 6),
+        "h_break_ideal":  (-6, 6),
+        "velo_ideal":     (60, 75),
+        "spin_ideal":     (100, 600),
+        "mlb_baseline":   {"velo": 70, "spin": 350, "v_break": 0, "h_break": 0},
+        "movement_goal":  "Random — low spin invites the wind.",
+    },
+}
+
+
+def _resolve_pitch_target(pitch_type):
+    """Find the closest matching PITCH_TARGETS entry for a label."""
+    if not pitch_type:
+        return None, None
+    pt = pitch_type.strip()
+    # Exact match
+    if pt in PITCH_TARGETS:
+        return pt, PITCH_TARGETS[pt]
+    # Fuzzy lowercase substring
+    low = pt.lower()
+    for key in PITCH_TARGETS:
+        if key.lower() in low or low in key.lower():
+            return key, PITCH_TARGETS[key]
+    # Family-based guess
+    if "slider" in low:    return "Slider",   PITCH_TARGETS["Slider"]
+    if "sweeper" in low:   return "Sweeper",  PITCH_TARGETS["Sweeper"]
+    if "change" in low:    return "Changeup", PITCH_TARGETS["Changeup"]
+    if "curve" in low:     return "Curveball",PITCH_TARGETS["Curveball"]
+    if "splitter" in low or "fork" in low:
+        return "Splitter", PITCH_TARGETS["Splitter"]
+    if "sinker" in low:    return "Sinker",   PITCH_TARGETS["Sinker"]
+    if "cutter" in low:    return "Cutter",   PITCH_TARGETS["Cutter"]
+    if "two" in low:       return "Two-Seam Fastball", PITCH_TARGETS["Two-Seam Fastball"]
+    if "fastball" in low or "four" in low:
+        return "Four-Seam Fastball", PITCH_TARGETS["Four-Seam Fastball"]
+    return None, None
+
+
+def compute_stuff_plus(velo, spin, v_break, h_break, pitch_type, hand_is_right=True):
+    """Approximate Stuff+ — MLB average is 100. Higher = nastier stuff.
+
+    Built from publicly available Driveline / Eno Sarris methodology:
+    weighted contribution from velocity-vs-baseline, spin-vs-baseline,
+    movement-vs-baseline. Not as precise as the proprietary models but
+    gives a meaningful single-number quality score that responds the
+    right way to slider changes (more carry on a 4-seam = higher Stuff+,
+    more horizontal sweep on a sweeper = higher Stuff+, etc.).
+    Clamped to 60-140 — anything outside is unrealistic given typical
+    inputs.
+    """
+    key, target = _resolve_pitch_target(pitch_type)
+    if not target:
+        return None
+    base = target["mlb_baseline"]
+    score = 100.0
+    # Velocity — 2 pts per mph above baseline (fastballs weight harder)
+    velo_weight = 2.5 if "Fastball" in key else 1.8
+    if velo is not None and base.get("velo") is not None:
+        score += (velo - base["velo"]) * velo_weight
+    # Spin — 1 pt per 100 rpm above baseline (breakers benefit more)
+    spin_weight = 0.8 if "Fastball" in key else 1.4
+    if spin is not None and base.get("spin") is not None:
+        score += ((spin - base["spin"]) / 100) * spin_weight
+    # Movement
+    if v_break is not None and h_break is not None:
+        # Reflect h_break to a glove/arm-side neutral if LHP (so the
+        # baseline math compares like-with-like)
+        h_adj = h_break if hand_is_right else -h_break
+        base_h_adj = base["h_break"]
+        if "Fastball" in key and "Sinker" not in key and "Two-Seam" not in key:
+            # 4-seam: reward carry (more v_break above baseline), penalize
+            # horizontal drift away from straight
+            score += max(0, (v_break - base["v_break"])) * 3.0
+            score -= abs(h_adj - base_h_adj) * 0.6
+        elif key in ("Slider", "Sweeper", "Cutter"):
+            # Breakers: reward bigger horizontal movement in the GLOVE
+            # direction (negative h_adj)
+            extra_h = max(0, (base_h_adj - h_adj))  # both negative; bigger gap = better
+            score += extra_h * 2.0
+            # Vertical drop also helps a curveball-shaped breaker
+            score += max(0, (base["v_break"] - v_break)) * 1.0
+        elif key == "Curveball":
+            # Curveballs: more drop = better
+            score += max(0, (base["v_break"] - v_break)) * 2.5
+            score += max(0, abs(h_adj) - abs(base_h_adj)) * 1.0
+        elif key in ("Changeup", "Splitter", "Sinker", "Two-Seam Fastball"):
+            # Arm-side break + extra drop both help
+            score += max(0, (h_adj - base_h_adj)) * 1.4
+            score += max(0, (base["v_break"] - v_break)) * 1.6
+    return int(round(max(60, min(140, score))))
+
+
+def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
+                                    pitch_type, hand_is_right=True,
+                                    width=720, height=520):
+    """Render the 4-quadrant movement chart as a static PNG.
+
+    X = horizontal break (negative = glove-side, positive = arm-side).
+    Y = vertical break (negative = drop, positive = carry/rise).
+    Renders:
+      - Quadrant grid with axis labels
+      - Translucent "ideal zone" rectangle for the pitch type
+      - Current pitch as a blue ball with label
+      - Target pitch as an orange ball with label (only if it differs)
+      - Arrow connecting current → target
+    """
+    try:
+        import plotly.graph_objects as go
+        import plotly.io as pio
+    except Exception:
+        return None
+
+    # Compute axis extents — cover the larger of: data, target, ideal zone
+    key, target = _resolve_pitch_target(pitch_type)
+    ideal_v = target["v_break_ideal"] if target else (-15, 20)
+    ideal_h = target["h_break_ideal"] if target else (-15, 15)
+
+    vals = [curr_v or 0, tgt_v or 0, ideal_v[0], ideal_v[1]]
+    hals = [curr_h or 0, tgt_h or 0, ideal_h[0], ideal_h[1]]
+    v_lim = max(22, max(abs(v) for v in vals) + 6)
+    h_lim = max(22, max(abs(v) for v in hals) + 6)
+    lim = max(v_lim, h_lim)  # symmetric
+    x_range = [-lim, lim]
+    y_range = [-lim, lim]
+
+    fig = go.Figure()
+
+    # ---- Quadrant background tint ----
+    fig.add_shape(type="rect", x0=x_range[0], x1=x_range[1],
+                    y0=y_range[0], y1=y_range[1],
+                    fillcolor="#0f172a", line=dict(width=0), layer="below")
+
+    # ---- Ideal zone (translucent green rectangle) ----
+    if target:
+        fig.add_shape(type="rect",
+                        x0=ideal_h[0], x1=ideal_h[1],
+                        y0=ideal_v[0], y1=ideal_v[1],
+                        fillcolor="rgba(16,185,129,0.15)",
+                        line=dict(color="rgba(16,185,129,0.65)",
+                                    width=2, dash="dot"),
+                        layer="below")
+        # Label the ideal zone
+        fig.add_annotation(
+            x=(ideal_h[0] + ideal_h[1]) / 2,
+            y=ideal_v[1] + 1.5,
+            text="IDEAL ZONE",
+            showarrow=False,
+            font=dict(color="#10b981", size=11, family="Inter, sans-serif"),
+        )
+
+    # ---- Axis grid lines (every 5 inches) ----
+    for v in range(-int(lim), int(lim) + 1, 5):
+        if v == 0:
+            continue
+        fig.add_shape(type="line", x0=v, x1=v,
+                        y0=y_range[0], y1=y_range[1],
+                        line=dict(color="rgba(148,163,184,0.10)", width=1),
+                        layer="below")
+        fig.add_shape(type="line", x0=x_range[0], x1=x_range[1],
+                        y0=v, y1=v,
+                        line=dict(color="rgba(148,163,184,0.10)", width=1),
+                        layer="below")
+
+    # ---- Main axes (heavier) ----
+    fig.add_shape(type="line", x0=0, x1=0,
+                    y0=y_range[0], y1=y_range[1],
+                    line=dict(color="#94a3b8", width=2), layer="below")
+    fig.add_shape(type="line", x0=x_range[0], x1=x_range[1],
+                    y0=0, y1=0,
+                    line=dict(color="#94a3b8", width=2), layer="below")
+
+    # ---- Quadrant labels ----
+    arm_word = "ARM-SIDE" if hand_is_right else "ARM-SIDE"
+    glove_word = "GLOVE-SIDE"
+    label_off = lim * 0.92
+    fig.add_annotation(x=label_off, y=label_off,
+                        text=f"<b>CARRY +<br>{arm_word}</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=10,
+                                    family="Inter, sans-serif"),
+                        align="center")
+    fig.add_annotation(x=-label_off, y=label_off,
+                        text=f"<b>CARRY +<br>{glove_word}</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=10,
+                                    family="Inter, sans-serif"),
+                        align="center")
+    fig.add_annotation(x=label_off, y=-label_off,
+                        text=f"<b>DROP +<br>{arm_word}</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=10,
+                                    family="Inter, sans-serif"),
+                        align="center")
+    fig.add_annotation(x=-label_off, y=-label_off,
+                        text=f"<b>DROP +<br>{glove_word}</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=10,
+                                    family="Inter, sans-serif"),
+                        align="center")
+
+    # ---- Connecting arrow (current → target) ----
+    if (curr_v is not None and curr_h is not None
+        and tgt_v is not None and tgt_h is not None
+        and (abs(tgt_v - curr_v) > 0.1 or abs(tgt_h - curr_h) > 0.1)):
+        fig.add_annotation(
+            x=tgt_h, y=tgt_v,
+            ax=curr_h, ay=curr_v,
+            xref="x", yref="y", axref="x", ayref="y",
+            showarrow=True, arrowhead=3, arrowwidth=2,
+            arrowcolor="#f59e0b", standoff=12, startstandoff=12,
+        )
+
+    # ---- Current pitch ball ----
+    if curr_v is not None and curr_h is not None:
+        fig.add_trace(go.Scatter(
+            x=[curr_h], y=[curr_v], mode="markers+text",
+            marker=dict(size=28, color="#3b82f6",
+                          line=dict(color="#dbeafe", width=3)),
+            text=["NOW"],
+            textposition="bottom center",
+            textfont=dict(color="#60a5fa", size=12,
+                            family="Inter, sans-serif"),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
+    # ---- Target pitch ball ----
+    if (tgt_v is not None and tgt_h is not None
+        and (abs(tgt_v - (curr_v or 0)) > 0.1
+              or abs(tgt_h - (curr_h or 0)) > 0.1)):
+        fig.add_trace(go.Scatter(
+            x=[tgt_h], y=[tgt_v], mode="markers+text",
+            marker=dict(size=28, color="#f59e0b",
+                          line=dict(color="#fef3c7", width=3)),
+            text=["TARGET"],
+            textposition="top center",
+            textfont=dict(color="#fbbf24", size=12,
+                            family="Inter, sans-serif"),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
+    # ---- Layout ----
+    fig.update_layout(
+        width=width, height=height,
+        paper_bgcolor="#0f172a",
+        plot_bgcolor="#0f172a",
+        margin=dict(l=58, r=24, t=42, b=52),
+        showlegend=False,
+        xaxis=dict(
+            range=x_range, zeroline=False, showgrid=False,
+            showline=False, tickmode="linear", dtick=5,
+            tickfont=dict(color="#64748b", size=11,
+                            family="Inter, sans-serif"),
+            title=dict(text="Horizontal Break (inches)",
+                        font=dict(color="#94a3b8", size=12,
+                                    family="Inter, sans-serif")),
+            fixedrange=True,
+        ),
+        yaxis=dict(
+            range=y_range, zeroline=False, showgrid=False,
+            showline=False, tickmode="linear", dtick=5,
+            tickfont=dict(color="#64748b", size=11,
+                            family="Inter, sans-serif"),
+            title=dict(text="Vertical Break (inches)",
+                        font=dict(color="#94a3b8", size=12,
+                                    family="Inter, sans-serif")),
+            fixedrange=True, scaleanchor=None,
+        ),
+    )
+
+    # Render to PNG (mobile stability — consistent with rest of app)
+    try:
+        png = pio.to_image(fig, format="png", width=width, height=height,
+                              scale=2)
+        return png
+    except Exception:
+        return None
+
+
 def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                                   athlete_sport, athlete_level):
     """Pitch Shaping tab — shape what you have, master before you add."""
@@ -16803,82 +17164,208 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
         key="shape_pitch_picker")
     selected = next(a for a in arsenal if a["pitch_type"] == pitch_picker)
 
-    # Metric cards
-    mc = st.columns(5)
+    # Current pitch values from the player's session data
+    cur_velo  = selected.get("avg_velo")
+    cur_spin  = selected.get("avg_spin")
+    cur_v     = selected.get("avg_v_break")
+    cur_h     = selected.get("avg_h_break")
+
+    hand_is_right = (athlete_hand or "Right") != "Left"
+
+    # Resolve pitch targets — ideal zones + MLB baseline for Stuff+
+    target_key, target = _resolve_pitch_target(pitch_picker)
+
+    # Compute Stuff+ for current pitch
+    stuff_now = compute_stuff_plus(
+        cur_velo, cur_spin, cur_v, cur_h, pitch_picker, hand_is_right)
+
+    # Metric cards (added Stuff+ in the row)
+    mc = st.columns(6)
     mc[0].metric("Velocity",
-                  f"{selected['avg_velo']} mph"
-                  if selected['avg_velo'] else "—")
+                  f"{cur_velo} mph" if cur_velo else "—")
     mc[1].metric("Spin",
-                  f"{selected['avg_spin']} rpm"
-                  if selected['avg_spin'] else "—")
+                  f"{cur_spin} rpm" if cur_spin else "—")
     mc[2].metric("Vert Break",
-                  f"{selected['avg_v_break']:+.1f}\""
-                  if selected['avg_v_break'] is not None else "—")
+                  f"{cur_v:+.1f}\"" if cur_v is not None else "—")
     mc[3].metric("Horiz Break",
-                  f"{selected['avg_h_break']:+.1f}\""
-                  if selected['avg_h_break'] is not None else "—")
+                  f"{cur_h:+.1f}\"" if cur_h is not None else "—")
     mc[4].metric("Spin Eff",
                   f"{selected['spin_eff']}%"
                   if selected['spin_eff'] is not None else "—")
+    mc[5].metric("Stuff+",
+                  f"{stuff_now}" if stuff_now is not None else "—",
+                  delta=("MLB avg = 100"
+                          if stuff_now is not None else None),
+                  delta_color="off")
+
+    # ---- Ideal-zone reference card ----
+    if target:
+        iv = target["v_break_ideal"]
+        ih = target["h_break_ideal"]
+        ivelo = target["velo_ideal"]
+        ispin = target["spin_ideal"]
+        st.markdown(
+            f"<div style='background:#1e293b;border:1px solid #334155;"
+            f"border-left:4px solid #10b981;border-radius:10px;"
+            f"padding:12px 16px;margin:14px 0;'>"
+            f"<div style='font-size:11px;letter-spacing:0.10em;"
+            f"font-weight:700;color:#10b981;text-transform:uppercase;"
+            f"margin-bottom:4px;'>Effectiveness goal for {target_key}</div>"
+            f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;'>"
+            f"{target['movement_goal']}<br>"
+            f"<b>Aim for:</b> Velo {ivelo[0]}–{ivelo[1]} mph · "
+            f"Spin {ispin[0]}–{ispin[1]} rpm · "
+            f"V break {iv[0]:+}\" to {iv[1]:+}\" · "
+            f"H break {ih[0]:+}\" to {ih[1]:+}\"<br>"
+            f"<span style='color:#94a3b8;font-size:12px;'>The goal isn't "
+            f"MAX break — it's landing inside this zone with command. "
+            f"Effective &gt; extreme.</span>"
+            f"</div></div>",
+            unsafe_allow_html=True)
 
     st.divider()
     st.subheader("Shape this pitch")
     st.caption(
-        "Pick exactly what you want to change about this pitch. The labels "
-        "below the slider show what each end means."
+        "Each slider STARTS at this pitch's current measured value (from "
+        "your session data). Move it to where you'd like this pitch to "
+        "live. The movement chart below shows where the pitch sits today "
+        "and where the target would land."
     )
 
-    # ----- Vertical break slider with explicit end labels -----
+    # ----- Sliders anchored at the pitch's CURRENT values -----
+    # Bound each slider widely enough to allow ambitious changes but
+    # narrow enough to feel meaningful for the rules engine.
+    if cur_v is None or cur_h is None or cur_velo is None:
+        st.warning(
+            "This pitch is missing measured break/velocity data — the "
+            "movement chart and sliders need at least velocity, vert "
+            "break, and horiz break. Run another session to populate "
+            "the metrics and come back.")
+        return
+
+    arm_word   = "ARM-SIDE"
+    glove_word = "GLOVE-SIDE"
+
+    sc1, sc2 = st.columns([1, 1])
+    with sc1:
+        st.markdown(
+            f"**Vertical break** — currently <b>{cur_v:+.1f}\"</b>",
+            unsafe_allow_html=True)
+        tgt_v = st.slider(
+            " ",
+            min_value=float(round(cur_v - 10)),
+            max_value=float(round(cur_v + 10)),
+            value=float(round(cur_v, 1)),
+            step=0.5,
+            format="%+.1f\"",
+            key=f"shape_tv_{pitch_picker}",
+            label_visibility="collapsed",
+        )
+        st.markdown(
+            "<div style='display:flex;justify-content:space-between;"
+            "font-size:11px;color:#94a3b8;margin-top:-12px;"
+            "margin-bottom:14px;'>"
+            "<span>← more DROP</span>"
+            "<span>more CARRY →</span></div>",
+            unsafe_allow_html=True)
+    with sc2:
+        st.markdown(
+            f"**Horizontal break** — currently <b>{cur_h:+.1f}\"</b>",
+            unsafe_allow_html=True)
+        tgt_h = st.slider(
+            " ",
+            min_value=float(round(cur_h - 10)),
+            max_value=float(round(cur_h + 10)),
+            value=float(round(cur_h, 1)),
+            step=0.5,
+            format="%+.1f\"",
+            key=f"shape_th_{pitch_picker}",
+            label_visibility="collapsed",
+        )
+        st.markdown(
+            f"<div style='display:flex;justify-content:space-between;"
+            f"font-size:11px;color:#94a3b8;margin-top:-12px;"
+            f"margin-bottom:14px;'>"
+            f"<span>← more {glove_word} cut</span>"
+            f"<span>more {arm_word} run →</span></div>",
+            unsafe_allow_html=True)
+
     st.markdown(
-        "**Vertical break** — do you want the pitch to drop more, or carry more?")
-    delta_v = st.slider(
-        " ", min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
-        format="%+.1f\"",
-        key=f"shape_dv_{pitch_picker}",
+        f"**Velocity** — currently <b>{cur_velo:.1f} mph</b>",
+        unsafe_allow_html=True)
+    tgt_velo = st.slider(
+        " ",
+        min_value=float(round(cur_velo - 6)),
+        max_value=float(round(cur_velo + 6)),
+        value=float(round(cur_velo, 1)),
+        step=0.5,
+        format="%.1f mph",
+        key=f"shape_tvelo_{pitch_picker}",
         label_visibility="collapsed",
     )
     st.markdown(
         "<div style='display:flex;justify-content:space-between;"
-        "font-size:11px;color:#94a3b8;margin-top:-12px;margin-bottom:14px;'>"
-        "<span>← more DROP (sinks more)</span>"
-        "<span>more CARRY / RISE →</span></div>",
+        "font-size:11px;color:#94a3b8;margin-top:-12px;"
+        "margin-bottom:14px;'>"
+        "<span>← SLOWER</span>"
+        "<span>FASTER →</span></div>",
         unsafe_allow_html=True)
 
-    # ----- Horizontal break slider with explicit end labels -----
-    hand_is_right = (athlete_hand or "Right") != "Left"
-    arm_word   = "RIGHT" if hand_is_right else "LEFT"
-    glove_word = "LEFT"  if hand_is_right else "RIGHT"
-    st.markdown(
-        f"**Horizontal break** — do you want the pitch to run more arm-side "
-        f"({arm_word.lower()}) or cut more glove-side ({glove_word.lower()})?")
-    delta_h = st.slider(
-        " ", min_value=-6.0, max_value=6.0, value=0.0, step=0.5,
-        format="%+.1f\"",
-        key=f"shape_dh_{pitch_picker}",
-        label_visibility="collapsed",
-    )
-    st.markdown(
-        f"<div style='display:flex;justify-content:space-between;"
-        f"font-size:11px;color:#94a3b8;margin-top:-12px;margin-bottom:14px;'>"
-        f"<span>← more GLOVE-SIDE cut (toward {glove_word})</span>"
-        f"<span>more ARM-SIDE run (toward {arm_word}) →</span></div>",
-        unsafe_allow_html=True)
+    # Compute deltas from current → these drive the rules engine
+    delta_v    = tgt_v    - cur_v
+    delta_h    = tgt_h    - cur_h
+    delta_velo = tgt_velo - cur_velo
 
-    # ----- Velocity slider with explicit end labels -----
-    st.markdown(
-        "**Velocity** — do you want this pitch faster or slower?")
-    delta_velo = st.slider(
-        " ", min_value=-4.0, max_value=4.0, value=0.0, step=0.5,
-        format="%+.1f mph",
-        key=f"shape_dv_velo_{pitch_picker}",
-        label_visibility="collapsed",
-    )
-    st.markdown(
-        "<div style='display:flex;justify-content:space-between;"
-        "font-size:11px;color:#94a3b8;margin-top:-12px;margin-bottom:14px;'>"
-        "<span>← SLOWER (less velo)</span>"
-        "<span>FASTER (more velo) →</span></div>",
-        unsafe_allow_html=True)
+    # ----- 4-quadrant movement chart -----
+    st.markdown("**Movement chart — where this pitch lives now vs. target**")
+    png = _render_pitch_movement_chart(
+        cur_v, cur_h, tgt_v, tgt_h,
+        pitch_picker, hand_is_right,
+        width=720, height=520)
+    if png:
+        st.image(png, width=720)
+    else:
+        st.info("Movement chart unavailable (plotly/kaleido missing).")
+
+    # ----- Stuff+ comparison (current vs target) -----
+    stuff_tgt = compute_stuff_plus(
+        tgt_velo, cur_spin, tgt_v, tgt_h, pitch_picker, hand_is_right)
+    if stuff_now is not None and stuff_tgt is not None:
+        delta_stuff = stuff_tgt - stuff_now
+        if delta_stuff > 0:
+            stuff_color = "#10b981"
+            stuff_arrow = "▲"
+        elif delta_stuff < 0:
+            stuff_color = "#ef4444"
+            stuff_arrow = "▼"
+        else:
+            stuff_color = "#94a3b8"
+            stuff_arrow = "■"
+        st.markdown(
+            f"<div style='display:flex;gap:12px;align-items:stretch;"
+            f"margin-top:8px;margin-bottom:14px;flex-wrap:wrap;'>"
+            f"<div style='flex:1;min-width:160px;background:#1e293b;"
+            f"border:1px solid #334155;border-radius:10px;"
+            f"padding:12px 16px;'>"
+            f"<div style='font-size:11px;letter-spacing:0.10em;"
+            f"font-weight:700;color:#60a5fa;text-transform:uppercase;'>"
+            f"Stuff+ NOW</div>"
+            f"<div style='font-size:28px;font-weight:800;color:#f1f5f9;"
+            f"line-height:1.1;'>{stuff_now}</div>"
+            f"<div style='font-size:11px;color:#94a3b8;'>"
+            f"MLB league average = 100</div></div>"
+            f"<div style='flex:1;min-width:160px;background:#1e293b;"
+            f"border:1px solid #334155;border-radius:10px;"
+            f"padding:12px 16px;'>"
+            f"<div style='font-size:11px;letter-spacing:0.10em;"
+            f"font-weight:700;color:#fbbf24;text-transform:uppercase;'>"
+            f"Stuff+ TARGET</div>"
+            f"<div style='font-size:28px;font-weight:800;color:#f1f5f9;"
+            f"line-height:1.1;'>{stuff_tgt}</div>"
+            f"<div style='font-size:11px;color:{stuff_color};'>"
+            f"{stuff_arrow} {abs(delta_stuff)} pts vs. current</div></div>"
+            f"</div>",
+            unsafe_allow_html=True)
 
     # Pull the matching shaping rules (fuzzy match on pitch type name)
     rules_key = next(
