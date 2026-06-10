@@ -7400,21 +7400,19 @@ def _build_strike_zone_figure(df: pd.DataFrame,
     diameter) is ~32% bigger than a baseball (~2.9"), so the markers
     scale up proportionally relative to the same 17"-wide zone.
     """
-    # Ball-marker sizing — small enough to comfortably FIT INSIDE the
-    # strike zone box on phone-sized displays. The earlier "scale to
-    # real ball ratio" approach overshot in practice: the legend block,
-    # scaleanchor constraint, and mobile compression all eat plot area
-    # so the visible zone box is much smaller than the raw PNG math
-    # suggests. These sizes are tuned by eye to keep markers readable
-    # on a phone without ever exceeding the zone width.
+    # Ball-marker sizing — baseball stays at its approved size; softball
+    # is shrunk because visually it was reading much bigger than the
+    # zone box at the proportional "real-ball-ratio" sizes. The fix is
+    # by eye, not by math: baseball at 52 fits comfortably in the box,
+    # softball at 36 fits comfortably too without looking outsized.
     if (sport or "Baseball").lower().startswith("softball"):
-        _ball_px = 30   # softball stays slightly larger than baseball
-        _ring_px = 40
-        _text_px = 11
+        _ball_px = 36
+        _ring_px = 46
+        _text_px = 12
     else:
-        _ball_px = 26
-        _ring_px = 36
-        _text_px = 10
+        _ball_px = 52
+        _ring_px = 62
+        _text_px = 16
     fig = go.Figure()
 
     # --- Strike zone box (3x3 grid for visual reference) ---
