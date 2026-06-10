@@ -6841,8 +6841,10 @@ DEMO_TIERS = {
         "label":           "Individual Athlete",
         "tag":             "__demo_individual__",
         "blurb":           "What one solo player sees: their own profile, "
-                            "their own data, no team scope.",
-        "athlete_count":   1,
+                            "their own data, no team scope. Includes one "
+                            "baseball pitcher and one softball pitcher so "
+                            "you can preview both flows.",
+        "athlete_count":   2,
         "team_specs":      [],   # no teams
     },
     "single_team": {
@@ -6937,17 +6939,46 @@ def _seed_demo_tier(tier_key: str):
 
     # Distribute the demo athletes across the team buckets evenly. For
     # the individual tier, no teams → all athletes get team_id=None.
-    pool = list(_DEMO_NAME_POOL)
+    # Interleave baseball + softball so every tier has both sports
+    # represented (without this, the first 12 names in the pool were
+    # all baseball, so Single Team was baseball-only).
+    bb_pool = [t for t in _DEMO_NAME_POOL if t[2] == "Baseball"]
+    sb_pool = [t for t in _DEMO_NAME_POOL if t[2] == "Softball"]
+    interleaved = []
+    for i in range(max(len(bb_pool), len(sb_pool))):
+        if i < len(bb_pool): interleaved.append(bb_pool[i])
+        if i < len(sb_pool): interleaved.append(sb_pool[i])
+    pool = interleaved
     needed = spec["athlete_count"]
     while len(pool) < needed:
-        pool += _DEMO_NAME_POOL   # repeat if we ask for more than the pool
-    chosen = pool[:needed]
+        pool += interleaved   # repeat if we ask for more than the pool
+
+    # Special-case Individual tier: explicitly pick the first BB and
+    # first SB so the solo-pitcher demo always shows BOTH sports
+    # regardless of pool ordering.
+    if tier_key == "individual" and needed == 2:
+        chosen = [bb_pool[0], sb_pool[0]]
+    else:
+        chosen = pool[:needed]
+
+    # Build a set of names already seeded for this tier so we don't
+    # double-add the same athlete on subsequent runs (e.g. when a tier
+    # increases athlete_count from 1 to 2 between releases).
+    with _db_conn() as c:
+        existing_names = {
+            r[0] for r in c.execute(
+                "SELECT name FROM athletes WHERE created_by = ?",
+                (tag,)).fetchall()}
+
     team_names_cycle = spec["team_specs"] or [None]
     for i, (name, hand, sport) in enumerate(chosen):
+        full_name = f"{name} (demo)"
+        if full_name in existing_names:
+            continue   # already seeded this athlete
         team_name = team_names_cycle[i % len(team_names_cycle)] if team_names_cycle != [None] else None
         team_id = team_ids.get(team_name) if team_name else None
         # Add a (demo) suffix so they're obviously fake
-        add_athlete(f"{name} (demo)", hand=hand, sport=sport,
+        add_athlete(full_name, hand=hand, sport=sport,
                     grad_class=str(2026 + (i % 4)),
                     level="HS-Varsity",
                     notes=f"Demo athlete for {spec['label']} tier.",
@@ -18605,7 +18636,18 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
 
 
 def _render_pitch_strategy_intro(df, athlete_hand, athlete_sport):
-    """Strategy tab intro — the 4-questions framework + matchup advice."""
+    """Strategy tab intro — the 4-questions framework + matchup advice.
+
+    Sport-aware: softball pitchers get windmill-mechanics references,
+    distinct pitch types (rise / drop / curve / screw), and the shorter
+    43 ft pitching distance shaping the reaction-time math.
+    """
+    is_sb = (athlete_sport or "Baseball").lower() == "softball"
+    # Reaction-time fact used in a few places — softball ~0.35s, baseball ~0.40s.
+    sport_label    = "softball" if is_sb else "baseball"
+    distance_label = "43 ft" if is_sb else "60.5 ft"
+    reaction_ms    = "350 ms" if is_sb else "400 ms"
+
     st.markdown(
         "<div style='font-size:11px;letter-spacing:0.12em;font-weight:700;"
         "color:#d4a634;text-transform:uppercase;margin-bottom:4px;'>"
@@ -18615,105 +18657,225 @@ def _render_pitch_strategy_intro(df, athlete_hand, athlete_sport):
         "Develop a pitching mindset</div>",
         unsafe_allow_html=True)
 
-    # ----- The 4 self-questions framework -----
+    # ----- The 4 self-questions framework — sport-neutral but cite the
+    # pitcher's anchor pitch correctly. -----
+    anchor_pitch = "rise ball or drop ball" if is_sb else "fastball"
     st.markdown(
-        "<div style='background:#1e293b;border:1px solid #334155;"
-        "border-radius:10px;padding:18px 22px;margin:14px 0;'>"
-        "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
-        "color:#d4a634;text-transform:uppercase;margin-bottom:8px;'>"
-        "When you're getting hit — ask yourself these 4 questions IN ORDER</div>"
-        "<div style='color:#cbd5e1;font-size:14px;line-height:1.8;'>"
-        "<b style='color:#3b82f6;'>1. Count Quality:</b> Am I giving up hits "
-        "in HITTER counts (1-0, 2-0, 2-1, 3-1) or PITCHER counts (0-1, 0-2, "
-        "1-2)? If behind in the count, work AHEAD before anything else.<br>"
-        "<b style='color:#3b82f6;'>2. Execution:</b> Am I hitting my spots? "
-        "If location is off — fix fastball command FIRST. Everything else "
-        "tunnels off the fastball.<br>"
-        "<b style='color:#3b82f6;'>3. Sequence:</b> Is my pattern backwards? "
-        "Am I throwing hittable pitches in 2-strike counts when I need my "
-        "nastiest stuff? Reverse the sequence.<br>"
-        "<b style='color:#3b82f6;'>4. Pattern Recognition:</b> Are hitters "
-        "ONTO me? If they're sitting on a specific pitch — completely flip "
-        "the script. Different first-pitch, different put-away."
-        "</div></div>",
+        f"<div style='background:#1e293b;border:1px solid #334155;"
+        f"border-radius:10px;padding:18px 22px;margin:14px 0;'>"
+        f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+        f"color:#d4a634;text-transform:uppercase;margin-bottom:8px;'>"
+        f"When you're getting hit — ask yourself these 4 questions IN ORDER"
+        f"</div>"
+        f"<div style='color:#cbd5e1;font-size:14px;line-height:1.8;'>"
+        f"<b style='color:#3b82f6;'>1. Count Quality:</b> Am I giving up hits "
+        f"in HITTER counts (1-0, 2-0, 2-1, 3-1) or PITCHER counts (0-1, 0-2, "
+        f"1-2)? If behind in the count, work AHEAD before anything else.<br>"
+        f"<b style='color:#3b82f6;'>2. Execution:</b> Am I hitting my spots? "
+        f"If location is off — fix fastball command FIRST. Everything else "
+        f"tunnels off the fastball.<br>"
+        f"<b style='color:#3b82f6;'>3. Sequence:</b> Is my pattern backwards? "
+        f"Am I throwing hittable pitches in 2-strike counts when I need my "
+        f"nastiest stuff? Reverse the sequence — go to your {anchor_pitch} "
+        f"when you need a put-away.<br>"
+        f"<b style='color:#3b82f6;'>4. Pattern Recognition:</b> Are hitters "
+        f"ONTO me? If they're sitting on a specific pitch — completely flip "
+        f"the script. Different first-pitch, different put-away."
+        f"</div></div>",
         unsafe_allow_html=True)
 
-    # ----- Quick reference: count leverage strategy -----
-    with st.expander("Count Leverage — what to throw when",
-                       expanded=False):
-        st.markdown(
-            "**Pitcher counts (0-1, 0-2, 1-2):** EXPAND the zone. Elevate "
-            "fastballs above the hands; spin breakers off the plate. Make "
-            "the hitter chase. You don't need a strike here.\n\n"
-            "**Even counts (1-1, 2-2):** ATTACK with your best put-away. Live "
-            "on the edges, not the heart. Mix speeds to break their timing.\n\n"
-            "**Hitter counts (1-0, 2-0, 2-1, 3-1):** TRUST your fastball "
-            "command first. A heart-of-plate fastball at the hitter's worst "
-            "level (low + away to a pull hitter, in on the hands to an "
-            "extension hitter) beats a hung breaker every time.\n\n"
-            "**3-0 / 3-1:** Throw a STRIKE. They're taking 95% of the time. "
-            "Fastball middle is the right pitch."
-        )
-
-    # ----- Matchup advice (RHB vs LHB) -----
-    with st.expander("Matchup advice — RHB vs LHB",
-                       expanded=False):
-        is_lefty = (athlete_hand == "Left")
-        if is_lefty:
+    # ----- Reaction-time / distance context (NEW for softball parity) -----
+    with st.expander(
+        f"The math: distance, reaction time, and what it means for you",
+        expanded=False):
+        if is_sb:
             st.markdown(
-                "**You're LHP. Here's what to lean on:**\n\n"
-                "**vs LHH (same-side):** Lean on glove-side break — slider, "
-                "cutter, curveball. The platoon advantage is yours. Start "
-                "the breaker at the hitter's belt buckle; it ends up off the "
-                "outer edge.\n\n"
-                "**vs RHH (opposite-side):** Changeup is gold — it fades "
-                "AWAY from a RHH. Mix in front-hip running fastballs. AVOID "
-                "leaving the slider middle to RHH — they see it for hours."
+                "**Distance:** Softball pitchers stride from a {dist} rubber.\n\n"
+                "**Reaction time:** A 60 mph fastball from {dist} gives the "
+                "hitter about **{rt}** to recognize spin, decide swing or take, "
+                "and start the swing. That's faster than the average hitter's "
+                "reaction time on a 90 mph baseball from 60.5 ft.\n\n"
+                "**What this means strategically:**\n"
+                "- Velocity changes hit HARDER in softball — a 47 mph changeup "
+                "after a 62 mph fastball is a 24% velocity drop. Hitters can't "
+                "adjust mid-flight.\n"
+                "- Eye-level changes (rise ↔ drop) work even better than in "
+                "baseball because the hitter has less time to re-set their "
+                "swing plane after committing.\n"
+                "- Movement matters MORE than velocity at the HS level. A "
+                "57 mph rise ball with a clean 12:00 axis gets more "
+                "swings-and-misses than a 65 mph flat fastball.\n"
+                "- Spin axis is your weapon — hitters track the seams. "
+                "Pitches with similar axes (e.g. all 12:00 backspin) get "
+                "easier to track. Mix axes."
+                .format(dist=distance_label, rt=reaction_ms)
             )
         else:
             st.markdown(
-                "**You're RHP. Here's what to lean on:**\n\n"
-                "**vs RHH (same-side):** Lean on glove-side break — slider, "
-                "cutter, curveball. Platoon advantage is yours. Start the "
-                "breaker at the hitter's belt buckle; it ends off the outer "
-                "edge for a chase swing.\n\n"
-                "**vs LHH (opposite-side):** Changeup is gold — it fades "
-                "AWAY from a LHH. Mix in front-hip running fastballs. AVOID "
-                "leaving the slider middle to LHH — they see it for hours."
+                "**Distance:** Baseball pitchers throw from a {dist} rubber.\n\n"
+                "**Reaction time:** A 90 mph fastball from {dist} gives the "
+                "hitter about **{rt}** to recognize spin, decide swing or take, "
+                "and start the swing.\n\n"
+                "**What this means strategically:**\n"
+                "- Velocity is currency — every additional mph of fastball "
+                "shrinks reaction time by ~3 ms.\n"
+                "- Extension matters as much as velocity — 6.5 ft extension at "
+                "92 mph 'plays' like 94 mph from a normal release point.\n"
+                "- Spin axis is your weapon — pitches with similar axes are "
+                "easier to track. Mix axes (12:00 backspin fastball + 6:00 "
+                "topspin curve = maximum visual contrast).\n"
+                "- Sequencing changes timing more than velocity alone. A 84 "
+                "mph slider after a 95 mph fastball is 'visually slower' to "
+                "the hitter than the 11 mph gap suggests."
+                .format(dist=distance_label, rt=reaction_ms)
             )
 
-    # ----- Pitch-to-contact philosophy -----
+    # ----- Quick reference: count leverage strategy — sport-aware -----
+    with st.expander("Count Leverage — what to throw when",
+                       expanded=False):
+        if is_sb:
+            st.markdown(
+                "**Pitcher counts (0-1, 0-2, 1-2):** EXPAND the zone. Elevate "
+                "rise balls above the letters; bury drop balls below the knees. "
+                "Make the hitter chase. You don't need a strike here.\n\n"
+                "**Even counts (1-1, 2-2):** ATTACK with your best put-away. "
+                "Live on the edges, not the heart. Mix speeds — fastball "
+                "into changeup is a 12+ mph gap.\n\n"
+                "**Hitter counts (1-0, 2-0, 2-1, 3-1):** TRUST your fastball "
+                "command first. A spotted fastball at the knees or letters "
+                "beats a hung curveball every time.\n\n"
+                "**3-0 / 3-1:** Throw a STRIKE. Softball hitters take 90%+ "
+                "of these. Fastball low-middle is the right pitch.")
+        else:
+            st.markdown(
+                "**Pitcher counts (0-1, 0-2, 1-2):** EXPAND the zone. Elevate "
+                "fastballs above the hands; spin breakers off the plate. Make "
+                "the hitter chase. You don't need a strike here.\n\n"
+                "**Even counts (1-1, 2-2):** ATTACK with your best put-away. "
+                "Live on the edges, not the heart. Mix speeds to break "
+                "their timing.\n\n"
+                "**Hitter counts (1-0, 2-0, 2-1, 3-1):** TRUST your fastball "
+                "command first. A heart-of-plate fastball at the hitter's "
+                "worst level (low + away to a pull hitter, in on the hands "
+                "to an extension hitter) beats a hung breaker every time.\n\n"
+                "**3-0 / 3-1:** Throw a STRIKE. They're taking 95% of the "
+                "time. Fastball middle is the right pitch.")
+
+    # ----- Matchup advice — sport-aware lefty/righty paths -----
+    with st.expander("Matchup advice — RHB vs LHB",
+                       expanded=False):
+        is_lefty = (athlete_hand == "Left")
+        if is_sb:
+            if is_lefty:
+                st.markdown(
+                    "**You're a LHP (left-handed windmill). Here's what to "
+                    "lean on:**\n\n"
+                    "**vs LHH (same-side):** Lean on glove-side break — "
+                    "curveball, drop ball curving glove-side. The platoon "
+                    "advantage is yours. Start the curve at the hitter's "
+                    "belt buckle; it ends off the outer corner.\n\n"
+                    "**vs RHH (opposite-side):** Screwball + changeup are "
+                    "your weapons — both fade AWAY from a RHH. AVOID leaving "
+                    "the curve middle to a RHH — they see the spin axis "
+                    "coming.")
+            else:
+                st.markdown(
+                    "**You're a RHP (right-handed windmill). Here's what to "
+                    "lean on:**\n\n"
+                    "**vs RHH (same-side):** Lean on glove-side break — "
+                    "curveball, drop ball curving glove-side. Platoon "
+                    "advantage is yours. Start the curve at the hitter's "
+                    "belt buckle; it ends off the outer corner.\n\n"
+                    "**vs LHH (opposite-side):** Screwball + changeup are "
+                    "your weapons — both fade AWAY from a LHH. AVOID "
+                    "leaving the curve middle to a LHH — they see the "
+                    "spin axis coming.")
+        else:
+            if is_lefty:
+                st.markdown(
+                    "**You're LHP. Here's what to lean on:**\n\n"
+                    "**vs LHH (same-side):** Lean on glove-side break — "
+                    "slider, cutter, curveball. The platoon advantage is "
+                    "yours. Start the breaker at the hitter's belt buckle; "
+                    "it ends up off the outer edge.\n\n"
+                    "**vs RHH (opposite-side):** Changeup is gold — it "
+                    "fades AWAY from a RHH. Mix in front-hip running "
+                    "fastballs. AVOID leaving the slider middle to RHH — "
+                    "they see it for hours.")
+            else:
+                st.markdown(
+                    "**You're RHP. Here's what to lean on:**\n\n"
+                    "**vs RHH (same-side):** Lean on glove-side break — "
+                    "slider, cutter, curveball. Platoon advantage is yours. "
+                    "Start the breaker at the hitter's belt buckle; it "
+                    "ends off the outer edge for a chase swing.\n\n"
+                    "**vs LHH (opposite-side):** Changeup is gold — it "
+                    "fades AWAY from a LHH. Mix in front-hip running "
+                    "fastballs. AVOID leaving the slider middle to LHH — "
+                    "they see it for hours.")
+
+    # ----- Pitch-to-contact philosophy — sport-aware -----
     with st.expander("Pitch to contact — when strikeouts aren't the goal",
                        expanded=False):
-        st.markdown(
-            "**Goal:** earn outs in 3 pitches or fewer. Stay in the game "
-            "longer, keep pitch count low.\n\n"
-            "- Live in the **bottom half of the zone** with sinkers and "
-            "two-seamers — induces ground balls.\n"
-            "- Throw your **strike-getter early in the count** — first-pitch "
-            "strikes lower batter OPS by ~100 points.\n"
-            "- Save the chase pitch for 2 strikes — don't waste it 1-1 hoping "
-            "for a chase that's not coming.\n"
-            "- Trust your defense. A 7-pitch ground ball out is better than "
-            "a 7-pitch strikeout."
-        )
+        if is_sb:
+            st.markdown(
+                "**Goal:** earn outs in 3 pitches or fewer. Stay in the "
+                "game longer, keep pitch count low.\n\n"
+                "- Live in the **bottom of the zone** with drop balls and "
+                "low fastballs — induces ground balls and weak pop-ups.\n"
+                "- Throw your **strike-getter early in the count** — "
+                "first-pitch strikes lower softball batter contact quality "
+                "significantly.\n"
+                "- Save the rise ball for 2 strikes — don't waste it 1-1 "
+                "hoping for a chase that's not coming.\n"
+                "- Trust your defense. A 5-pitch ground ball is better "
+                "than a 6-pitch strikeout.")
+        else:
+            st.markdown(
+                "**Goal:** earn outs in 3 pitches or fewer. Stay in the "
+                "game longer, keep pitch count low.\n\n"
+                "- Live in the **bottom half of the zone** with sinkers "
+                "and two-seamers — induces ground balls.\n"
+                "- Throw your **strike-getter early in the count** — "
+                "first-pitch strikes lower batter OPS by ~100 points.\n"
+                "- Save the chase pitch for 2 strikes — don't waste it "
+                "1-1 hoping for a chase that's not coming.\n"
+                "- Trust your defense. A 7-pitch ground ball out is "
+                "better than a 7-pitch strikeout.")
 
-    # ----- Eye-level and sequencing -----
+    # ----- Eye-level and sequencing — sport-aware -----
     with st.expander("Eye-level changes — keeping the hitter guessing",
                        expanded=False):
-        st.markdown(
-            "**The principle:** the hitter's brain adapts to the visual plane "
-            "of recent pitches. Disrupt that plane.\n\n"
-            "- **High fastball → low breaker:** classic 'up the ladder' "
-            "sequence. Hitter raises the eye-level; the breaker dives at "
-            "the knees.\n"
-            "- **Low sinker → high four-seam:** flip it. Sinker low for "
-            "called strike. Then four-seam at the top of the zone — looks "
-            "like it's rising.\n"
-            "- **Inside fastball → away changeup:** changes the hitter's "
-            "horizontal plane AND speed at the same time. Brutal sequence "
-            "for a heavy pull hitter."
-        )
+        if is_sb:
+            st.markdown(
+                "**The principle:** the hitter's brain adapts to the "
+                "visual plane of recent pitches. Disrupt that plane.\n\n"
+                "- **Rise ball → drop ball:** the signature softball "
+                "vertical tunnel. Hitter raises the eye-level for the "
+                "rise; the drop dies at the knees. Even MLB hitters "
+                "would chase this combo.\n"
+                "- **Low drop → high rise:** flip it. Drop low for a "
+                "called strike (or chase). Then rise at the letters — "
+                "looks like it's coming up out of the dirt.\n"
+                "- **Curveball → screwball:** changes horizontal plane "
+                "AND keeps the hitter guessing direction. Brutal vs "
+                "hitters who load early.\n"
+                "- **Fastball → changeup:** the 12-15 mph velo gap is a "
+                "weapon in softball — most HS hitters can't adjust in "
+                "the {rt} they have to react.".format(rt=reaction_ms))
+        else:
+            st.markdown(
+                "**The principle:** the hitter's brain adapts to the "
+                "visual plane of recent pitches. Disrupt that plane.\n\n"
+                "- **High fastball → low breaker:** classic 'up the "
+                "ladder' sequence. Hitter raises the eye-level; the "
+                "breaker dives at the knees.\n"
+                "- **Low sinker → high four-seam:** flip it. Sinker low "
+                "for called strike. Then four-seam at the top of the "
+                "zone — looks like it's rising.\n"
+                "- **Inside fastball → away changeup:** changes the "
+                "hitter's horizontal plane AND speed at the same time. "
+                "Brutal sequence for a heavy pull hitter.")
 
 
 def main():
