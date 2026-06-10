@@ -7404,8 +7404,10 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
                     x=[row["Strike_Zone_Side"]],
                     y=[row["Strike_Zone_Height"]],
                     mode="markers",
-                    marker=dict(size=28, color="rgba(0,0,0,0)",
-                                line=dict(color=ring, width=3)),
+                    # Ring sized to encircle the new baseball-sized
+                    # marker (size=44 + 4px halo on each side).
+                    marker=dict(size=52, color="rgba(0,0,0,0)",
+                                line=dict(color=ring, width=4)),
                     showlegend=False,
                     hoverinfo="skip",
                 ))
@@ -7433,10 +7435,16 @@ def _build_strike_zone_figure(df: pd.DataFrame) -> "go.Figure":
         fig.add_trace(go.Scatter(
             x=g["Strike_Zone_Side"], y=g["Strike_Zone_Height"],
             mode="markers+text",
-            marker=dict(size=16, color=color, line=dict(width=1.5, color="black")),
+            # Marker sized to a real baseball (~2.9" diameter) relative
+            # to the 17" strike zone width — 17% of zone = ~44 px on a
+            # 560-wide PNG with ~213 px wide zone box. Visually matches
+            # Statcast pitch charts where each dot reads as "a ball in
+            # the zone."
+            marker=dict(size=44, color=color,
+                          line=dict(width=2, color="black")),
             text=[str(int(p)) for p in g["Pitch_Num"]],
             textposition="middle center",
-            textfont=dict(color="white", size=9, family="Arial Black"),
+            textfont=dict(color="white", size=15, family="Arial Black"),
             customdata=g[["Pitch_Num"]].values,
             hovertemplate="%{hovertext}<extra></extra>",
             hovertext=hover,
@@ -11151,25 +11159,27 @@ def _build_hit_quality_zone_figure(df: pd.DataFrame) -> "go.Figure":
                        line=dict(color="#cccccc", width=0.6), layer="below")
         fig.add_shape(type="line", x0=SZ_X_MIN, x1=SZ_X_MAX, y0=z, y1=z,
                        line=dict(color="#cccccc", width=0.6), layer="below")
-    # Home plate at the bottom
+    # Home plate at the bottom — positioned in the visible plot range
     fig.add_shape(
         type="path",
-        path="M -0.71 0.05 L 0.71 0.05 L 0.50 -0.10 L 0 -0.25 L -0.50 -0.10 Z",
+        path="M -0.71 0.90 L 0.71 0.90 L 0.50 0.75 L 0 0.60 L -0.50 0.75 Z",
         line=dict(color="black", width=1.5),
         fillcolor="rgba(220,220,220,0.6)", layer="below",
     )
 
-    # Group + render — one trace per outcome so the legend is readable
+    # Group + render — one trace per outcome so the legend is readable.
+    # Markers sized to a real baseball (~2.9" diameter) vs the 17" zone
+    # so each dot reads as "a ball where it crossed the plate."
     for outcome in ["barrel", "solid_contact", "foul", "weak_contact", "whiff", "take"]:
         g = df[df["Swing_Outcome"] == outcome]
         if g.empty:
             continue
         color = SWING_OUTCOME_COLORS[outcome]
-        marker = dict(size=18, color=color, line=dict(width=1.5, color="black"))
+        marker = dict(size=44, color=color, line=dict(width=2, color="black"))
         if outcome == "take":
             # render as hollow ring so takes are visible but de-emphasized
-            marker = dict(size=14, color="rgba(0,0,0,0)",
-                           line=dict(width=2, color="#9ca3af"))
+            marker = dict(size=40, color="rgba(0,0,0,0)",
+                           line=dict(width=2.5, color="#9ca3af"))
         hover = []
         for _, row in g.iterrows():
             ev = row.get("Exit_Velocity_mph")
@@ -11186,7 +11196,7 @@ def _build_hit_quality_zone_figure(df: pd.DataFrame) -> "go.Figure":
             text=[str(int(s)) for s in g["Swing_Num"]],
             textposition="middle center",
             textfont=dict(color="white" if outcome != "take" else "#6b7280",
-                           size=9, family="Arial Black"),
+                           size=15, family="Arial Black"),
             customdata=g[["Swing_Num"]].values,
             hovertemplate="%{hovertext}<extra></extra>",
             hovertext=hover,
