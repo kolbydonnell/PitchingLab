@@ -7750,6 +7750,72 @@ GRIP_LIBRARY = {
             "arm path."
         ),
     },
+    "sinker": {
+        "label":       "Sinker (Heavy Two-Seam)",
+        "description": (
+            "**How to hold it (plain English):** Cousin of the two-seam, but with the **index and "
+            "middle fingers pinched closer together** and shifted slightly toward the *inside* of "
+            "the parallel-seam pair. Press a touch more weight on the **index fingertip pad**. "
+            "Thumb tucks straight up underneath the ball on the bottom seam (not off to the side). "
+            "Grip is firm in the fingertips, loose in the palm.\n\n"
+            "**Why this works:** The closer fingers + extra index pressure tilts the spin axis "
+            "further from vertical (closer to 1:30/10:30) and DROPS the spin rate — usually "
+            "1900–2200 rpm vs. a four-seam's 2300+. Less Magnus lift means more sink. Velocity "
+            "is typically 1–3 mph below your four-seam. It's the classic 'heavy ball' that "
+            "induces weak ground contact, especially against same-side hitters.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Setup → high cocked:** Identical to four-seam. The whole pitch depends on the "
+            "hitter not seeing it coming.\n"
+            "- **Release:** Stay 'on top' of the ball — don't get to the side. Think 'index "
+            "pulls down through the seam.' The wrist stays neutral; the grip + index pressure "
+            "does the axis work for you.\n"
+            "- **Follow-through:** Same as four-seam, full whip across the body.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T pronate hard** thinking it adds run — you'll get a side-spin, glove-side "
+            "miss instead of a sinker, AND increase elbow stress.\n"
+            "- **DON'T lean back** trying to throw it down in the zone. Same arm slot, same "
+            "intent — the pitch sinks because of grip, not posture.\n"
+            "- **DON'T choke the grip too deep into the palm.** Sinkers live on the fingertips.\n"
+            "- **DON'T overthrow it.** Max-effort sinkers tend to cut instead of sink because "
+            "the wrist tightens up. Throw at 92–95% intent.\n\n"
+            "**Drills to practice this:** Index-pressure isolation reps (alternate four-seam "
+            "and sinker every other throw, focus on the index pad), seam-orientation drills "
+            "on a tee, and Driveline-style 'plyo ball' work to feel the heavy late life."
+        ),
+    },
+    "three_finger_change": {
+        "label":       "Three-Finger Changeup",
+        "description": (
+            "**How to hold it (plain English):** Place the **index, middle, and ring fingers "
+            "across the top of the ball** — all three fingertips on (or just outside of) the "
+            "horseshoe seam. The fingers are touching each other (no spread). Thumb tucks "
+            "underneath on the opposite seam, pinky relaxed and off the ball. Push the ball "
+            "deeper into the palm than you would on a fastball — palm contact is part of the "
+            "design.\n\n"
+            "**Why this works:** Three fingers + extra palm contact KILLS velocity (8–12 mph "
+            "below your fastball) without you needing to slow your arm down. The 'softness' "
+            "comes from the GRIP, not the delivery. Great starter changeup for pitchers who "
+            "have small hands or can't comfortably get into a circle change.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Setup → high cocked:** Identical fastball arm path. Same stride, same intent, "
+            "same release height. Any 'slowing down' is a tip.\n"
+            "- **Release:** The ball comes off the fingers with reduced spin rate (1500–1800 "
+            "rpm vs. a fastball's 2200+). Wrist stays neutral; let the grip dump the velocity.\n"
+            "- **Follow-through:** Full fastball finish, all the way across the body.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T slow the arm** trying to 'guide' the ball — the changeup loses its "
+            "deception the moment your arm slows.\n"
+            "- **DON'T squeeze the ball** to take more off — the relaxed grip generates the "
+            "natural fade and drop. A death grip kills both.\n"
+            "- **DON'T throw it from a different release height** than your fastball — tipping "
+            "by release point ruins the pitch.\n"
+            "- **DON'T abandon it after a couple of bad ones.** The three-finger change takes "
+            "300–500 reps to find the feel. Trust the process.\n\n"
+            "**Drills to practice this:** Fastball-changeup alternation at 60% intensity to "
+            "match arm slot, towel-throw arm-action drill, and 'speed-blind' tossing (catcher "
+            "calls velocities without telling you which pitch to throw)."
+        ),
+    },
     "slider_standard": {
         "label":       "Standard Slider",
         "description": (
@@ -8051,28 +8117,85 @@ GRIP_LIBRARY = {
             "pull-across motion; tunnel drill versus a fastball to test deception."
         ),
     },
-    "eephus": {
-        "label":       "Eephus (Trick Pitch)",
+    "sweeper": {
+        "label":       "Sweeper (Wide Horizontal Slider)",
         "description": (
-            "**How to hold it (plain English):** Any normal grip works (often fastball or "
-            "curve). The trick is the DELIVERY: arc the ball high into the air at extremely "
-            "low velocity (typically 45-58 mph). Imagine slow-pitch softball or a lob.\n\n"
-            "**Why this works:** When everything else you throw is 80+ mph, a 50-mph rainbow "
-            "is so different that even big-league hitters time it wrong. It's a once-in-a-"
-            "season weapon — overuse kills the effect.\n\n"
+            "**How to hold it (plain English):** Think of a slider — middle finger on the long "
+            "seam — but **shift it OFF-CENTER toward the outside of the ball** so most of the "
+            "ball is on the thumb-side of your hand. Index finger sits just off the middle "
+            "finger (a small gap is fine). The seam should run *under* the middle-finger pad "
+            "so your fingertip is grabbing the horseshoe at an angle. Thumb tucks underneath. "
+            "Grip is firm in the fingertips, loose in the palm.\n\n"
+            "**Why this works:** The off-center grip lets you impart a near-pure **side-spin "
+            "axis (2:00–3:00 for RHP)** instead of the slider's mixed gyro/side tilt. That "
+            "side-spin produces 14–22 inches of *horizontal* sweep with relatively little "
+            "vertical drop — the modern 'frisbee' shape that gets way more swing-and-miss "
+            "to the glove side than a tight slider. Velocity sits 4–8 mph below your "
+            "fastball.\n\n"
             "**Arm motion (key positions):**\n"
-            "- **Cocked:** Same as fastball — keep the arm path identical.\n"
-            "- **Release:** Slow the wrist way down at the very end, point the fingertips "
-            "skyward. The ball lofts on a parabolic arc.\n"
-            "- **Follow-through:** Truncated — no full whip across the body.\n\n"
+            "- **Setup → high cocked:** IDENTICAL to fastball/slider. Tunnel matters more "
+            "on a sweeper than any other pitch — hitters need to see fastball arm path "
+            "until the very end.\n"
+            "- **Release:** Think 'throw a frisbee' — middle finger sweeps **around the side** "
+            "of the ball (not down across it like a slider). The fingertip stays on the ball "
+            "a hair longer, pulling the side seam through. Wrist stays neutral; let the GRIP "
+            "do the spinning, not the wrist.\n"
+            "- **Follow-through:** Hand finishes across the body slightly higher than slider "
+            "finish — chest-level rather than belt-level.\n\n"
             "**Common mistakes (don't do this):**\n"
-            "- **DON'T tip it** by slowing the arm before release — keep arm speed until "
-            "the wrist breaks the deceleration at the end.\n"
-            "- **DON'T throw it twice in a row** to the same hitter — they'll be ready.\n"
-            "- **DON'T throw it with runners on base** unless you're VERY confident — the "
-            "long flight time invites stolen bases.\n\n"
-            "**Drills to practice this:** Long-toss arc drills (visualize hitting a 20-foot-tall "
-            "target with a rainbow), and tracking practice with batters off live BP."
+            "- **DON'T turn the wrist sideways** to force the sweep — that's a recipe for "
+            "elbow stress AND a flatter, easier-to-track pitch. Off-center grip + finger "
+            "pull does it for you.\n"
+            "- **DON'T choke the ball deep in the palm** — the sweeper lives in the "
+            "fingertips. Palm contact kills spin rate.\n"
+            "- **DON'T aim glove-side corner from the start.** Sweepers move so much that "
+            "you should start at the MIDDLE of the plate and let the pitch finish off the "
+            "edge. Aim at edge and it ends up at the opposite batter's box.\n"
+            "- **DON'T overthrow it.** Maximum-effort sweepers go gyro (bullet spin) and "
+            "lose the horizontal break. 90–93% intent gives the cleanest axis.\n\n"
+            "**Drills to practice this:** Football-throw drill (proves you can spin "
+            "side-axis without wrist twist), tilt-board drill with a tee to check your "
+            "spin axis is 2:00–3:00 (RHP) or 9:00–10:00 (LHP), and tunnel reps against "
+            "the four-seam to dial in the late-break window."
+        ),
+    },
+    "fork_change": {
+        "label":       "Fork Changeup (Horns Change)",
+        "description": (
+            "**How to hold it (plain English):** Spread your **index and middle fingers wide** "
+            "into a V or 'horns' shape and lay them along the *outside* of the seams — the "
+            "ball is wedged between the two fingers rather than gripped on top of it. Some "
+            "pitchers let the ball sink almost to the base of the V (deeper = slower, more "
+            "drop); others keep it nearer the fingertips for a few more mph. Thumb sits on "
+            "the bottom seam, ring and pinky relaxed. Grip is RELAXED — don't pinch the ball.\n\n"
+            "**Why this works:** The wide V kills spin (spin rate drops to 1100–1500 rpm "
+            "compared to a fastball's 2200+). With less Magnus lift, gravity wins — the "
+            "pitch drops 6–10\" more than your fastball would at the same trajectory. "
+            "Velocity sits **8–12 mph below the fastball** with the SAME arm action, so it "
+            "tunnels late and dies. It's the changeup-splitter hybrid — softer than a "
+            "splitter, divier than a circle change.\n\n"
+            "**Arm motion (key positions):**\n"
+            "- **Setup → high cocked:** Identical fastball arm path. Don't slow the arm. "
+            "Don't shorten the stride.\n"
+            "- **Release:** Pronate naturally as you would on a fastball, but the wide grip "
+            "means the ball **'squirts' out from between your fingers** with reduced spin. "
+            "Wrist stays loose — let the grip dump the velocity.\n"
+            "- **Follow-through:** Full fastball finish, all the way through across the "
+            "body. Tipping happens when pitchers shorten the finish.\n\n"
+            "**Common mistakes (don't do this):**\n"
+            "- **DON'T squeeze the ball** between the fingers — pinching adds tension that "
+            "tips the arm slot AND keeps the spin rate too high.\n"
+            "- **DON'T turn it over** like a circle change — the fork change kills spin by "
+            "GRIP, not by wrist pronation. Forcing pronation defeats the design.\n"
+            "- **DON'T spread the fingers wider than feels natural.** A painful spread "
+            "stresses the flexor tendons and tells the arm to slow down — both are bad.\n"
+            "- **DON'T throw it more than ~15% of the time** until you've proven you can "
+            "land it for strikes. Most pitchers throw their first fork-changes either "
+            "into the dirt or floated up. Live BP it before in-game use.\n\n"
+            "**Drills to practice this:** Wide-grip catch play at 30–40 ft to feel the "
+            "ball coming off the fingers without spin, towel-throws at fastball intent, and "
+            "a side-by-side fastball/fork-change ladder to verify the velocity gap and "
+            "arm-action match."
         ),
     },
 
@@ -8656,6 +8779,10 @@ GRIP_WIKI_URLS = {
     "knuckle_curve":          "https://en.wikipedia.org/wiki/Knuckle_curve",
     "vulcan_changeup":        "https://en.wikipedia.org/wiki/Changeup",
     "slurve":                 "https://en.wikipedia.org/wiki/Slurve",
+    "sweeper":                "https://en.wikipedia.org/wiki/Slider",
+    "fork_change":            "https://en.wikipedia.org/wiki/Forkball",
+    "sinker":                 "https://en.wikipedia.org/wiki/Sinker_(baseball)",
+    "three_finger_change":    "https://en.wikipedia.org/wiki/Changeup",
     "eephus":                 "https://en.wikipedia.org/wiki/Eephus_pitch",
     "softball_fastball":      "https://en.wikipedia.org/wiki/Fastpitch_softball",
     "softball_rise":          "https://en.wikipedia.org/wiki/Rise_ball",
@@ -8666,6 +8793,393 @@ GRIP_WIKI_URLS = {
     "softball_changeup":      "https://en.wikipedia.org/wiki/Changeup",
     "softball_change":        "https://en.wikipedia.org/wiki/Fastpitch_softball",
     "softball_offspeed_knuckle": "https://en.wikipedia.org/wiki/Knuckleball",
+}
+
+
+# =====================================================================
+# Pitch families — groups grips so we can show 'sister' pitches together
+# so a learner can compare circle vs three-finger vs fork vs splitter
+# vs vulcan instead of just learning each in isolation.
+# =====================================================================
+GRIP_FAMILIES = {
+    # ---- Fastballs ----
+    "four_seam_fastball":     "Fastball",
+    "two_seam_fastball":      "Fastball",
+    "sinker":                 "Fastball",
+    "cutter":                 "Fastball",
+    # ---- Changeups (offspeed that mirrors the fastball arm slot) ----
+    "changeup_circle":        "Changeup",
+    "three_finger_change":    "Changeup",
+    "fork_change":            "Changeup",
+    "splitter":               "Changeup",
+    "vulcan_changeup":        "Changeup",
+    # ---- Sliders / sweepers (lateral break) ----
+    "slider_standard":        "Slider / Sweeper",
+    "slider_spike_seam":      "Slider / Sweeper",
+    "sweeper":                "Slider / Sweeper",
+    "slurve":                 "Slider / Sweeper",
+    # ---- Curveballs (vertical break) ----
+    "curveball":              "Curveball",
+    "knuckle_curve":          "Curveball",
+    # ---- Specialty / trick ----
+    "knuckleball":            "Specialty",
+    "eephus":                 "Specialty",
+    # ---- Softball families ----
+    "softball_fastball":        "Softball Fastball",
+    "softball_rise":            "Softball Rise/Drop",
+    "softball_drop":            "Softball Rise/Drop",
+    "softball_drop_roll":       "Softball Rise/Drop",
+    "softball_curve":           "Softball Breaking",
+    "softball_screw":           "Softball Breaking",
+    "softball_changeup":        "Softball Changeup",
+    "softball_change":          "Softball Changeup",
+    "softball_offspeed_knuckle":"Softball Changeup",
+}
+
+# =====================================================================
+# Comparison cheat-sheet — quick pros / cons / picker for every grip.
+# Used in the 'Learn a new pitch' tab to help the learner choose between
+# similar pitches (especially changeups, where 5+ variants exist).
+# Each entry is { velocity_band, movement, difficulty, pros, cons,
+# pick_if, avoid_if }.
+# =====================================================================
+GRIP_COMPARISON = {
+    # ===== FASTBALL FAMILY =====
+    "four_seam_fastball": {
+        "velocity_band":  "Your top velocity — the benchmark.",
+        "movement":       "12–18\" of carry (perceived rise), very little horizontal.",
+        "difficulty":     "Easy to grip, lifetime to master command.",
+        "pros":           ["Highest velocity in your arsenal", "Best for elevated swing-and-miss", "Establishes the tunnel for everything else"],
+        "cons":           ["Predictable shape — barreled if location is poor", "Doesn't move late", "Hardest pitch to disguise to elite hitters"],
+        "pick_if":        "You need a strike, want to elevate, or are setting up an offspeed.",
+        "avoid_if":       "You're trying to induce weak contact at the knees — sinker is better.",
+    },
+    "two_seam_fastball": {
+        "velocity_band":  "1–3 mph below 4-seam.",
+        "movement":       "8–14\" of arm-side run with mild sink.",
+        "difficulty":     "Easy — just rotate the ball and add a touch of index pressure.",
+        "pros":           ["Natural run lets you start at the heart and finish off the plate", "Heavy ball produces weak contact", "Reliable strike-getter to same-side hitters"],
+        "cons":           ["Less carry — flat 2-seamers get crushed", "Hard to elevate — best in lower third", "Less effective vs opposite-side hitters"],
+        "pick_if":        "You face mostly same-side hitters or live in the bottom of the zone.",
+        "avoid_if":       "Your fastball already runs naturally — adding more might tip the slot.",
+    },
+    "sinker": {
+        "velocity_band":  "1–3 mph below 4-seam.",
+        "movement":       "10–16\" of run with PRONOUNCED sink (more drop than 2-seam).",
+        "difficulty":     "Easy grip, but takes reps to keep it from cutting.",
+        "pros":           ["Best ground-ball producer in baseball", "Heavy late life — saws bats", "Pairs perfectly with a high 4-seam"],
+        "cons":           ["Limited K upside — works to contact", "If it cuts instead of sinks, it's a meatball middle", "Loses effectiveness if your slot drops"],
+        "pick_if":        "You're a ground-ball pitcher or face same-side hitters frequently.",
+        "avoid_if":       "Your strikeout rate is already low — you need swing-and-miss stuff, not contact.",
+    },
+    "cutter": {
+        "velocity_band":  "1–4 mph below 4-seam.",
+        "movement":       "2–6\" of glove-side cut, slight downward.",
+        "difficulty":     "Moderate — easy to grip, hard to keep from sliding into slider territory.",
+        "pros":           ["Breaks bats on opposite-side hitters (in on the hands)", "Tunnels off fastball — late, sharp cut", "Easier on the elbow than a true slider"],
+        "cons":           ["Only 2–6\" of break — small margin", "Can morph into a slider if you wrist-twist", "Reduces 4-seam velo if you throw too many"],
+        "pick_if":        "You need an in-on-the-hands weapon vs opposite-side hitters.",
+        "avoid_if":       "Your slider is already a hammer — they'll overlap.",
+    },
+    # ===== CHANGEUP FAMILY =====
+    "changeup_circle": {
+        "velocity_band":  "8–12 mph below fastball.",
+        "movement":       "Arm-side fade + sink (tumble).",
+        "difficulty":     "Moderate — the circle grip takes 200–400 reps to feel natural.",
+        "pros":           ["Best 'starter' changeup for most pitchers", "Strong tunneling off fastball", "Lets you keep fastball intent (the grip slows it)", "Effective vs both same and opposite-side hitters"],
+        "cons":           ["Requires medium-to-large hands to form the circle comfortably", "Wrist pronation is critical — easy to flatten", "If you grip too tight it cuts instead of fades"],
+        "pick_if":        "Your hand can form a comfortable circle and you want one go-to offspeed.",
+        "avoid_if":       "Small hands — the circle is forced. Try three-finger or vulcan instead.",
+    },
+    "three_finger_change": {
+        "velocity_band":  "8–12 mph below fastball.",
+        "movement":       "Mild arm-side fade with sink.",
+        "difficulty":     "EASIEST changeup to learn — fingers feel natural.",
+        "pros":           ["Works for small hands and beginners", "Palm contact dumps velo without slowing arm", "Lowest mechanical risk of any changeup"],
+        "cons":           ["Less movement than circle or fork", "Easier for hitters to identify if velo gap is small", "Caps out around 10 mph velo separation"],
+        "pick_if":        "You're new to throwing a changeup or have a smaller hand.",
+        "avoid_if":       "You're an advanced pitcher and need more late dive — try fork or splitter.",
+    },
+    "fork_change": {
+        "velocity_band":  "10–14 mph below fastball.",
+        "movement":       "Sharp LATE drop with minor arm-side run.",
+        "difficulty":     "Hard — wide V grip is uncomfortable for many hands.",
+        "pros":           ["Biggest vertical drop of any changeup", "Looks like fastball deep into flight, then dives", "Modern replacement for the splitter for some arms"],
+        "cons":           ["Wide spread stresses flexor tendons — limit reps until comfortable", "Hard to throw for strikes early on", "Some pitchers cannot get into the grip at all"],
+        "pick_if":        "You have a strong forearm and need a swing-and-miss put-away offspeed.",
+        "avoid_if":       "Your hand is small or you have any forearm/flexor history.",
+    },
+    "splitter": {
+        "velocity_band":  "5–10 mph below fastball.",
+        "movement":       "Late sharp drop (tumbles like falling off a table).",
+        "difficulty":     "Hard — finger spread + finesse, takes 6+ months to game-ready.",
+        "pros":           ["Devastating late drop — elite chase rate", "Throws off the same arm slot as fastball", "Velo gap small enough to stay in the same tunnel"],
+        "cons":           ["Same forearm-stress concern as the fork", "If you throw too many, fastball velo dips over the season", "Tippy — many pitchers tip it with a slower arm"],
+        "pick_if":        "You're a veteran arm with a strong forearm and want a put-away weapon.",
+        "avoid_if":       "You're under 16, your forearm tires fast, or your fastball is already inconsistent.",
+    },
+    "vulcan_changeup": {
+        "velocity_band":  "8–12 mph below fastball.",
+        "movement":       "Heavy fade + drop — splits the difference between circle and splitter.",
+        "difficulty":     "Moderate — the middle/ring split is unusual but learnable.",
+        "pros":           ["More dive than a circle change without the splitter's forearm stress", "Holds velocity gap better than a circle", "Tunnels almost identically to the fastball"],
+        "cons":           ["The middle/ring split needs flexibility — not natural for everyone", "If you grip too tight it cuts", "Less common — fewer coaches can teach it"],
+        "pick_if":        "Your circle change has flattened and you want more dive without going to a splitter.",
+        "avoid_if":       "Your hand can't comfortably split the middle and ring fingers.",
+    },
+    # ===== SLIDER / SWEEPER FAMILY =====
+    "slider_standard": {
+        "velocity_band":  "5–10 mph below fastball.",
+        "movement":       "Tight late break — 4–8\" glove-side, 0–4\" drop.",
+        "difficulty":     "Easy to start, hard to master without wrist twist.",
+        "pros":           ["Plus chase pitch with 2 strikes", "Same arm slot as fastball — late identification", "Reliable strike-stealer on first pitch"],
+        "cons":           ["Highest elbow-stress pitch in the arsenal", "Easy to telegraph with a slower arm", "Often morphs into a cutter or a sweeper without you noticing"],
+        "pick_if":        "You can keep your wrist locked through release — let the grip do the break.",
+        "avoid_if":       "You have any elbow soreness history — start with spike-seam or sweeper instead.",
+    },
+    "slider_spike_seam": {
+        "velocity_band":  "5–10 mph below fastball.",
+        "movement":       "Sharper, later break — 5–10\" of glove-side bite.",
+        "difficulty":     "Easier than standard for many pitchers — finger does the work.",
+        "pros":           ["Lower elbow stress than standard slider", "Sharper break with cleaner spin axis", "Better swing-and-miss numbers in the data"],
+        "cons":           ["Spike position is uncomfortable for some fingers", "Requires reps to stop digging the nail too aggressively", "Index nail can wear/crack from the seam pressure"],
+        "pick_if":        "Your standard slider has flat break or your elbow has barked at you.",
+        "avoid_if":       "You can't comfortably bend the index for the spike position.",
+    },
+    "sweeper": {
+        "velocity_band":  "6–10 mph below fastball.",
+        "movement":       "WIDE horizontal — 14–22\" of glove-side sweep, low drop.",
+        "difficulty":     "Moderate — feel for the off-center grip takes weeks.",
+        "pros":           ["Biggest horizontal break in baseball", "Elite swing-and-miss vs same-side hitters", "Less elbow stress than a tight slider (finger pull, not wrist twist)"],
+        "cons":           ["Wide break means it can backdoor opposite-side hitters badly", "Loses effectiveness if you don't tunnel it off fastball", "Can flatten if you overthrow it"],
+        "pick_if":        "You face mostly same-side hitters and want a swing-and-miss breaker.",
+        "avoid_if":       "You don't have a fastball-tunneling problem yet — start with a tight slider first.",
+    },
+    "slurve": {
+        "velocity_band":  "7–12 mph below fastball.",
+        "movement":       "Diagonal break (combination of curve drop + slider sweep).",
+        "difficulty":     "Moderate — combines elements of both pitches.",
+        "pros":           ["Unique shape — confuses hitters who haven't seen it", "Versatile — works as both a strike-getter and a chase pitch", "Pairs well with a tight slider as a second-breaker"],
+        "cons":           ["Less identification — coaches and Rapsodo often classify it weirdly", "Easier to flatten than either a curve or slider", "Some hitters will eat it because the shape is bigger and easier to track"],
+        "pick_if":        "Your slider is too flat AND your curve is too slow — slurve splits the difference.",
+        "avoid_if":       "You already have a sharp slider — the slurve will steal reps from it.",
+    },
+    # ===== CURVEBALL FAMILY =====
+    "curveball": {
+        "velocity_band":  "10–18 mph below fastball.",
+        "movement":       "12-to-6 drop — 12–20\" vertical break.",
+        "difficulty":     "Moderate — the spike or knuckle variant takes longer.",
+        "pros":           ["Biggest vertical change-of-eye-level pitch", "Devastating from the high ladder to the bottom of the zone", "Pairs perfectly with elevated fastballs"],
+        "cons":           ["Velocity gap is large — hitters can sit on it if you're predictable", "Loose curveballs hang and get hammered", "Some coaches limit youth curveball use for arm health"],
+        "pick_if":        "You can spin the ball cleanly and want a true eye-level changer.",
+        "avoid_if":       "You're under 14 — some pitching coaches delay the curve to protect the elbow.",
+    },
+    "knuckle_curve": {
+        "velocity_band":  "10–18 mph below fastball.",
+        "movement":       "Sharper break than standard curve — late dive at the bottom of the zone.",
+        "difficulty":     "Hard — knuckle grip takes 6+ months to be game-ready.",
+        "pros":           ["Sharper break and cleaner spin axis", "Lower elbow stress than wrist-snapped curveball", "Elite swing-and-miss when commanded"],
+        "cons":           ["Slow to develop — many give up before it's game-ready", "Knuckle position can hurt the index finger early on", "Hard to throw for a strike at first"],
+        "pick_if":        "You want curve-shape with less elbow stress and you'll commit to the long ramp-up.",
+        "avoid_if":       "You need a usable breaking ball THIS season — start with standard curve.",
+    },
+    # ===== SPECIALTY =====
+    "knuckleball": {
+        "velocity_band":  "55–75 mph (a separate career path).",
+        "movement":       "Unpredictable — moves randomly because of low spin.",
+        "difficulty":     "Years to master — distinct from any other pitch.",
+        "pros":           ["Almost impossible to barrel when it's working", "Easier on the arm than power pitches", "Can extend a career into your 40s"],
+        "cons":           ["Catchers struggle — passed balls and wild pitches go way up", "When it doesn't move, it's batting practice", "Almost a totally separate skill from regular pitching"],
+        "pick_if":        "You're committed to making the knuckleball your identity.",
+        "avoid_if":       "You're trying to add a finesse pitch to a power arsenal — the two don't mix.",
+    },
+    "eephus": {
+        "velocity_band":  "45–58 mph rainbow lob.",
+        "movement":       "Big high arc, lands as a strike.",
+        "difficulty":     "Easy to throw, hard to throw at the right moment.",
+        "pros":           ["Devastating timing weapon when used 1× per season", "Steals a strike when hitters expect heat", "Fun, memorable pitch — fan favorite"],
+        "cons":           ["Loses effect immediately if overused", "Long flight time invites stolen bases", "If hit, it's usually hit very hard"],
+        "pick_if":        "You want a one-time-per-season disruptor.",
+        "avoid_if":       "Runners on base, batters with extreme uppercut swings, or any 3-ball count.",
+    },
+}
+
+# =====================================================================
+# Arsenal integration — how to USE the pitch once you've learned it.
+# When in the count, what to pair it with, how to introduce it in-game.
+# =====================================================================
+GRIP_ARSENAL_INTEGRATION = {
+    "four_seam_fastball": (
+        "**Arsenal role:** Foundation. Everything else tunnels off this pitch.\n\n"
+        "**When to throw it:**\n"
+        "- First-pitch strike — 60%+ usage is the goal for working ahead.\n"
+        "- Above the hands (top third) for swing-and-miss vs uppercut swings.\n"
+        "- Any time you need to throw a strike with conviction.\n\n"
+        "**Pairs best with:** sinker (eye-level flip), changeup (velocity tunnel), "
+        "any breaking ball (the four-seam IS the tunnel).\n\n"
+        "**Game-ready timeline:** Day one. This is the pitch you build around."
+    ),
+    "two_seam_fastball": (
+        "**Arsenal role:** Contact-induction strike-getter.\n\n"
+        "**When to throw it:**\n"
+        "- 1-1, 2-1, 2-2 vs same-side hitters — start middle, finish off the plate.\n"
+        "- Pitcher counts vs hitters who chase low — the run gets them to roll over.\n"
+        "- Avoid vs opposite-side hitters in 2-strike counts — it runs INTO their barrel.\n\n"
+        "**Pairs best with:** four-seam (look up, see two-seam down), changeup (similar "
+        "tunnel + bigger velocity gap), slider (back-foot freeze).\n\n"
+        "**Game-ready timeline:** 2–4 weeks of bullpens to be confident at competitive intent."
+    ),
+    "sinker": (
+        "**Arsenal role:** Heavy ball for ground balls + early-count strikes.\n\n"
+        "**When to throw it:**\n"
+        "- First-pitch strike when you want a quick ground-ball out.\n"
+        "- 1-1, 2-1 vs same-side hitters — start belt-high, finish at the knees.\n"
+        "- Bases loaded / double-play opportunity — the sinker is your best friend.\n"
+        "- Avoid 0-2 in big counts — hitters often spit on it low and you waste a pitch.\n\n"
+        "**Pairs best with:** elevated four-seam (the classic 'up and down' combo), "
+        "changeup (same arm-side fade family), slider (eye-level + break direction shift).\n\n"
+        "**Game-ready timeline:** 3–5 weeks to consistently get the sink without it cutting."
+    ),
+    "cutter": (
+        "**Arsenal role:** Bat-breaker on opposite-side hitters; emergency in-zone strike.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 vs opposite-side hitters — start middle, end inside.\n"
+        "- 2-1 vs same-side hitters when you want to interrupt a fastball tunnel.\n"
+        "- Avoid more than ~15% usage — it eats into 4-seam velocity over a start.\n\n"
+        "**Pairs best with:** four-seam (tunnel, then break the bat handle), slider "
+        "(cutter sets up the bigger horizontal break), changeup (velo tunnel difference).\n\n"
+        "**Game-ready timeline:** 4–8 weeks to dial in the small 2–6\" break window."
+    ),
+    "changeup_circle": (
+        "**Arsenal role:** Your primary offspeed, especially vs opposite-side hitters.\n\n"
+        "**When to throw it:**\n"
+        "- 1-1, 1-2, 2-2 vs opposite-side hitters — fade away from their barrel.\n"
+        "- 0-0 occasionally — first-pitch changeup steals strikes when hitters sit fastball.\n"
+        "- Avoid back-to-back changeups — the second one almost always gets hit.\n\n"
+        "**Pairs best with:** four-seam (tunnel + velo separation), two-seam (same tunnel "
+        "+ smaller velo gap as a 'cousin' pitch), curveball (vertical eye-change).\n\n"
+        "**Game-ready timeline:** 6–8 weeks for typical pitchers — feel and spin axis "
+        "take time to consolidate."
+    ),
+    "three_finger_change": (
+        "**Arsenal role:** Beginner's first changeup — establishes the offspeed habit.\n\n"
+        "**When to throw it:**\n"
+        "- 1-1, 1-2 vs opposite-side hitters — the velo gap and fade do the work.\n"
+        "- Any early-count situation where you need a strike but a fastball might be hit.\n"
+        "- Avoid 2-strike put-aways at higher levels — bigger movement options exist.\n\n"
+        "**Pairs best with:** four-seam (basic velo tunnel), two-seam (similar shape, "
+        "easier sequencing for new pitchers).\n\n"
+        "**Game-ready timeline:** 3–5 weeks — faster than any other changeup variant."
+    ),
+    "fork_change": (
+        "**Arsenal role:** Late put-away weapon — your 'finishing pitch' for swing-and-miss.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 in any matchup — late dive earns the chase swing.\n"
+        "- Vs opposite-side hitters who have shown they can lay off the circle change.\n"
+        "- Avoid full counts — if the dive is off, it's a walk.\n\n"
+        "**Pairs best with:** four-seam (the tunnel disguises the velo drop), slider "
+        "(opposite-direction late movement), sinker (vertical drop sequenced after horizontal).\n\n"
+        "**Game-ready timeline:** 8–12 weeks — the grip is hard to repeat; expect a "
+        "longer ramp than circle or three-finger."
+    ),
+    "splitter": (
+        "**Arsenal role:** Premium swing-and-miss put-away — used sparingly.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 only — the splitter is a finisher, not a strike-getter.\n"
+        "- Vs aggressive hitters who chase low — the late dive is irresistible.\n"
+        "- Cap usage at ~10% of pitches to protect your forearm and fastball velo.\n\n"
+        "**Pairs best with:** four-seam (the splitter is the late drop after the elevated "
+        "fastball), slider (mid-flight tunnel, opposite-direction break).\n\n"
+        "**Game-ready timeline:** 12–24 weeks for true confidence — many pitchers never "
+        "get there. Try fork or three-finger first."
+    ),
+    "vulcan_changeup": (
+        "**Arsenal role:** Power changeup with more dive than a circle — for veteran arms.\n\n"
+        "**When to throw it:**\n"
+        "- 1-2, 2-2 vs opposite-side hitters who have laid off your circle change.\n"
+        "- As a second changeup variant (some pitchers run circle + vulcan for different counts).\n"
+        "- Avoid early counts until you can land it for strikes — that takes time.\n\n"
+        "**Pairs best with:** four-seam (tunnel + velo gap), slider (opposite break "
+        "direction late), curve (eye-level change to vertical).\n\n"
+        "**Game-ready timeline:** 6–10 weeks — flexibility in the middle/ring split is "
+        "the gating factor."
+    ),
+    "slider_standard": (
+        "**Arsenal role:** Primary breaking ball vs same-side hitters.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 vs same-side hitters — start belt-high, finish off the corner.\n"
+        "- 1-1 first-strike pitch when you want to steal a count.\n"
+        "- Avoid back-to-back sliders to the same hitter — they're sitting on it.\n\n"
+        "**Pairs best with:** four-seam (tunnel + late break), changeup (opposite-side "
+        "matchups), cutter (smaller break that sets up the bigger one).\n\n"
+        "**Game-ready timeline:** 4–8 weeks; mechanics check more important than feel."
+    ),
+    "slider_spike_seam": (
+        "**Arsenal role:** Replacement / upgrade for a standard slider with low elbow stress.\n\n"
+        "**When to throw it:**\n"
+        "- Same situations as the standard slider — this is a 'better version' of it.\n"
+        "- 0-2, 1-2 chase pitches — the sharper bite earns more swing-and-miss.\n\n"
+        "**Pairs best with:** Same as standard slider — four-seam, changeup, cutter.\n\n"
+        "**Game-ready timeline:** 3–6 weeks for pitchers transitioning from a standard "
+        "slider; longer if it's your first slider variant."
+    ),
+    "sweeper": (
+        "**Arsenal role:** Swing-and-miss specialist vs same-side hitters.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 vs same-side hitters — start at the belt-buckle, finish well off.\n"
+        "- 1-1 first-strike pitch if you can land it on the corner (advanced usage).\n"
+        "- Avoid vs opposite-side hitters in hittable counts — wide break invites disaster.\n\n"
+        "**Pairs best with:** four-seam (tunnel + late horizontal departure), changeup "
+        "(opposite-direction movement for opposite-side hitters), slider (smaller break "
+        "earlier to set up the bigger sweep later).\n\n"
+        "**Game-ready timeline:** 6–10 weeks — the wide break is humbling at first, but "
+        "once you find it, you find it fast."
+    ),
+    "slurve": (
+        "**Arsenal role:** Secondary breaker — useful as a third or fourth pitch.\n\n"
+        "**When to throw it:**\n"
+        "- Any 2-strike count where the hitter has eliminated your primary slider/curve.\n"
+        "- 1-1 first-strike pitch when the unique shape gets a called strike.\n"
+        "- Avoid as a primary breaker — its hybrid shape is more identifiable than a true "
+        "slider or curve.\n\n"
+        "**Pairs best with:** four-seam (tunnel), slider (different break shape but related), "
+        "curve (eye-level change vertical, then horizontal-ish).\n\n"
+        "**Game-ready timeline:** 4–8 weeks; the release pattern is its own thing."
+    ),
+    "curveball": (
+        "**Arsenal role:** Eye-level changer — separates the hitter's vertical attention.\n\n"
+        "**When to throw it:**\n"
+        "- 0-2, 1-2 in any matchup — the 12-to-6 dive earns the chase swing.\n"
+        "- After an elevated fastball — classic 'up the ladder' sequence.\n"
+        "- Avoid in 3-ball counts unless you can land it — large velo gap = walk risk.\n\n"
+        "**Pairs best with:** four-seam (vertical eye-change), slider (horizontal vs "
+        "vertical break choice), changeup (velocity ladder).\n\n"
+        "**Game-ready timeline:** 6–12 weeks. Some coaches delay youth use for arm safety."
+    ),
+    "knuckle_curve": (
+        "**Arsenal role:** Premium curveball — sharper break with less wrist-snap stress.\n\n"
+        "**When to throw it:**\n"
+        "- Same as curveball — primarily as a late-count chase pitch.\n"
+        "- 1-1 first strike if you can land it; sharper than a standard curve when commanded.\n\n"
+        "**Pairs best with:** Same as curveball — fastball, slider, changeup.\n\n"
+        "**Game-ready timeline:** 12–24 weeks — the longest ramp of any non-knuckleball pitch."
+    ),
+    "knuckleball": (
+        "**Arsenal role:** Either your only pitch (rare) or never throw it.\n\n"
+        "**When to throw it:**\n"
+        "- Knuckleballers throw it 80–90% of the time — it's a career identity, not a side dish.\n"
+        "- If you're a power pitcher considering it as a 'show' pitch — DON'T. It tips the slot.\n\n"
+        "**Pairs best with:** A slow curveball as the only secondary pitch.\n\n"
+        "**Game-ready timeline:** 2+ years to be consistently game-usable."
+    ),
+    "eephus": (
+        "**Arsenal role:** Once-a-season timing disruptor.\n\n"
+        "**When to throw it:**\n"
+        "- 1-0, 1-1 — a 'show' moment when no one expects it.\n"
+        "- Never with runners on base. Never to extreme uppercut hitters.\n\n"
+        "**Pairs best with:** Itself, used surprisingly — no follow-up needed.\n\n"
+        "**Game-ready timeline:** 1–2 weeks of long-toss arc work."
+    ),
 }
 
 
@@ -9059,6 +9573,57 @@ def grip_svg(grip_key: str) -> str:
             '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
             'font-size="13" font-weight="bold">Any grip · the LOB '
             'trajectory is the trick</text>',
+        "sweeper":
+            # Slider grip but shifted off-center (fingers farther right of center)
+            # with a wide horizontal sweep arrow showing the horizontal break.
+            finger(185, 100, angle=-10, length=85, label="M") +
+            finger(160, 115, angle=-15, length=78, label="I") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            # Wide horizontal sweep arrow showing the frisbee-shape break
+            '<path d="M 70 195 Q 160 230 250 175" fill="none" '
+            'stroke="#3a8df0" stroke-width="3" stroke-dasharray="6 4"/>'
+            '<polygon points="244,170 258,178 246,186" fill="#3a8df0"/>'
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Off-center slider · '
+            'WIDE horizontal sweep</text>',
+        "fork_change":
+            # Wide horns/V — fingers spread far apart with the ball between
+            finger(115, 110, angle=10, length=90, label="I") +
+            finger(205, 110, angle=-10, length=90, label="M") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            # Drop arrow showing the dive
+            '<path d="M 160 160 L 160 220" fill="none" '
+            'stroke="#d4634a" stroke-width="3" stroke-dasharray="6 4"/>'
+            '<polygon points="153,213 160,225 167,213" fill="#d4634a"/>'
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Wide V (horns) · ball '
+            'wedged · KILLS spin → drops</text>',
+        "sinker":
+            # Two-seam style but fingers slightly tighter together, with a
+            # gentle arm-side run + sink arrow.
+            finger(150, 110, angle=0, length=80, label="I") +
+            finger(180, 110, angle=0, length=80, label="M") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            # Diagonal sink + arm-side run arrow
+            '<path d="M 90 175 Q 175 195 235 215" fill="none" '
+            'stroke="#3a8df0" stroke-width="3" stroke-dasharray="6 4"/>'
+            '<polygon points="228,209 244,217 230,224" fill="#3a8df0"/>'
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Tight 2-seam · INDEX '
+            'pressure · sink + run</text>',
+        "three_finger_change":
+            # Three fingers across the top of the ball
+            finger(120, 110, angle=5, length=82, label="I") +
+            finger(160, 105, angle=0, length=82, label="M") +
+            finger(200, 110, angle=-5, length=82, label="R") +
+            finger(160, 240, angle=180, length=68, label="T") +
+            # Subtle fade arrow
+            '<path d="M 85 200 Q 175 220 240 215" fill="none" '
+            'stroke="#3a8df0" stroke-width="3" stroke-dasharray="6 4"/>'
+            '<polygon points="234,209 248,217 234,222" fill="#3a8df0"/>'
+            '<text x="160" y="305" text-anchor="middle" fill="#5c3a1a" '
+            'font-size="13" font-weight="bold">Three fingers across · '
+            'palm contact = 8-12 mph drop</text>',
         # ===== NEW SOFTBALL GRIPS =====
         "softball_drop_roll":
             # Same as peel drop but with wrist-roll arrow
@@ -15954,10 +16519,12 @@ ALT_PITCHES_FOR_DIRECTION = {
     "less_velo":          [
         ("Circle Changeup", "changeup_circle",
          "8-12 mph slower than fastball, same arm action."),
+        ("Fork Changeup (Horns)", "fork_change",
+         "10-12 mph slower with extra drop — modern replacement for the splitter/eephus."),
         ("Splitter", "splitter",
          "5-8 mph slower with extra drop."),
-        ("Eephus", "eephus",
-         "The 50 mph lob — once a game, max."),
+        ("Three-Finger Changeup", "three_finger_change",
+         "8-12 mph drop with no spread-finger stress. Great starter changeup."),
     ],
 }
 
@@ -16076,12 +16643,16 @@ PITCH_SHAPING_RULES = {
              ["changeup_circle"], []),
         ],
         "h_break_glove": [
-            ("Honestly — try a different pitch",
-             "A changeup with glove-side break is fighting its own design "
-             "(circle grip + pronation = arm-side movement). For glove-side "
-             "movement at off-speed velocity, look at a slurve or a slow "
-             "curveball.",
-             [], []),
+            ("Lighten the pronation",
+             "Less pronation = less arm-side fade. The changeup won't truly "
+             "cut glove-side (the grip prevents it) but you can neutralize "
+             "the run into a straighter sinking pitch.",
+             ["changeup_circle"], []),
+            ("Consider building a SLOW CURVE alongside",
+             "For real glove-side break at off-speed velo, a slow curveball "
+             "(70-78 mph) is the natural answer. Keep the changeup as your "
+             "arm-side weapon and add a curve for the other side.",
+             ["curveball"], ["one_knee_curveball"]),
         ],
         "velo_down": [
             ("More pronation at release",
@@ -16094,10 +16665,20 @@ PITCH_SHAPING_RULES = {
              ["vulcan_changeup"], []),
         ],
         "velo_up": [
-            ("Honestly — that's a fastball",
-             "A changeup is DEFINED by being slower than your fastball. "
-             "If you want more velo, work fastball command instead.",
+            ("Firm up the grip slightly",
+             "A firmer grip on the circle change adds 1-3 mph without losing "
+             "the sink. Many MLB changeups live at 8 mph below fastball "
+             "instead of 12 — perfectly valid pitch profile.",
+             ["changeup_circle"], ["fastball_change_alternation"]),
+            ("More extension at release",
+             "Same as fastball — long stride + reach adds perceived velocity "
+             "without changing the pitch's identity. 'Free' velo on every "
+             "pitch in the arsenal.",
              [], []),
+            ("Throw at fastball intent",
+             "Most velo-low changeups come from soft-arm 'guiding' the pitch. "
+             "Throw it like a fastball; the grip does the slowing.",
+             ["changeup_circle"], ["speed_blind_tossing"]),
         ],
         "safety": "Changeup is among the lowest-stress pitches. ONLY danger zone is slowing the arm down — that telegraphs the pitch AND can introduce odd mechanics.",
     },
@@ -16455,13 +17036,125 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                 "focus on getting each pitch under the 4-criteria rule "
                 "before adding more.")
     else:
+        # Group the learnable grips by family so the user can see related
+        # pitches side-by-side instead of one big alphabetical list.
+        _by_family = {}
+        for gk, lab in _learnable:
+            fam = GRIP_FAMILIES.get(gk, "Other")
+            _by_family.setdefault(fam, []).append((gk, lab))
+
+        # Ordered families (Fastball first, Specialty last) — this is the
+        # natural learning order most coaches recommend.
+        _fam_order = [
+            "Fastball", "Changeup", "Slider / Sweeper", "Curveball",
+            "Specialty",
+            # Softball
+            "Softball Fastball", "Softball Rise/Drop",
+            "Softball Breaking", "Softball Changeup",
+            "Other",
+        ]
+        _fams_present = [f for f in _fam_order if f in _by_family]
+
+        # Family picker first — narrows the choice naturally
+        family_choice = st.radio(
+            "Pick a pitch family",
+            options=_fams_present,
+            horizontal=True,
+            key="new_pitch_family_picker",
+            help=("Group similar pitches so you can compare options — "
+                  "five changeup variants, three slider variants, etc."))
+
+        # Then pick a specific pitch within that family
+        fam_options = _by_family[family_choice]
         new_pitch_label = st.selectbox(
-            "Pick a pitch to learn",
-            options=[lab for (_, lab) in _learnable],
+            f"Pick a {family_choice.lower()} variant to learn",
+            options=[lab for (_, lab) in fam_options],
             key="new_pitch_picker")
-        new_pitch_key = next(k for (k, lab) in _learnable
+        new_pitch_key = next(k for (k, lab) in fam_options
                               if lab == new_pitch_label)
         new_info = GRIP_LIBRARY[new_pitch_key]
+
+        # =========================================================
+        # Compare to other pitches in the same family — pros/cons
+        # =========================================================
+        family_peers = [(gk, lab) for (gk, lab) in fam_options
+                          if gk in GRIP_COMPARISON]
+        if len(family_peers) > 1:
+            with st.expander(
+                f"Compare the {family_choice.lower()} family — "
+                f"pros, cons, and when to pick each",
+                expanded=False):
+                st.caption(
+                    f"You don't need every pitch in the family. Pick the "
+                    f"one whose pros line up with your strengths and "
+                    f"whose cons you can live with. Below is every "
+                    f"{family_choice.lower()} we cover, side-by-side.")
+                for gk, lab in family_peers:
+                    cmp = GRIP_COMPARISON[gk]
+                    is_selected = (gk == new_pitch_key)
+                    pros_html = "".join(
+                        f"<li style='margin-bottom:3px;'>{p}</li>"
+                        for p in cmp.get("pros", []))
+                    cons_html = "".join(
+                        f"<li style='margin-bottom:3px;'>{c}</li>"
+                        for c in cmp.get("cons", []))
+                    border = ("#3b82f6" if is_selected else "#334155")
+                    badge = (
+                        "<span style='display:inline-block;background:#3b82f6;"
+                        "color:white;padding:2px 8px;border-radius:10px;"
+                        "font-size:10px;font-weight:700;letter-spacing:0.06em;"
+                        "margin-left:8px;vertical-align:middle;'>SELECTED</span>"
+                        if is_selected else "")
+                    st.markdown(
+                        f"<div style='background:#1e293b;border:1px solid "
+                        f"{border};border-radius:10px;padding:14px 16px;"
+                        f"margin-bottom:10px;width:100%;box-sizing:border-box;'>"
+                        f"<div style='font-size:16px;font-weight:700;"
+                        f"color:#f1f5f9;margin-bottom:8px;word-wrap:break-word;'>"
+                        f"{lab}{badge}</div>"
+                        f"<div style='display:grid;grid-template-columns:"
+                        f"repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px;'>"
+                        f"<div style='color:#94a3b8;font-size:11px;'>"
+                        f"<div style='color:#64748b;letter-spacing:0.06em;"
+                        f"font-weight:700;text-transform:uppercase;font-size:10px;"
+                        f"margin-bottom:2px;'>Velocity</div>"
+                        f"<div style='color:#cbd5e1;'>{cmp.get('velocity_band','')}</div>"
+                        f"</div>"
+                        f"<div style='color:#94a3b8;font-size:11px;'>"
+                        f"<div style='color:#64748b;letter-spacing:0.06em;"
+                        f"font-weight:700;text-transform:uppercase;font-size:10px;"
+                        f"margin-bottom:2px;'>Movement</div>"
+                        f"<div style='color:#cbd5e1;'>{cmp.get('movement','')}</div>"
+                        f"</div>"
+                        f"<div style='color:#94a3b8;font-size:11px;'>"
+                        f"<div style='color:#64748b;letter-spacing:0.06em;"
+                        f"font-weight:700;text-transform:uppercase;font-size:10px;"
+                        f"margin-bottom:2px;'>Difficulty</div>"
+                        f"<div style='color:#cbd5e1;'>{cmp.get('difficulty','')}</div>"
+                        f"</div></div>"
+                        f"<div style='display:grid;grid-template-columns:"
+                        f"1fr 1fr;gap:14px;margin-top:8px;'>"
+                        f"<div><div style='color:#10b981;font-size:11px;"
+                        f"font-weight:700;letter-spacing:0.06em;"
+                        f"text-transform:uppercase;margin-bottom:4px;'>"
+                        f"Pros</div><ul style='color:#cbd5e1;font-size:13px;"
+                        f"line-height:1.5;padding-left:18px;margin:0;'>"
+                        f"{pros_html}</ul></div>"
+                        f"<div><div style='color:#ef4444;font-size:11px;"
+                        f"font-weight:700;letter-spacing:0.06em;"
+                        f"text-transform:uppercase;margin-bottom:4px;'>"
+                        f"Cons</div><ul style='color:#cbd5e1;font-size:13px;"
+                        f"line-height:1.5;padding-left:18px;margin:0;'>"
+                        f"{cons_html}</ul></div></div>"
+                        f"<div style='margin-top:10px;padding-top:10px;"
+                        f"border-top:1px dashed #334155;color:#cbd5e1;"
+                        f"font-size:12px;line-height:1.5;'>"
+                        f"<b style='color:#10b981;'>Pick if:</b> "
+                        f"{cmp.get('pick_if','')}<br>"
+                        f"<b style='color:#ef4444;'>Skip if:</b> "
+                        f"{cmp.get('avoid_if','')}"
+                        f"</div></div>",
+                        unsafe_allow_html=True)
 
         # Step 1: grip + arm motion
         st.markdown("**Step 1 — Learn the grip and the arm motion**")
@@ -16534,6 +17227,35 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                 f"margin-bottom:4px;'>Biomech safety while learning</div>"
                 f"<div style='color:#cbd5e1;font-size:13px;line-height:1.6;'>"
                 f"{new_safety}</div></div>",
+                unsafe_allow_html=True)
+
+        # Step 5: arsenal integration — when to throw it, what to pair
+        # with, how to introduce it in a game.
+        arsenal_text = GRIP_ARSENAL_INTEGRATION.get(new_pitch_key)
+        if arsenal_text:
+            st.divider()
+            st.markdown(
+                "**Step 5 — Add it to your arsenal**")
+            st.caption(
+                "Once you can throw the pitch for strikes with command, "
+                "this is how to actually USE it in a game — when to call "
+                "it, which pitches it tunnels off of, and how to introduce "
+                "it without tipping your patterns.")
+            # Convert the markdown text to HTML so it renders inside our
+            # styled green-bordered container.
+            import re as _re
+            _at = arsenal_text
+            _at = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", _at)
+            # Bullets — '- ' at start of a line → bullet glyph
+            _at = _re.sub(r"(^|\n)- ", r"\1• ", _at)
+            # Paragraph breaks then line breaks
+            _at = _at.replace("\n\n", "<br><br>").replace("\n", "<br>")
+            st.markdown(
+                f"<div style='background:#1e293b;border:1px solid #334155;"
+                f"border-left:4px solid #10b981;border-radius:8px;"
+                f"padding:14px 18px;margin-top:8px;color:#cbd5e1;"
+                f"font-size:13px;line-height:1.7;word-wrap:break-word;"
+                f"overflow-wrap:anywhere;'>{_at}</div>",
                 unsafe_allow_html=True)
 
     st.divider()

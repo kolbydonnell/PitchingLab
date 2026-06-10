@@ -10,21 +10,25 @@ Save each photo with this exact filename (any of `.jpg`, `.jpeg`, `.png`,
 
 ### Baseball
 
-| Grip                | Filename                          |
-|---------------------|-----------------------------------|
-| Four-Seam Fastball  | `four_seam_fastball.jpg`          |
-| Two-Seam Sinker     | `two_seam_fastball.jpg`           |
-| Standard Slider     | `slider_standard.jpg`             |
-| Spike-Seam Slider   | `slider_spike_seam.jpg`           |
-| Curveball (12-6)    | `curveball.jpg`                   |
-| Circle Changeup     | `changeup_circle.jpg`             |
-| Cutter              | `cutter.jpg`                      |
-| Splitter            | `splitter.jpg`                    |
-| Knuckleball         | `knuckleball.jpg`                 |
-| Knuckle Curve       | `knuckle_curve.jpg`               |
-| Vulcan Changeup     | `vulcan_changeup.jpg`             |
-| Slurve              | `slurve.jpg`                      |
-| Eephus              | `eephus.jpg`                      |
+| Grip                    | Filename                          |
+|-------------------------|-----------------------------------|
+| Four-Seam Fastball      | `four_seam_fastball.jpg`          |
+| Two-Seam Sinker         | `two_seam_fastball.jpg`           |
+| Sinker (Heavy 2-Seam)   | `sinker.jpg`                      |
+| Standard Slider         | `slider_standard.jpg`             |
+| Spike-Seam Slider       | `slider_spike_seam.jpg`           |
+| Sweeper                 | `sweeper.jpg`                     |
+| Curveball (12-6)        | `curveball.jpg`                   |
+| Circle Changeup         | `changeup_circle.jpg`             |
+| Three-Finger Changeup   | `three_finger_change.jpg`         |
+| Fork Changeup (Horns)   | `fork_change.jpg`                 |
+| Cutter                  | `cutter.jpg`                      |
+| Splitter                | `splitter.jpg`                    |
+| Knuckleball             | `knuckleball.jpg`                 |
+| Knuckle Curve           | `knuckle_curve.jpg`               |
+| Vulcan Changeup         | `vulcan_changeup.jpg`             |
+| Slurve                  | `slurve.jpg`                      |
+| Eephus                  | `eephus.jpg`                      |
 
 ### Softball
 
