@@ -7400,17 +7400,20 @@ def _build_strike_zone_figure(df: pd.DataFrame,
     diameter) is ~32% bigger than a baseball (~2.9"), so the markers
     scale up proportionally relative to the same 17"-wide zone.
     """
-    # Ball-marker sizing — scaled to the real ball : 17"-zone ratio.
-    # Baseball: 2.9" / 17" ≈ 17.1% → 52 px on a 560-wide PNG.
-    # Softball: 3.82" / 17" ≈ 22.5% → 68 px on the same PNG.
+    # Ball-marker sizing — scaled to the ball : 17"-zone ratio but
+    # toned down from the pure-math value because the scaleanchor
+    # constraint shrinks the rendered plot area more than the PNG
+    # dimensions suggest. Softball stays slightly bigger than baseball
+    # (real ratio is ~32%) but not so large that the marker exceeds
+    # the strike-zone box on a phone.
     if (sport or "Baseball").lower().startswith("softball"):
-        _ball_px = 68
-        _ring_px = 78
-        _text_px = 18
+        _ball_px = 50
+        _ring_px = 60
+        _text_px = 15
     else:
-        _ball_px = 52
-        _ring_px = 62
-        _text_px = 16
+        _ball_px = 42
+        _ring_px = 52
+        _text_px = 14
     fig = go.Figure()
 
     # --- Strike zone box (3x3 grid for visual reference) ---
@@ -17571,6 +17574,144 @@ def compute_stuff_plus(velo, spin, v_break, h_break, pitch_type, hand_is_right=T
     return int(round(max(60, min(140, score))))
 
 
+def _build_arsenal_movement_chart(df, sport: str = "Baseball",
+                                     hand: str = "Right"):
+    """4-quadrant movement chart for an entire bullpen session.
+
+    Plots every pitch as a colored marker at (Horiz_Break_in,
+    Vert_Break_in) with a quadrant grid centered at zero. This mirrors
+    the Pitch Shaping movement chart so the visual language is
+    consistent across the app.
+
+    X axis: horizontal break (negative = glove-side, positive = arm-side)
+    Y axis: vertical break (negative = drop, positive = carry / rise)
+    """
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    # Compute symmetric extents that comfortably hold all data points.
+    h_vals = df["Horiz_Break_in"].dropna().tolist() if "Horiz_Break_in" in df.columns else []
+    v_vals = df["Vert_Break_in"].dropna().tolist()  if "Vert_Break_in"  in df.columns else []
+    if not h_vals and not v_vals:
+        # Empty dataset — fall back to a default ±20" window.
+        lim = 20
+    else:
+        max_abs = max(
+            (max(abs(v) for v in h_vals) if h_vals else 0),
+            (max(abs(v) for v in v_vals) if v_vals else 0),
+        )
+        lim = max(20, max_abs + 6)
+    x_range = [-lim, lim]
+    y_range = [-lim, lim]
+
+    # ---- Quadrant gridlines every 5" (light gray) ----
+    for v in range(-int(lim), int(lim) + 1, 5):
+        if v == 0:
+            continue
+        fig.add_shape(type="line", x0=v, x1=v,
+                        y0=y_range[0], y1=y_range[1],
+                        line=dict(color="rgba(148,163,184,0.10)", width=1),
+                        layer="below")
+        fig.add_shape(type="line", x0=x_range[0], x1=x_range[1],
+                        y0=v, y1=v,
+                        line=dict(color="rgba(148,163,184,0.10)", width=1),
+                        layer="below")
+
+    # ---- Main center axes (heavier) ----
+    fig.add_shape(type="line", x0=0, x1=0,
+                    y0=y_range[0], y1=y_range[1],
+                    line=dict(color="#94a3b8", width=2), layer="below")
+    fig.add_shape(type="line", x0=x_range[0], x1=x_range[1],
+                    y0=0, y1=0,
+                    line=dict(color="#94a3b8", width=2), layer="below")
+
+    # ---- Quadrant labels ----
+    label_off = lim * 0.92
+    fig.add_annotation(x=label_off, y=label_off,
+                        text="<b>CARRY +<br>ARM-SIDE</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=11,
+                                    family="Inter, sans-serif"),
+                        align="center")
+    fig.add_annotation(x=-label_off, y=label_off,
+                        text="<b>CARRY +<br>GLOVE-SIDE</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=11,
+                                    family="Inter, sans-serif"),
+                        align="center")
+    fig.add_annotation(x=label_off, y=-label_off,
+                        text="<b>DROP +<br>ARM-SIDE</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=11,
+                                    family="Inter, sans-serif"),
+                        align="center")
+    fig.add_annotation(x=-label_off, y=-label_off,
+                        text="<b>DROP +<br>GLOVE-SIDE</b>",
+                        showarrow=False,
+                        font=dict(color="#64748b", size=11,
+                                    family="Inter, sans-serif"),
+                        align="center")
+
+    # ---- Plot each pitch type as its own colored trace (legend support) ----
+    if "Pitch_Type" in df.columns:
+        for ptype, g in df.groupby("Pitch_Type"):
+            color = PITCH_COLORS.get(ptype, "#666")
+            hover = []
+            for _, row in g.iterrows():
+                hover.append(
+                    f"<b>Pitch #{int(row['Pitch_Num'])}</b> — {row['Pitch_Type']}<br>"
+                    f"Velo: {row['Velocity_mph']:.1f} mph<br>"
+                    f"H break: {row['Horiz_Break_in']:.1f}\" &nbsp;|&nbsp; "
+                    f"V break: {row['Vert_Break_in']:.1f}\""
+                )
+            fig.add_trace(go.Scatter(
+                x=g["Horiz_Break_in"], y=g["Vert_Break_in"],
+                mode="markers+text",
+                marker=dict(size=20, color=color,
+                              line=dict(width=2, color="black")),
+                text=[str(int(p)) for p in g["Pitch_Num"]],
+                textposition="middle center",
+                textfont=dict(color="white", size=10,
+                                family="Arial Black"),
+                hovertemplate="%{hovertext}<extra></extra>",
+                hovertext=hover,
+                name=ptype,
+            ))
+
+    # ---- Layout ----
+    fig.update_layout(
+        paper_bgcolor="#0f172a",
+        plot_bgcolor="#0f172a",
+        margin=dict(l=58, r=24, t=42, b=52),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                      font=dict(color="#cbd5e1", size=11)),
+        xaxis=dict(
+            range=x_range, zeroline=False, showgrid=False,
+            showline=False, tickmode="linear", dtick=5,
+            tickfont=dict(color="#64748b", size=11,
+                            family="Inter, sans-serif"),
+            title=dict(text="Horizontal Break (inches)",
+                        font=dict(color="#94a3b8", size=12,
+                                    family="Inter, sans-serif")),
+            fixedrange=True, constrain="domain",
+        ),
+        yaxis=dict(
+            range=y_range, zeroline=False, showgrid=False,
+            showline=False, tickmode="linear", dtick=5,
+            tickfont=dict(color="#64748b", size=11,
+                            family="Inter, sans-serif"),
+            title=dict(text="Vertical Break (inches)",
+                        font=dict(color="#94a3b8", size=12,
+                                    family="Inter, sans-serif")),
+            fixedrange=True,
+            scaleanchor="x", scaleratio=1, constrain="domain",
+        ),
+    )
+    return fig
+
+
 def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
                                     pitch_type, hand_is_right=True,
                                     width=720, height=520):
@@ -19838,21 +19979,15 @@ def main():
                 "real CSVs) and the deltas will switch to a real rolling baseline."
             )
 
-        st.subheader("Pitch Map — Movement vs Velocity")
-        fig = px.scatter(
-            df, x="Horiz_Break_in", y="Velocity_mph",
-            color="Pitch_Type", text="Pitch_Num",
-            color_discrete_map=PITCH_COLORS,
-            hover_data=["Total_Spin_rpm", "Spin_Efficiency_pct", "Peak_Valgus_Nm"],
-            labels={
-                "Horiz_Break_in": "Horizontal Break (inches)",
-                "Velocity_mph":   "Velocity (mph)",
-            },
-        )
-        fig.update_traces(marker=dict(size=14, line=dict(width=1, color="black")),
-                          textposition="top center")
-        fig.update_layout(height=480)
-        render_static_chart(fig)
+        st.subheader("Pitch Movement — 4-Quadrant Map")
+        st.caption(
+            "Each pitch plotted by its horizontal break (arm-side / glove-side) "
+            "vs vertical break (carry / drop). Center axis = 0\". Same chart "
+            "style as the Pitch Shaping tab so movement reads consistently across "
+            "the app.")
+        mv_fig = _build_arsenal_movement_chart(df, athlete_sport, athlete_hand)
+        render_static_chart(mv_fig, key="arsenal_movement_chart",
+                              width_px=640, height_px=640)
 
         # =====================================================
         # STRIKE ZONE SCATTER (clickable → per-pitch detail panel below)
