@@ -1670,7 +1670,7 @@ DEMO_ARCHETYPES = {
         "spin":  (2200, 2400),
         "eff":   (95, 98),
         "axis":  "01:15",  "gyro": (10, 13),
-        "vbreak": (17, 19),  "hbreak": (-8, -6),
+        "vbreak": (16, 18),  "hbreak": (4, 7),
         "valgus": (52, 56),  "ac_ratio": (0.8, 1.1),
         "trunk_fp": (28, 34), "hip_shoulder_peak": (52, 56),
         "lead_knee": (152, 158),
@@ -1683,7 +1683,7 @@ DEMO_ARCHETYPES = {
         "spin":  (2100, 2250),
         "eff":   (93, 96),
         "axis":  "02:30",  "gyro": (12, 15),
-        "vbreak": (11, 14),  "hbreak": (-16, -14),
+        "vbreak": (9, 12),  "hbreak": (12, 15),
         "valgus": (50, 54),  "ac_ratio": (0.85, 1.1),
         "trunk_fp": (29, 33), "hip_shoulder_peak": (50, 55),
         "lead_knee": (150, 156),
@@ -1695,7 +1695,7 @@ DEMO_ARCHETYPES = {
         "spin":  (2350, 2500),
         "eff":   (30, 38),
         "axis":  "08:45",  "gyro": (62, 70),
-        "vbreak": (-3, -1),  "hbreak": (4, 7),
+        "vbreak": (-2, 1),  "hbreak": (-7, -4),
         "valgus": (47, 52),  "ac_ratio": (0.85, 1.1),
         "trunk_fp": (30, 35), "hip_shoulder_peak": (46, 52),
         "lead_knee": (148, 154),
@@ -1707,7 +1707,7 @@ DEMO_ARCHETYPES = {
         "spin":  (2300, 2450),
         "eff":   (14, 22),
         "axis":  "09:15",  "gyro": (75, 82),
-        "vbreak": (-6, -3),  "hbreak": (14, 17),
+        "vbreak": (-5, -2),  "hbreak": (-12, -8),
         "valgus": (62, 68),    # DANGER zone — this is the story arc
         "ac_ratio": (1.05, 1.30),
         "trunk_fp": (54, 62),  # opens chest too early
@@ -1721,7 +1721,7 @@ DEMO_ARCHETYPES = {
         "spin":  (1600, 1800),
         "eff":   (85, 92),
         "axis":  "02:00",  "gyro": (17, 21),
-        "vbreak": (10, 13),  "hbreak": (-15, -13),
+        "vbreak": (5, 9),  "hbreak": (12, 15),
         "valgus": (48, 53),  "ac_ratio": (0.85, 1.1),
         "trunk_fp": (29, 33), "hip_shoulder_peak": (48, 53),
         "lead_knee": (150, 156),
@@ -1732,11 +1732,11 @@ DEMO_ARCHETYPES = {
 
 # Pitcher's "ideal" target per archetype — used to compute outlier distance
 PITCH_IDEALS = {
-    "Four-Seam Fastball": {"velo": 92.5, "spin": 2350, "vbreak": 18.5, "hbreak": -7.0, "valgus": 53.0},
-    "Two-Seam Sinker":    {"velo": 90.0, "spin": 2200, "vbreak": 13.0, "hbreak": -15.0, "valgus": 52.0},
-    "Slider Strike-Getter": {"velo": 83.5, "spin": 2450, "vbreak": -2.0, "hbreak": 5.5, "valgus": 49.0},
-    "Slider Chase":       {"velo": 79.5, "spin": 2400, "vbreak": -4.5, "hbreak": 16.0, "valgus": 56.0},
-    "Changeup":           {"velo": 83.5, "spin": 1700, "vbreak": 12.0, "hbreak": -14.0, "valgus": 50.0},
+    "Four-Seam Fastball": {"velo": 92.5, "spin": 2350, "vbreak": 17.0, "hbreak": 5.5,  "valgus": 53.0},
+    "Two-Seam Sinker":    {"velo": 90.0, "spin": 2200, "vbreak": 10.5, "hbreak": 13.5, "valgus": 52.0},
+    "Slider Strike-Getter": {"velo": 83.5, "spin": 2450, "vbreak": -0.5, "hbreak": -5.5, "valgus": 49.0},
+    "Slider Chase":       {"velo": 79.5, "spin": 2400, "vbreak": -3.5,  "hbreak": -10.0, "valgus": 56.0},
+    "Changeup":           {"velo": 83.5, "spin": 1700, "vbreak": 7.0,   "hbreak": 13.5, "valgus": 50.0},
 }
 
 # Default demo bullpen: pitch types and counts. Coaches see fastball-heavy
