@@ -7230,14 +7230,36 @@ def archive_athlete(athlete_id: int, archived: bool = True):
 def save_session(athlete_id: int, df: pd.DataFrame,
                  session_type: str = "real",
                  session_date: str | None = None,
-                 session_kind: str = "pitching") -> int:
+                 session_kind: str = "pitching",
+                 sport: str | None = None) -> int:
     """Save a session DataFrame keyed to an athlete.
 
     session_kind is 'pitching' or 'hitting'. Same athlete can have both —
     they live as separate rows.
+
+    `sport` is optional but should be passed for real sessions so the
+    saved data carries its sport context — needed by the new sport-aware
+    Pitch Shaping / Stuff+ / strike-zone-marker features when a session
+    is loaded later from history.
     """
     init_db()
     from datetime import datetime as _dt
+
+    # Embed sport in the DataFrame so it survives the JSON round-trip
+    # AND is available to every downstream consumer that gets the df
+    # back. Defaults to the athlete record's sport if not passed.
+    if sport is None:
+        try:
+            with _db_conn() as _c:
+                _row = _c.execute(
+                    "SELECT sport FROM athletes WHERE id = ?",
+                    (athlete_id,)).fetchone()
+                sport = (_row[0] if _row else None) or "Baseball"
+        except Exception:
+            sport = "Baseball"
+    df = df.copy()
+    df["Sport"] = sport
+
     if session_date is None:
         # Prefer the earliest pitch/swing timestamp; fall back to "now"
         if "Timestamp" in df.columns and df["Timestamp"].notna().any():
@@ -17456,31 +17478,50 @@ PITCH_TARGETS = {
 }
 
 
-def _resolve_pitch_target(pitch_type):
-    """Find the closest matching PITCH_TARGETS entry for a label."""
+def _resolve_pitch_target(pitch_type, sport: str = "Baseball"):
+    """Find the closest matching PITCH_TARGETS entry for a label.
+
+    `sport` biases the lookup so softball pitchers get softball targets
+    even when their pitch labels happen to overlap with baseball ones
+    (e.g. a softball pitcher labeling a glove-side breaker as "Slider"
+    should get the softball Curveball baseline, not the baseball Slider).
+    """
     if not pitch_type:
         return None, None
     pt = pitch_type.strip()
-    # Exact match
+    is_softball = (sport or "Baseball").lower().startswith("softball")
+    low = pt.lower()
+
+    # ----- Softball-context lookups FIRST when sport is softball -----
+    # Critical: this runs BEFORE the exact-match check below, because
+    # baseball "Slider" / "Curveball" / "Sinker" / "Changeup" exist as
+    # exact keys in PITCH_TARGETS, and an exact match would steal a
+    # softball pitcher's label and score them against MLB baselines.
+    if is_softball:
+        if "rise" in low:      return "Rise Ball", PITCH_TARGETS["Rise Ball"]
+        if "drop" in low:      return "Drop Ball", PITCH_TARGETS["Drop Ball"]
+        if "screw" in low:     return "Screwball", PITCH_TARGETS["Screwball"]
+        # Softball "Slider" / "Sweeper" / "Cutter" / any "Curve" =
+        # glove-side breaker → softball Curveball baseline.
+        if any(s in low for s in ("slider", "sweeper", "cutter", "curve")):
+            return "Curveball (softball)", PITCH_TARGETS["Curveball (softball)"]
+        if "change" in low or "splitter" in low or "fork" in low:
+            return "Change-Up", PITCH_TARGETS["Change-Up"]
+        if "fastball" in low or "four" in low or "sinker" in low or "two" in low:
+            return "Softball Fastball", PITCH_TARGETS["Softball Fastball"]
+        # Last-ditch softball default
+        return "Softball Fastball", PITCH_TARGETS["Softball Fastball"]
+
+    # ----- Baseball exact match -----
     if pt in PITCH_TARGETS:
         return pt, PITCH_TARGETS[pt]
-    # Fuzzy lowercase substring
-    low = pt.lower()
+
+    # ----- Substring match against any PITCH_TARGETS key -----
     for key in PITCH_TARGETS:
         if key.lower() in low or low in key.lower():
             return key, PITCH_TARGETS[key]
-    # ----- Softball-family guesses (check FIRST so "Curveball" in
-    # softball context picks the softball curve, not the baseball one) -----
-    if "rise" in low:      return "Rise Ball", PITCH_TARGETS["Rise Ball"]
-    if "drop" in low:      return "Drop Ball", PITCH_TARGETS["Drop Ball"]
-    if "screw" in low:     return "Screwball", PITCH_TARGETS["Screwball"]
-    if "softball_change" in low or low in ("change-up", "softball change-up"):
-        return "Change-Up", PITCH_TARGETS["Change-Up"]
-    if "softball_fastball" in low or low == "softball fastball":
-        return "Softball Fastball", PITCH_TARGETS["Softball Fastball"]
-    if "softball_curve" in low or "curveball (softball)" in low:
-        return "Curveball (softball)", PITCH_TARGETS["Curveball (softball)"]
-    # ----- Baseball-family guesses -----
+
+    # ----- Baseball-family fuzzy guesses -----
     if "slider" in low:    return "Slider",   PITCH_TARGETS["Slider"]
     if "sweeper" in low:   return "Sweeper",  PITCH_TARGETS["Sweeper"]
     if "change" in low:    return "Changeup", PITCH_TARGETS["Changeup"]
@@ -17495,19 +17536,18 @@ def _resolve_pitch_target(pitch_type):
     return None, None
 
 
-def compute_stuff_plus(velo, spin, v_break, h_break, pitch_type, hand_is_right=True):
+def compute_stuff_plus(velo, spin, v_break, h_break, pitch_type,
+                         hand_is_right=True, sport: str = "Baseball"):
     """Approximate Stuff+ — MLB average is 100. Higher = nastier stuff.
 
-    Built from publicly available Driveline / Eno Sarris methodology:
-    weighted contribution from velocity-vs-baseline, spin-vs-baseline,
-    movement-vs-baseline. Not as precise as the proprietary models but
-    gives a meaningful single-number quality score that responds the
-    right way to slider changes (more carry on a 4-seam = higher Stuff+,
-    more horizontal sweep on a sweeper = higher Stuff+, etc.).
-    Clamped to 60-140 — anything outside is unrealistic given typical
-    inputs.
+    `sport` biases the baseline lookup so a softball pitcher's "Slider"
+    label gets scored against a softball Curveball baseline instead of
+    the much-harder baseball Slider baseline. Without this a softball
+    pitcher labelling a glove-side breaker as Slider would always look
+    like a Stuff+ 60 (well below MLB average) because their 78 mph spin
+    can't possibly approach a 94 mph MLB four-seamer.
     """
-    key, target = _resolve_pitch_target(pitch_type)
+    key, target = _resolve_pitch_target(pitch_type, sport)
     if not target:
         return None
     base = target["mlb_baseline"]
@@ -17713,7 +17753,8 @@ def _build_arsenal_movement_chart(df, sport: str = "Baseball",
 
 def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
                                     pitch_type, hand_is_right=True,
-                                    width=720, height=520):
+                                    width=720, height=520,
+                                    sport: str = "Baseball"):
     """Render the 4-quadrant movement chart as a static PNG.
 
     X = horizontal break (negative = glove-side, positive = arm-side).
@@ -17732,7 +17773,7 @@ def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
         return None
 
     # Compute axis extents — cover the larger of: data, target, ideal zone
-    key, target = _resolve_pitch_target(pitch_type)
+    key, target = _resolve_pitch_target(pitch_type, sport)
     ideal_v = target["v_break_ideal"] if target else (-15, 20)
     ideal_h = target["h_break_ideal"] if target else (-15, 15)
 
@@ -18063,12 +18104,23 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
 
     hand_is_right = (athlete_hand or "Right") != "Left"
 
+    # Prefer the embedded Sport column on the df if present (real
+    # sessions loaded from history carry it now). Otherwise fall back
+    # to the athlete record's sport.
+    _effective_sport = athlete_sport
+    if df is not None and "Sport" in df.columns and df["Sport"].notna().any():
+        try:
+            _effective_sport = df["Sport"].dropna().iloc[0]
+        except Exception:
+            pass
+
     # Resolve pitch targets — ideal zones + MLB baseline for Stuff+
-    target_key, target = _resolve_pitch_target(pitch_picker)
+    target_key, target = _resolve_pitch_target(pitch_picker, _effective_sport)
 
     # Compute Stuff+ for current pitch
     stuff_now = compute_stuff_plus(
-        cur_velo, cur_spin, cur_v, cur_h, pitch_picker, hand_is_right)
+        cur_velo, cur_spin, cur_v, cur_h, pitch_picker, hand_is_right,
+        sport=_effective_sport)
 
     # Metric cards (added Stuff+ in the row)
     mc = st.columns(6)
@@ -18235,7 +18287,8 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
     chart = _render_pitch_movement_chart(
         cur_v, cur_h, tgt_v, tgt_h,
         pitch_picker, hand_is_right,
-        width=720, height=520)
+        width=720, height=520,
+        sport=_effective_sport)
     if chart and chart.get("png"):
         # Preferred path: static PNG (mobile rotation stability).
         st.image(chart["png"], use_container_width=True)
@@ -18253,7 +18306,8 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
 
     # ----- Stuff+ comparison (current vs target) -----
     stuff_tgt = compute_stuff_plus(
-        tgt_velo, cur_spin, tgt_v, tgt_h, pitch_picker, hand_is_right)
+        tgt_velo, cur_spin, tgt_v, tgt_h, pitch_picker, hand_is_right,
+        sport=_effective_sport)
     if stuff_now is not None and stuff_tgt is not None:
         delta_stuff = stuff_tgt - stuff_now
         if delta_stuff > 0:
