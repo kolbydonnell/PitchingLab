@@ -6337,6 +6337,15 @@ def init_db():
             c.execute("ALTER TABLE users ADD COLUMN org_id INTEGER")
         if "linked_athlete_id" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN linked_athlete_id INTEGER")
+        # ----- Email — for password recovery + emailing bullpen reports -----
+        if "email" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            # Stripe customers are keyed by email. Make sure existing accounts
+            # without an email can still upgrade — we'll prompt for one on
+            # checkout if missing.
+        if "email_opt_in" not in ucols:
+            # opt-in flag for whether we may email them (e.g. session reports)
+            c.execute("ALTER TABLE users ADD COLUMN email_opt_in INTEGER NOT NULL DEFAULT 1")
         # ----- Subscription / billing columns -----
         # On users (for solo individual athletes). On orgs (for org plans).
         for col, ddl in [
@@ -6414,29 +6423,62 @@ def _validate_username_password(username: str, password: str) -> tuple:
     return True, username
 
 
+def _normalize_email(email: str | None) -> str | None:
+    """Lower-case + strip. Returns None for empty strings."""
+    if email is None:
+        return None
+    e = (email or "").strip().lower()
+    return e or None
+
+
+def _is_valid_email(email: str | None) -> bool:
+    """Very loose email validator — enough to catch obvious typos but
+    not so strict it rejects legit unicode addresses."""
+    if not email or "@" not in email:
+        return False
+    local, _, domain = email.rpartition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    return True
+
+
 def register_user(username: str, password: str,
                     role: str = "coach",
                     org_id: int | None = None,
-                    linked_athlete_id: int | None = None) -> tuple:
+                    linked_athlete_id: int | None = None,
+                    email: str | None = None) -> tuple:
     """Generic user-insert. Returns (success, message). Most callers should
-    use register_coach() or register_athlete() instead."""
+    use register_coach() or register_athlete() instead.
+
+    `email` is optional but strongly encouraged — it's used for password
+    recovery and emailing bullpen reports.
+    """
     import os
     ok, msg = _validate_username_password(username, password)
     if not ok:
         return False, msg
     username = msg
+    email = _normalize_email(email)
+    if email and not _is_valid_email(email):
+        return False, "Please enter a valid email address."
     init_db()
     from datetime import datetime as _dt
     with _db_conn() as c:
         if c.execute("SELECT 1 FROM users WHERE username = ?",
                       (username,)).fetchone():
             return False, "That username is already taken."
+        if email and c.execute(
+                "SELECT 1 FROM users WHERE LOWER(email) = ?",
+                (email,)).fetchone():
+            return False, ("That email is already registered. "
+                            "Try signing in instead.")
         salt = os.urandom(16)
         c.execute(
             "INSERT INTO users (username, password_hash, salt, created_at, "
-            "role, org_id, linked_athlete_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "role, org_id, linked_athlete_id, email) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (username, _hash_password(password, salt), salt.hex(),
-             _dt.utcnow().isoformat(), role, org_id, linked_athlete_id))
+             _dt.utcnow().isoformat(), role, org_id, linked_athlete_id,
+             email))
     return True, f"Account '{username}' created."
 
 
@@ -6454,24 +6496,24 @@ def create_organization(name: str, owner_username: str) -> int:
         return cur.lastrowid
 
 
-def register_coach(username: str, password: str, org_name: str) -> tuple:
+def register_coach(username: str, password: str, org_name: str,
+                     email: str | None = None) -> tuple:
     """Create a coach account + a new organization owned by them.
 
     Shortcut: if username is literally 'admin' (case-insensitive), the
     account is created as a platform admin instead — no org is created
-    and no org name is required. Lets the operator (you) self-bootstrap
-    in one step without needing the secret bootstrap code path.
+    and no org name is required.
     Returns (success, message_or_username).
     """
     is_admin_shortcut = (username or "").strip().lower() == "admin"
     if is_admin_shortcut:
-        ok, msg = register_user(username, password, role="admin")
+        ok, msg = register_user(username, password, role="admin", email=email)
         if not ok:
             return False, msg
         return True, "admin"
     if not org_name or not org_name.strip():
         return False, "Organization name is required."
-    ok, msg = register_user(username, password, role="coach")
+    ok, msg = register_user(username, password, role="coach", email=email)
     if not ok:
         return False, msg
     canonical_username = msg.split("'")[1] if "'" in msg else username.strip().lower()
@@ -6576,7 +6618,8 @@ def register_athlete(username: str, password: str,
                       hand: str = "Right",
                       sport: str = "Baseball",
                       grad_class: str = "",
-                      level: str = "HS-Varsity") -> tuple:
+                      level: str = "HS-Varsity",
+                      email: str | None = None) -> tuple:
     """Register a player account.
     Two paths:
       - invite_code provided  → link to the coach-created athlete with
@@ -6591,14 +6634,15 @@ def register_athlete(username: str, password: str,
             return False, "Invalid invite code. Double-check with your coach."
         ok, msg = register_user(username, password, role="athlete",
                                   org_id=athlete.get("org_id"),
-                                  linked_athlete_id=athlete["id"])
+                                  linked_athlete_id=athlete["id"],
+                                  email=email)
         if not ok:
             return False, msg
         return True, msg
     # Solo path — must provide a name to create the athlete record
     if not name or not name.strip():
         return False, "Enter your name so the app can create your athlete profile."
-    ok, msg = register_user(username, password, role="athlete")
+    ok, msg = register_user(username, password, role="athlete", email=email)
     if not ok:
         return False, msg
     canonical = (username or "").strip().lower()
@@ -6769,6 +6813,278 @@ def _stripe_secrets() -> dict:
 def stripe_is_configured() -> bool:
     cfg = _stripe_secrets()
     return bool(cfg.get("secret_key"))
+
+
+def _get_stripe():
+    """Lazy import + configure the Stripe SDK. Returns the module or None.
+
+    Stripe is an optional dependency — the app runs fine without it, the
+    Choose-Tier buttons just show a friendly 'not configured yet' notice.
+    """
+    cfg = _stripe_secrets()
+    if not cfg.get("secret_key"):
+        return None
+    try:
+        import stripe  # type: ignore
+    except Exception:
+        return None
+    stripe.api_key = cfg["secret_key"]
+    return stripe
+
+
+def _stripe_price_id(tier_key: str, billing_cycle: str) -> str | None:
+    """Look up the Stripe Price ID for (tier_key, billing_cycle).
+
+    Reads from .streamlit/secrets.toml under
+        [stripe.prices]
+        individual_monthly = "price_..."
+        individual_annual  = "price_..."
+        ...
+    Returns None if the price isn't configured.
+    """
+    cfg = _stripe_secrets()
+    prices = cfg.get("prices", {}) or {}
+    return prices.get(f"{tier_key}_{billing_cycle}")
+
+
+def _entity_email(kind: str, rec: dict | None) -> str | None:
+    """Resolve a billing entity's contact email — used by Stripe so the
+    Checkout receipt + Customer Portal default to the right address."""
+    if not rec:
+        return None
+    if kind == "user":
+        return rec.get("email")
+    # Org billing — use the owner's email
+    try:
+        owner = rec.get("owner_username")
+        if owner:
+            owner_rec = get_user_record(owner) or {}
+            return owner_rec.get("email")
+    except Exception:
+        pass
+    return None
+
+
+def create_stripe_checkout_session(tier_key: str,
+                                       billing_cycle: str = "monthly",
+                                       success_url: str | None = None,
+                                       cancel_url: str | None = None) -> tuple:
+    """Create a Stripe Checkout Session for the current billing entity.
+
+    Returns (ok, url_or_error_message). On success, redirect the browser
+    to the returned URL. On error, surface the message to the user.
+
+    The session carries our (kind, entity_id) in metadata so the on-return
+    sync (and any future webhook) can find the right row to update.
+    """
+    stripe = _get_stripe()
+    if stripe is None:
+        return False, ("Stripe isn't fully configured yet. "
+                        "Add `secret_key` + `prices` under [stripe] in "
+                        "`.streamlit/secrets.toml`.")
+    if billing_cycle not in ("monthly", "annual"):
+        return False, "Invalid billing cycle."
+    price_id = _stripe_price_id(tier_key, billing_cycle)
+    if not price_id:
+        return False, (f"No Stripe Price ID configured for "
+                        f"{tier_key} / {billing_cycle}. Add it to "
+                        f"[stripe.prices] in secrets.toml.")
+    kind, rec = get_billing_entity()
+    if rec is None or kind == "none":
+        return False, "You must be logged in to subscribe."
+
+    email = _entity_email(kind, rec)
+    base_url = (_stripe_secrets().get("app_url") or "").rstrip("/")
+    if not base_url:
+        # Fall back to a placeholder — Streamlit Cloud users override via
+        # the `app_url` secret. The success/cancel URLs CAN be relative
+        # for many Stripe flows but it's cleaner to require an absolute.
+        base_url = "https://diamondsportslab.com"
+    if success_url is None:
+        success_url = (f"{base_url}/?stripe_status=success&session_id="
+                        f"{{CHECKOUT_SESSION_ID}}")
+    if cancel_url is None:
+        cancel_url = f"{base_url}/?stripe_status=cancel"
+
+    try:
+        params = dict(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            allow_promotion_codes=True,
+            metadata={
+                "entity_kind": kind,
+                "entity_id":   str(rec.get("id")),
+                "tier":        tier_key,
+                "billing_cycle": billing_cycle,
+            },
+            subscription_data={
+                "metadata": {
+                    "entity_kind": kind,
+                    "entity_id":   str(rec.get("id")),
+                    "tier":        tier_key,
+                }},
+        )
+        # Reuse existing Stripe customer if we have one, otherwise let
+        # Stripe create one from the email.
+        existing_customer = rec.get("stripe_customer_id")
+        if existing_customer:
+            params["customer"] = existing_customer
+        elif email:
+            params["customer_email"] = email
+        session = stripe.checkout.Session.create(**params)
+        return True, session.url
+    except Exception as e:
+        return False, f"Stripe error: {type(e).__name__}: {e}"
+
+
+def sync_subscription_from_stripe(checkout_session_id: str | None = None) -> tuple:
+    """Refresh our subscription state from Stripe.
+
+    Called when a user returns from Checkout (success_url) so they don't
+    have to wait for a webhook to write the row. Either pass the Checkout
+    session ID, or the function falls back to looking up the entity's
+    stored stripe_customer_id and reading their active subscriptions.
+
+    Returns (ok, msg).
+    """
+    stripe = _get_stripe()
+    if stripe is None:
+        return False, "Stripe not configured."
+    try:
+        sub = None
+        kind = None
+        entity_id = None
+        tier = None
+
+        if checkout_session_id:
+            sess = stripe.checkout.Session.retrieve(
+                checkout_session_id,
+                expand=["subscription", "customer"])
+            kind = (sess.metadata or {}).get("entity_kind")
+            try:
+                entity_id = int((sess.metadata or {}).get("entity_id"))
+            except Exception:
+                entity_id = None
+            tier = (sess.metadata or {}).get("tier")
+            sub = sess.subscription
+            customer_id = (sess.customer.id if hasattr(sess.customer, "id")
+                            else sess.customer)
+        else:
+            kind, rec = get_billing_entity()
+            if not rec or not rec.get("stripe_customer_id"):
+                return False, "No Stripe customer linked to this account."
+            customer_id = rec["stripe_customer_id"]
+            entity_id = rec.get("id")
+            # Find latest active subscription
+            subs = stripe.Subscription.list(customer=customer_id,
+                                              status="all", limit=5)
+            actives = [s for s in subs.data
+                          if s.status in ("active", "trialing", "past_due")]
+            sub = actives[0] if actives else (subs.data[0] if subs.data else None)
+            if sub is not None:
+                tier = ((sub.metadata or {}).get("tier")
+                          if hasattr(sub, "metadata") else None)
+
+        if sub is None or entity_id is None or kind is None:
+            return False, "No subscription found to sync."
+
+        # Map Stripe sub status → our internal status string
+        stripe_status = getattr(sub, "status", None) or sub["status"]
+        status_map = {
+            "active":   "active",
+            "trialing": "active",
+            "past_due": "past_due",
+            "canceled": "canceled",
+            "incomplete": "trial",
+            "incomplete_expired": "expired",
+            "unpaid": "past_due",
+            "paused": "canceled",
+        }
+        our_status = status_map.get(stripe_status, "trial")
+        # Subscription end timestamp for renewal display
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            renew = _dt.fromtimestamp(int(sub["current_period_end"]),
+                                          _tz.utc).isoformat()
+        except Exception:
+            renew = None
+
+        set_subscription(
+            kind, entity_id,
+            tier=tier or "individual",
+            status=our_status,
+            renews_at=renew,
+            stripe_customer_id=customer_id,
+            stripe_subscription_id=getattr(sub, "id", None) or sub.get("id"))
+        return True, f"Subscription updated ({our_status})."
+    except Exception as e:
+        return False, f"Stripe sync error: {type(e).__name__}: {e}"
+
+
+def create_stripe_portal_session(return_url: str | None = None) -> tuple:
+    """Create a Stripe Customer Portal session so the user can manage
+    their card, cancel, switch plans, etc. Returns (ok, url_or_error)."""
+    stripe = _get_stripe()
+    if stripe is None:
+        return False, "Stripe not configured."
+    kind, rec = get_billing_entity()
+    if not rec or not rec.get("stripe_customer_id"):
+        return False, ("No Stripe customer on file. Subscribe first, then "
+                        "the portal will be available.")
+    base_url = (_stripe_secrets().get("app_url") or
+                "https://diamondsportslab.com").rstrip("/")
+    if return_url is None:
+        return_url = f"{base_url}/?stripe_status=returned"
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=rec["stripe_customer_id"],
+            return_url=return_url)
+        return True, portal.url
+    except Exception as e:
+        return False, f"Stripe portal error: {type(e).__name__}: {e}"
+
+
+def handle_stripe_return_query():
+    """If the user just returned from Stripe Checkout, sync state.
+
+    Streamlit doesn't natively support webhooks. As a pragmatic
+    alternative, the success URL carries `stripe_status=success` and
+    `session_id={CHECKOUT_SESSION_ID}` in query params. When we detect
+    that on page load, we pull the canonical state from Stripe so the
+    user sees their subscription as active immediately.
+
+    Safe no-op if no relevant query param is present, or if Stripe is
+    not configured.
+    """
+    if not stripe_is_configured():
+        return
+    try:
+        qp = st.query_params  # Streamlit 1.30+
+    except Exception:
+        return
+    status = qp.get("stripe_status")
+    if status == "success":
+        session_id = qp.get("session_id")
+        ok, msg = sync_subscription_from_stripe(checkout_session_id=session_id)
+        if ok:
+            st.toast("Subscription activated — welcome aboard.")
+        else:
+            st.toast(f"Couldn't sync subscription: {msg}", icon="⚠")
+        # Clear the query params so we don't re-sync on every rerun
+        try:
+            for k in ("stripe_status", "session_id"):
+                if k in qp:
+                    del qp[k]
+        except Exception:
+            pass
+    elif status == "cancel":
+        st.toast("Checkout canceled — you can pick a plan whenever you're ready.")
+        try:
+            del qp["stripe_status"]
+        except Exception:
+            pass
 
 
 def get_billing_entity(user: dict | None = None) -> tuple:
@@ -6965,12 +7281,35 @@ def render_trial_status_banner():
 
 
 def render_billing_modal_if_requested():
-    """Full pricing card + (eventually) Stripe Checkout launch. Stub for
-    now — shows the tiers and prices, click-to-subscribe redirects to
-    Stripe only when configured."""
+    """Full pricing card + Stripe Checkout launch."""
     if not st.session_state.get("show_billing_modal"):
         return
     st.markdown("---")
+    # If they already have an active subscription, surface the Stripe
+    # Customer Portal button up top instead of just showing plans again.
+    kind, bill_rec = get_billing_entity()
+    bill_status = (bill_rec or {}).get("subscription_status")
+    if bill_status == "active" and stripe_is_configured():
+        cur_tier_key = (bill_rec or {}).get("subscription_tier")
+        cur_tier = SUBSCRIPTION_TIERS.get(cur_tier_key, {})
+        st.success(
+            f"Active subscription: **{cur_tier.get('label', cur_tier_key)}**. "
+            "Use Manage to update card, switch plan, or cancel.")
+        if st.button("Manage subscription (Stripe portal)",
+                      key="open_stripe_portal",
+                      type="primary",
+                      use_container_width=True):
+            ok, msg = create_stripe_portal_session()
+            if ok:
+                st.markdown(
+                    f"<meta http-equiv='refresh' content='0; url={msg}'>"
+                    f"<a href='{msg}' target='_self'>"
+                    f"Open Stripe Customer Portal →</a>",
+                    unsafe_allow_html=True)
+                st.stop()
+            else:
+                st.error(msg)
+        st.markdown("---")
     st.subheader("Choose a plan")
     st.caption(
         "All plans start with a 14-day trial limited to "
@@ -7004,10 +7343,21 @@ def render_billing_modal_if_requested():
                           key=f"choose_{key}_{cycle}",
                           use_container_width=True):
                 if stripe_is_configured():
-                    st.session_state["pending_checkout_tier"]  = key
-                    st.session_state["pending_checkout_annual"] = is_annual
-                    st.info("Stripe Checkout integration coming online — "
-                            "you'll be redirected to enter card details.")
+                    cycle_key = "annual" if is_annual else "monthly"
+                    ok, msg = create_stripe_checkout_session(
+                        tier_key=key, billing_cycle=cycle_key)
+                    if ok:
+                        # `msg` is the Checkout URL. Redirect the browser
+                        # via a meta-refresh / window.location since
+                        # Streamlit can't do a server-side redirect.
+                        st.markdown(
+                            f"<meta http-equiv='refresh' content='0; url={msg}'>"
+                            f"<a href='{msg}' target='_self'>"
+                            f"Continue to secure checkout →</a>",
+                            unsafe_allow_html=True)
+                        st.stop()
+                    else:
+                        st.error(msg)
                 else:
                     st.warning(
                         "Billing isn't fully turned on yet. The price tiers "
@@ -7775,19 +8125,20 @@ def _build_strike_zone_figure(df: pd.DataFrame,
     diameter) is ~32% bigger than a baseball (~2.9"), so the markers
     scale up proportionally relative to the same 17"-wide zone.
     """
-    # Ball-marker sizing — baseball stays at its approved size; softball
-    # is shrunk because visually it was reading much bigger than the
-    # zone box at the proportional "real-ball-ratio" sizes. The fix is
-    # by eye, not by math: baseball at 52 fits comfortably in the box,
-    # softball at 36 fits comfortably too without looking outsized.
+    # Ball-marker sizing — proportional to real ball-to-zone ratios so
+    # softball (3.82" diameter) reads slightly larger than baseball
+    # (2.9" diameter) just like in real life. Softball baseline is 36 px
+    # (already user-approved as fitting comfortably inside the zone);
+    # baseball is set to 76% of that so the relative proportion matches
+    # the real-world size difference (2.9 / 3.82 ≈ 0.76).
     if (sport or "Baseball").lower().startswith("softball"):
         _ball_px = 36
         _ring_px = 46
         _text_px = 12
     else:
-        _ball_px = 52
-        _ring_px = 62
-        _text_px = 16
+        _ball_px = 28
+        _ring_px = 38
+        _text_px = 11
     fig = go.Figure()
 
     # --- Strike zone box (3x3 grid for visual reference) ---
@@ -16280,6 +16631,12 @@ def _render_login_screen() -> bool:
                 st.markdown("---")
                 nu  = st.text_input("Pick a username", key="reg_u",
                                        placeholder="3+ chars, letters/numbers/_-")
+                ne  = st.text_input(
+                    "Email address",
+                    key="reg_email",
+                    placeholder="you@example.com",
+                    help=("Used for password recovery and to email you your "
+                          "bullpen reports. We won't share it."))
                 np_ = st.text_input("Pick a password", type="password",
                                        key="reg_p",
                                        placeholder="6+ characters")
@@ -16321,12 +16678,14 @@ def _render_login_screen() -> bool:
 
                 if st.button(btn_label, type="primary",
                               use_container_width=True, key="reg_btn"):
+                    email_val = st.session_state.get("reg_email", "")
                     if np_ != np2:
                         st.error("Passwords don't match.")
                     elif acct_type.startswith("Coach"):
                         ok, msg = register_coach(nu, np_,
                                                     st.session_state.get(
-                                                        "reg_org_name", ""))
+                                                        "reg_org_name", ""),
+                                                    email=email_val)
                         if ok:
                             st.session_state["auth_user"] = msg
                             st.session_state.pop("reg_p", None)
@@ -16338,7 +16697,8 @@ def _render_login_screen() -> bool:
                         ok, msg = register_athlete(
                             nu, np_,
                             invite_code=st.session_state.get(
-                                "reg_invite_code", ""))
+                                "reg_invite_code", ""),
+                            email=email_val)
                         if ok:
                             _, canonical = verify_user(nu, np_)
                             st.session_state["auth_user"] = canonical
@@ -16353,7 +16713,8 @@ def _render_login_screen() -> bool:
                             name=st.session_state.get("reg_solo_name", ""),
                             hand=st.session_state.get("reg_solo_hand", "Right"),
                             sport=st.session_state.get("reg_solo_sport", "Baseball"),
-                            grad_class=st.session_state.get("reg_solo_grad", ""))
+                            grad_class=st.session_state.get("reg_solo_grad", ""),
+                            email=email_val)
                         if ok:
                             _, canonical = verify_user(nu, np_)
                             st.session_state["auth_user"] = canonical
@@ -19534,6 +19895,12 @@ def main():
         initial_sidebar_state="expanded",
     )
     _inject_global_styles()
+
+    # If the user just came back from Stripe Checkout (success or
+    # cancel), sync our subscription state to match Stripe BEFORE
+    # rendering anything else. This is the no-webhook path that works
+    # on Streamlit Cloud out of the box.
+    handle_stripe_return_query()
 
     # ===== LOGIN / LANDING GATE =====
     # Renders login or landing screen and returns False until the user

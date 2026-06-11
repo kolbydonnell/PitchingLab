@@ -10,6 +10,7 @@ pillow>=11.0
 reportlab>=4.0
 matplotlib>=3.9
 pypdf>=4.0
+stripe>=9.0       # subscription billing (Stripe Checkout + Customer Portal)
 
 # =====================================================================
 # Live Capture + Upload Video — phone/tablet camera tracking

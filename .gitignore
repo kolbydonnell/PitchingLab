@@ -1,0 +1,28 @@
+# Secrets — NEVER commit
+.streamlit/secrets.toml
+.env
+.env.local
+.env.*.local
+
+# Local SQLite database
+diamond_sports_lab.db
+*.db
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Mac
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Streamlit runtime
+.streamlit/credentials.toml
