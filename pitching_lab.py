@@ -5194,7 +5194,8 @@ def generate_pbr_pdf(df: pd.DataFrame,
                      athlete_hand: str = "Right",
                      athlete_class: str = "",
                      sport: str = "Baseball",
-                     athlete_level: str = "HS-Varsity") -> bytes:
+                     athlete_level: str = "HS-Varsity",
+                     athlete_id: int | None = None) -> bytes:
     """Generate the Post-Bullpen Report as a multi-page PDF.
 
     Returns: PDF as raw bytes (suitable for st.download_button).
@@ -5308,11 +5309,17 @@ def generate_pbr_pdf(df: pd.DataFrame,
     story.append(kpi_table)
     story.append(Spacer(1, 12))
 
-    # --- Pitch Type Breakdown ---
+    # --- Pitch Type Breakdown (with Stuff+) ---
     story.append(Paragraph("Pitch Type Breakdown", h2))
     breakdown = pitch_type_breakdown(df)
-    bd_rows = [["Pitch Type", "#", "Velo", "Spin", "V Brk", "H Brk", "Stress"]]
+    _is_right = (athlete_hand or "Right") != "Left"
+    bd_rows = [["Pitch Type", "#", "Velo", "Spin", "V Brk", "H Brk",
+                 "Stuff+", "Stress"]]
     for _, r in breakdown.iterrows():
+        stf = compute_stuff_plus(
+            r.get("Avg_Velo"), r.get("Avg_Spin"),
+            r.get("Avg_Vert_Break"), r.get("Avg_Horiz_Break"),
+            r["Pitch_Type"], _is_right, sport=sport)
         bd_rows.append([
             r["Pitch_Type"],
             str(int(r["Thrown"])),
@@ -5320,10 +5327,12 @@ def generate_pbr_pdf(df: pd.DataFrame,
             f"{int(r['Avg_Spin']) if pd.notna(r['Avg_Spin']) else '—'}",
             f"{r['Avg_Vert_Break']:.1f}\"" if pd.notna(r['Avg_Vert_Break']) else "—",
             f"{r['Avg_Horiz_Break']:.1f}\"" if pd.notna(r['Avg_Horiz_Break']) else "—",
+            f"{stf}" if stf is not None else "—",
             f"{r['Avg_Stress']:.1f} Nm" if pd.notna(r['Avg_Stress']) else "—",
         ])
-    bd_table = Table(bd_rows, colWidths=[1.7*inch, 0.4*inch, 0.9*inch, 0.7*inch,
-                                          0.7*inch, 0.7*inch, 0.9*inch])
+    bd_table = Table(bd_rows, colWidths=[1.55*inch, 0.35*inch, 0.85*inch,
+                                          0.65*inch, 0.65*inch, 0.65*inch,
+                                          0.6*inch, 0.85*inch])
     bd_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), brand_navy),
         ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
@@ -5428,6 +5437,73 @@ def generate_pbr_pdf(df: pd.DataFrame,
     story.append(Paragraph(athlete_name + " — Action Plan", h1))
     story.append(Spacer(1, 6))
 
+    # ===== Pitch Development Plan (items the coach added from
+    # Pitch Shaping). Lives at the TOP of the Action Plan page so the
+    # coach is reminded of the targeted work BEFORE the algorithmic
+    # drills. Only renders when an athlete_id is provided AND there
+    # are active items. =====
+    if athlete_id is not None:
+        try:
+            import json as _json
+            init_db()
+            with _db_conn() as _c:
+                dp_rows = _c.execute(
+                    "SELECT item_id, type, pitch, title, description, "
+                    "grip_refs, drill_refs, status FROM dev_plan_items "
+                    "WHERE athlete_id = ? AND status = 'active' "
+                    "ORDER BY added_at",
+                    (athlete_id,)).fetchall()
+        except Exception:
+            dp_rows = []
+        if dp_rows:
+            story.append(Paragraph("Pitch Development Plan", h2))
+            story.append(Paragraph(
+                "<font color='#6b7280' size='8.5'>Items added from the "
+                "Pitch Shaping tab — the specific shaping or "
+                "new-pitch work for this athlete this week.</font>",
+                small))
+            story.append(Spacer(1, 4))
+            for r in dp_rows:
+                _item_id, _type, _pitch, _title, _desc, _gr, _dr, _st = r
+                type_lbl = ("LEARN NEW PITCH" if _type == "learn"
+                              else "SHAPE PITCH")
+                grip_lbl = ""
+                try:
+                    grip_keys = _json.loads(_gr or "[]")
+                    if grip_keys:
+                        grip_lbl = "Grips: " + ", ".join(
+                            GRIP_LIBRARY.get(k, {}).get("label", k)
+                            for k in grip_keys)
+                except Exception:
+                    pass
+                drill_lbl = ""
+                try:
+                    drill_keys = _json.loads(_dr or "[]")
+                    if drill_keys:
+                        drill_lbl = "Drills: " + ", ".join(
+                            DRILL_LIBRARY.get(k, {}).get("label", k)
+                            for k in drill_keys)
+                except Exception:
+                    pass
+                refs_text = ""
+                if grip_lbl:  refs_text += grip_lbl
+                if drill_lbl:
+                    if refs_text: refs_text += " · "
+                    refs_text += drill_lbl
+                story.append(KeepTogether([
+                    Paragraph(
+                        f"<b><font color='#1a2150'>{_pitch}</font></b>  "
+                        f"<font color='#6b7280' size='8'>[{type_lbl}]</font>"
+                        f"<br/><b>{_title}</b>", body),
+                    Paragraph(
+                        f"<font color='#374151'>{_desc}</font>", body),
+                    Paragraph(
+                        f"<font color='#6b7280' size='8'>{refs_text}</font>",
+                        small) if refs_text else Spacer(1, 1),
+                    Spacer(1, 8),
+                ]))
+            story.append(Spacer(1, 8))
+
     def _drill_block(d):
         parts = [
             Paragraph(f"<b>{d['label']}</b>  "
@@ -5475,6 +5551,257 @@ def generate_pbr_pdf(df: pd.DataFrame,
         "and biomechanics data into one workflow."
         "</font>", small
     ))
+
+    doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    return buf.getvalue()
+
+
+# =============================================================================
+# RECRUITING / SCOUT REPORT PDF — one-page summary for college coaches
+# =============================================================================
+def generate_recruiting_pdf(df: pd.DataFrame,
+                              athlete_name: str = "Athlete",
+                              athlete_hand: str = "Right",
+                              athlete_class: str = "",
+                              sport: str = "Baseball",
+                              athlete_level: str = "HS-Varsity",
+                              contact_email: str = "",
+                              contact_phone: str = "",
+                              school: str = "") -> bytes:
+    """One-page recruiting / scout report.
+
+    Designed for scout-glance reading: headline metrics up top, full
+    arsenal table with Stuff+, the 4-quadrant movement chart, strike-zone
+    command map, and a 'best pitches' highlight strip. Optional contact
+    info at the bottom for follow-up.
+    """
+    from datetime import datetime
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
+        KeepTogether,
+    )
+
+    buf = io.BytesIO()
+    brand_navy = colors.HexColor("#1a2150")
+    brand_gold = colors.HexColor("#d4a634")
+    soft_grey  = colors.HexColor("#6b7280")
+    light_grey = colors.HexColor("#f3f4f6")
+    accent_grn = colors.HexColor("#16a34a")
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=22,
+                          leading=24, textColor=brand_navy, spaceAfter=2)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=11,
+                          leading=13, textColor=brand_navy, spaceBefore=8,
+                          spaceAfter=3, fontName="Helvetica-Bold")
+    body = ParagraphStyle("body", parent=styles["BodyText"], fontSize=9,
+                            leading=11.5)
+    small = ParagraphStyle("small", parent=body, fontSize=7.5,
+                            leading=9, textColor=soft_grey)
+    highlight = ParagraphStyle("hl", parent=body, fontSize=10,
+                                  leading=13, textColor=brand_navy,
+                                  fontName="Helvetica-Bold")
+
+    def _header_footer(canvas, doc):
+        canvas.saveState()
+        # Top brand bar
+        canvas.setFillColor(brand_navy)
+        canvas.rect(0, doc.pagesize[1] - 0.45 * inch,
+                    doc.pagesize[0], 0.45 * inch, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(0.5 * inch, doc.pagesize[1] - 0.30 * inch,
+                          "DIAMOND SPORTS LAB")
+        canvas.setFont("Helvetica-Bold", 8.5)
+        canvas.setFillColor(brand_gold)
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch,
+                               doc.pagesize[1] - 0.30 * inch,
+                               f"RECRUITING REPORT  ·  {sport.upper()}")
+        # Footer
+        canvas.setFillColor(soft_grey)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(0.5 * inch, 0.3 * inch,
+                          f"Generated {datetime.now().strftime('%b %d, %Y')}")
+        canvas.drawRightString(doc.pagesize[0] - 0.5 * inch, 0.3 * inch,
+                               "diamondsportslab.com")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=LETTER,
+        topMargin=0.7 * inch, bottomMargin=0.5 * inch,
+        leftMargin=0.5 * inch, rightMargin=0.5 * inch,
+        title=f"Recruiting Report — {athlete_name}",
+        author="Diamond Sports Lab",
+    )
+
+    story = []
+
+    # ===== Athlete header =====
+    story.append(Paragraph(athlete_name, h1))
+    bio_bits = [f"{sport}", f"{athlete_hand}HP"]
+    if athlete_class: bio_bits.append(f"Class {athlete_class}")
+    if athlete_level: bio_bits.append(athlete_level)
+    if school:        bio_bits.append(school)
+    bio_str = " · ".join(bio_bits)
+    story.append(Paragraph(
+        f"<font color='#6b7280'>{bio_str}</font>", body))
+    story.append(Spacer(1, 8))
+
+    # ===== Headline KPI strip =====
+    kpis = session_kpis(df)
+    arsenal_breakdown = pitch_type_breakdown(df)
+    # Compute peak Stuff+ across the arsenal
+    is_right = (athlete_hand or "Right") != "Left"
+    peak_stuff = None
+    if len(arsenal_breakdown):
+        for _, r in arsenal_breakdown.iterrows():
+            stf = compute_stuff_plus(
+                r.get("Avg_Velo"), r.get("Avg_Spin"),
+                r.get("Avg_Vert_Break"), r.get("Avg_Horiz_Break"),
+                r["Pitch_Type"], is_right, sport=sport)
+            if stf is not None:
+                peak_stuff = max(peak_stuff or 0, stf)
+
+    kpi_row = [
+        ["PEAK VELO", "AVG VELO", "TOP SPIN", "PEAK STUFF+", "PITCHES"],
+        [
+            f"{kpis['Peak Velocity']:.1f} mph" if kpis.get('Peak Velocity') is not None else "—",
+            f"{kpis['Avg Velocity']:.1f} mph"  if kpis.get('Avg Velocity')  is not None else "—",
+            f"{kpis['Avg Spin']:,}" if kpis.get('Avg Spin') else "—",
+            f"{peak_stuff}" if peak_stuff is not None else "—",
+            str(kpis.get('Total Pitches', 0)),
+        ],
+    ]
+    kpi_table = Table(kpi_row, colWidths=[1.45*inch] * 5)
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), brand_navy),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), brand_gold),
+        ("BACKGROUND", (0, 1), (-1, 1), light_grey),
+        ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME",   (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("FONTSIZE",   (0, 0), (-1, 0), 8),
+        ("FONTSIZE",   (0, 1), (-1, 1), 16),
+        ("TEXTCOLOR",  (0, 1), (-1, 1), brand_navy),
+        ("ALIGN",      (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(kpi_table)
+    story.append(Spacer(1, 10))
+
+    # ===== Arsenal table (with Stuff+ column) =====
+    story.append(Paragraph("Arsenal", h2))
+    ar_rows = [["Pitch", "#", "Velo Avg", "Velo Pk", "Spin",
+                 "V Brk", "H Brk", "Stuff+"]]
+    # Sort by usage descending so the primary pitches are at the top
+    ar_sorted = arsenal_breakdown.sort_values("Thrown", ascending=False) \
+                  if len(arsenal_breakdown) else arsenal_breakdown
+    for _, r in ar_sorted.iterrows():
+        stf = compute_stuff_plus(
+            r.get("Avg_Velo"), r.get("Avg_Spin"),
+            r.get("Avg_Vert_Break"), r.get("Avg_Horiz_Break"),
+            r["Pitch_Type"], is_right, sport=sport)
+        # Peak velo per type — recompute from raw rows
+        type_rows = df[df["Pitch_Type"] == r["Pitch_Type"]]
+        peak_v = type_rows["Velocity_mph"].max() if "Velocity_mph" in type_rows.columns else None
+        ar_rows.append([
+            r["Pitch_Type"],
+            str(int(r["Thrown"])),
+            f"{r['Avg_Velo']:.1f}" if pd.notna(r['Avg_Velo']) else "—",
+            f"{peak_v:.1f}" if peak_v is not None and pd.notna(peak_v) else "—",
+            f"{int(r['Avg_Spin'])}" if pd.notna(r['Avg_Spin']) else "—",
+            f"{r['Avg_Vert_Break']:.1f}\"" if pd.notna(r['Avg_Vert_Break']) else "—",
+            f"{r['Avg_Horiz_Break']:.1f}\"" if pd.notna(r['Avg_Horiz_Break']) else "—",
+            f"{stf}" if stf is not None else "—",
+        ])
+    ar_table = Table(ar_rows, colWidths=[
+        1.45*inch, 0.3*inch, 0.7*inch, 0.7*inch, 0.65*inch,
+        0.7*inch, 0.7*inch, 0.7*inch])
+    ar_table.setStyle(TableStyle([
+        ("BACKGROUND",      (0, 0), (-1, 0), brand_navy),
+        ("TEXTCOLOR",       (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",        (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",        (0, 0), (-1, -1), 8.5),
+        ("ALIGN",           (1, 0), (-1, -1), "RIGHT"),
+        ("ALIGN",           (0, 0), (0, -1), "LEFT"),
+        ("GRID",            (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+        ("ROWBACKGROUNDS",  (0, 1), (-1, -1), [colors.white, light_grey]),
+        ("TOPPADDING",      (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING",   (0, 0), (-1, -1), 4),
+    ]))
+    story.append(ar_table)
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(
+        "<font color='#6b7280' size='7.5'>Stuff+ benchmark: 100 = MLB league average. "
+        "Above 110 = plus pitch. Above 120 = elite. Computed from velocity, spin, "
+        "and movement relative to a pitch-type-specific baseline.</font>",
+        small))
+    story.append(Spacer(1, 10))
+
+    # ===== Movement chart + Command map (side by side) =====
+    move_png = _render_movement_quadrant_png(df, width_in=4.5)
+    zone_png = (_render_strike_zone_png(df, width_in=4.5)
+                  if df["Strike_Zone_Side"].notna().any() else None)
+    if move_png and zone_png:
+        side_by_side = Table([[
+            [Paragraph("Pitch Movement (catcher's view)", h2),
+             Image(io.BytesIO(move_png), width=3.4*inch, height=3.4*inch)],
+            [Paragraph("Strike Zone Command", h2),
+             Image(io.BytesIO(zone_png), width=3.0*inch, height=3.0*inch)],
+        ]], colWidths=[3.6*inch, 3.6*inch])
+        side_by_side.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(side_by_side)
+    elif move_png:
+        story.append(Paragraph("Pitch Movement (catcher's view)", h2))
+        img = Image(io.BytesIO(move_png), width=4.0*inch, height=4.0*inch)
+        img.hAlign = "CENTER"
+        story.append(img)
+    story.append(Spacer(1, 8))
+
+    # ===== Highlights — positive-outlier pitches =====
+    positive_rows = df[df.get("Outlier_Type", "") == "positive"] \
+                      if "Outlier_Type" in df.columns else df.iloc[0:0]
+    if len(positive_rows):
+        story.append(Paragraph("Highlights — best pitches of the session", h2))
+        highlights = []
+        for _, p in positive_rows.head(4).iterrows():
+            reason = p.get("Outlier_Reasons") or ""
+            highlights.append(Paragraph(
+                f"<b>{p['Pitch_Type']}</b> · {p['Velocity_mph']:.1f} mph"
+                + (f" · spin {int(p['Total_Spin_rpm'])} rpm"
+                    if pd.notna(p.get('Total_Spin_rpm')) else "")
+                + (f"<br/><font color='#6b7280' size='8'>{reason}</font>"
+                    if reason else ""),
+                body))
+            highlights.append(Spacer(1, 4))
+        story.append(KeepTogether(highlights))
+        story.append(Spacer(1, 6))
+
+    # ===== Footer — contact + credibility =====
+    contact_lines = []
+    if contact_email: contact_lines.append(f"Email: {contact_email}")
+    if contact_phone: contact_lines.append(f"Phone: {contact_phone}")
+    if contact_lines:
+        story.append(Paragraph(
+            "<b>Contact</b><br/>" + "<br/>".join(contact_lines),
+            body))
+        story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        "<font color='#6b7280' size='7.5'>This report was generated by "
+        "Diamond Sports Lab — coach-portable pitching analytics that fuse "
+        "ball-flight, arm-health, and biomechanics data. Metrics are "
+        "session aggregates from real or video-tracked bullpens.</font>",
+        small))
 
     doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
     return buf.getvalue()
@@ -5921,6 +6248,32 @@ def init_db():
         scols = [r[1] for r in c.execute("PRAGMA table_info(sessions)").fetchall()]
         if "session_kind" not in scols:
             c.execute("ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'pitching'")
+
+        # ===== DEV PLAN ITEMS table (Pitch Development Plan) =====
+        # Items the athlete adds from the Pitch Shaping tab + new-pitch
+        # trainer. Persists across app restarts so a coach can come back
+        # next week and the plan is still there.
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS dev_plan_items (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                athlete_id   INTEGER NOT NULL,
+                item_id      TEXT NOT NULL,
+                type         TEXT NOT NULL DEFAULT 'shape',
+                pitch        TEXT,
+                title        TEXT NOT NULL,
+                description  TEXT,
+                grip_refs    TEXT NOT NULL DEFAULT '[]',
+                drill_refs   TEXT NOT NULL DEFAULT '[]',
+                direction    TEXT,
+                weeks        TEXT,
+                status       TEXT NOT NULL DEFAULT 'active',
+                added_at     TEXT NOT NULL,
+                FOREIGN KEY (athlete_id) REFERENCES athletes(id) ON DELETE CASCADE,
+                UNIQUE(athlete_id, item_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dev_plan_athlete
+                ON dev_plan_items(athlete_id, status);
+        """)
 
         # ===== USERS + ORGS tables (login system + role scoping) =====
         c.executescript("""
@@ -17950,29 +18303,116 @@ def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
 # on app restart (good for now; can persist to DB later).
 # =====================================================================
 def _dev_plan_items_key(athlete_name: str) -> str:
-    """Session-state key scoped to the current athlete so two athletes
-    on the same device don't share each other's plans."""
+    """Session-state key for the fallback path (used when there's no
+    selected athlete_id — e.g. unauthenticated preview)."""
     return f"dev_plan_items::{(athlete_name or 'default').lower()}"
 
 
+def _dev_plan_current_athlete_id() -> int | None:
+    """Return the selected athlete ID for DB-backed dev plan ops, or
+    None when we should fall back to session_state."""
+    try:
+        return st.session_state.get("selected_athlete_id")
+    except Exception:
+        return None
+
+
 def _dev_plan_get_items(athlete_name: str) -> list:
+    """Return the dev plan items for the current athlete. Reads SQLite
+    when an athlete is selected (persists across app restarts), and
+    falls back to session_state for the unauthenticated preview path."""
+    import json as _json
+    ath_id = _dev_plan_current_athlete_id()
+    if ath_id is not None:
+        try:
+            init_db()
+            with _db_conn() as c:
+                rows = c.execute(
+                    "SELECT item_id, type, pitch, title, description, "
+                    "grip_refs, drill_refs, direction, weeks, status, "
+                    "added_at FROM dev_plan_items "
+                    "WHERE athlete_id = ? ORDER BY added_at",
+                    (ath_id,)).fetchall()
+            items = []
+            for r in rows:
+                items.append({
+                    "id":          r[0],
+                    "type":        r[1],
+                    "pitch":       r[2] or "",
+                    "title":       r[3],
+                    "description": r[4] or "",
+                    "grip_refs":   _json.loads(r[5] or "[]"),
+                    "drill_refs":  _json.loads(r[6] or "[]"),
+                    "direction":   r[7],
+                    "weeks":       _json.loads(r[8]) if r[8] else None,
+                    "status":      r[9],
+                    "added_at":    r[10],
+                })
+            return items
+        except Exception:
+            # If the DB query fails for any reason, fall through to
+            # session_state so the UI keeps working.
+            pass
     return st.session_state.get(_dev_plan_items_key(athlete_name), [])
 
 
 def _dev_plan_add_item(athlete_name: str, item: dict) -> bool:
     """Append a development item. Dedupes by `id`. Returns True if added."""
+    import json as _json
+    item = dict(item)
+    item.setdefault("added_at", datetime.now(timezone.utc).isoformat())
+    item.setdefault("status", "active")
+
+    ath_id = _dev_plan_current_athlete_id()
+    if ath_id is not None:
+        try:
+            init_db()
+            with _db_conn() as c:
+                # Use INSERT OR IGNORE for dedup (UNIQUE constraint on
+                # athlete_id+item_id). Returns rowcount=0 if already exists.
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO dev_plan_items "
+                    "(athlete_id, item_id, type, pitch, title, description, "
+                    "grip_refs, drill_refs, direction, weeks, status, "
+                    "added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ath_id,
+                     item.get("id"),
+                     item.get("type", "shape"),
+                     item.get("pitch", ""),
+                     item.get("title", ""),
+                     item.get("description", ""),
+                     _json.dumps(item.get("grip_refs", [])),
+                     _json.dumps(item.get("drill_refs", [])),
+                     item.get("direction"),
+                     _json.dumps(item.get("weeks")) if item.get("weeks") else None,
+                     item.get("status", "active"),
+                     item["added_at"]))
+                return cur.rowcount > 0
+        except Exception:
+            pass
+    # Session-state fallback
     key = _dev_plan_items_key(athlete_name)
     items = list(st.session_state.get(key, []))
     if any(existing.get("id") == item.get("id") for existing in items):
         return False
-    item.setdefault("added_at", datetime.now(timezone.utc).isoformat())
-    item.setdefault("status", "active")
     items.append(item)
     st.session_state[key] = items
     return True
 
 
 def _dev_plan_remove_item(athlete_name: str, item_id: str):
+    ath_id = _dev_plan_current_athlete_id()
+    if ath_id is not None:
+        try:
+            init_db()
+            with _db_conn() as c:
+                c.execute(
+                    "DELETE FROM dev_plan_items "
+                    "WHERE athlete_id = ? AND item_id = ?",
+                    (ath_id, item_id))
+            return
+        except Exception:
+            pass
     key = _dev_plan_items_key(athlete_name)
     items = [i for i in st.session_state.get(key, [])
               if i.get("id") != item_id]
@@ -17980,6 +18420,20 @@ def _dev_plan_remove_item(athlete_name: str, item_id: str):
 
 
 def _dev_plan_toggle_status(athlete_name: str, item_id: str):
+    ath_id = _dev_plan_current_athlete_id()
+    if ath_id is not None:
+        try:
+            init_db()
+            with _db_conn() as c:
+                # Flip status in one statement (active ↔ done)
+                c.execute(
+                    "UPDATE dev_plan_items SET status = "
+                    "CASE WHEN status = 'done' THEN 'active' ELSE 'done' END "
+                    "WHERE athlete_id = ? AND item_id = ?",
+                    (ath_id, item_id))
+            return
+        except Exception:
+            pass
     key = _dev_plan_items_key(athlete_name)
     items = list(st.session_state.get(key, []))
     for i in items:
@@ -20953,7 +21407,8 @@ def main():
         # Primary CTA: PDF report (this is what coaches text/email parents)
         try:
             pdf_bytes = generate_pbr_pdf(df, athlete_name, athlete_hand, athlete_class,
-                                          sport=athlete_sport, athlete_level=athlete_level)
+                                          sport=athlete_sport, athlete_level=athlete_level,
+                                          athlete_id=active_athlete_id)
             st.download_button(
                 "📄  Download Post-Bullpen Report (PDF) — text or email to parent",
                 data=pdf_bytes,
@@ -20980,6 +21435,22 @@ def main():
             )
         except Exception as e:
             st.caption(f"Action plan PDF generation issue: `{type(e).__name__}: {e}`.")
+
+        # Recruiting / scout report — clean one-pager for college coaches
+        try:
+            rec_pdf = generate_recruiting_pdf(
+                df, athlete_name, athlete_hand, athlete_class,
+                sport=athlete_sport, athlete_level=athlete_level)
+            st.download_button(
+                "🎯  Download Recruiting / Scout Report (PDF) — "
+                "share with college coaches",
+                data=rec_pdf,
+                file_name=f"{athlete_name.replace(' ', '_')}_Recruiting_{pd.Timestamp.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.caption(f"Recruiting PDF generation issue: `{type(e).__name__}: {e}`.")
 
         col_e1, col_e2 = st.columns(2)
         with col_e1:
