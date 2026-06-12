@@ -2330,6 +2330,322 @@ def session_kpis(df: pd.DataFrame) -> dict:
     }
 
 
+# =============================================================================
+# DRIVELINE-STYLE PHASE-BY-PHASE MECHANICS SCORING
+# =============================================================================
+# Five canonical pitching phases — Leg Lift, Buildup, Landing, Rotation,
+# Launch/Release — each scored 0-100 against pro-style ideal ranges
+# (sport-aware: baseball overhand vs softball windmill).
+#
+# The numeric thresholds below come from a blend of:
+#   - Driveline's published biomechanics reports
+#   - ASMI (American Sports Medicine Institute) pitching norms
+#   - Softball biomech literature (Werner/Jindrich/etc) for windmill
+#
+# Each metric defines (weak, target, elite) cutoffs. Scoring is linear
+# inside each band — a clean, consistent 100-point scale across phases.
+# =============================================================================
+
+# Phase metadata: ordered list, each with a code + label + goal + the
+# metrics that contribute to it.
+BIOMECH_PHASES = [
+    {
+        "code":  "leg_lift",
+        "label": "Leg Lift",
+        "goal":  ("Raise the lead leg to peak with a stable center of mass "
+                   "and a coiled back hip. Posture matters more than height."),
+        "metrics": ["arm_slot_consistency"],   # proxy — see notes in compute fn
+    },
+    {
+        "code":  "buildup",
+        "label": "Buildup / Momentum",
+        "goal":  ("Descend from leg lift and DRIVE down the mound — high "
+                   "ground force, stable back hip. Builds the energy pool the "
+                   "rotation will spend."),
+        "metrics": ["extension", "back_hip_stability"],
+    },
+    {
+        "code":  "landing",
+        "label": "Landing (Foot Strike)",
+        "goal":  ("Front foot lands with HIPS OPEN to the target but "
+                   "SHOULDERS CLOSED. Wide hip-shoulder separation = "
+                   "rubber-band torque coming in the rotation phase."),
+        "metrics": ["hip_shoulder_sep", "footplant_trunk_rot"],
+    },
+    {
+        "code":  "rotation",
+        "label": "Lower & Upper Rotation",
+        "goal":  ("Hips rotate first → core follows → shoulders fire last. "
+                   "Sequencing is what separates 80 mph from 95 mph. "
+                   "Higher trunk angular velocity = better delivery snap."),
+        "metrics": ["trunk_angular_vel", "release_trunk_rot"],
+    },
+    {
+        "code":  "launch",
+        "label": "Launch / Release",
+        "goal":  ("Stiff front leg brakes forward momentum so all energy "
+                   "transfers UP into the ball. Lead-knee extension + trunk "
+                   "tilt + clean arm slot together produce velocity AND "
+                   "command."),
+        "metrics": ["lead_knee_ext", "release_extension", "arm_slot",
+                     "elbow_stress_inverse"],
+    },
+]
+
+
+def _biomech_thresholds(sport: str = "Baseball") -> dict:
+    """Return per-metric (weak, target, elite) thresholds. Sport-aware:
+    softball windmill mechanics use different magnitudes than baseball
+    overhand."""
+    is_sb = (sport or "Baseball").lower().startswith("softball")
+    if is_sb:
+        return {
+            # Hip-shoulder separation: windmill numbers run lower than overhand
+            "hip_shoulder_sep":    (35, 42, 50),
+            # Trunk rotation at foot-plant: lower = chest stays closed = good
+            "footplant_trunk_rot": (45, 32, 22),    # inverted band: lower is better
+            # Lead knee extension at release
+            "lead_knee_ext":       (142, 150, 158),
+            # Release extension (less meaningful for windmill but kept for parity)
+            "release_extension":   (5.5, 6.0, 6.5),
+            # Arm slot consistency (range across pitches; lower = better)
+            "arm_slot":            (8, 5, 3),       # inverted band
+            # Trunk angular velocity at release
+            "trunk_angular_vel":   (700, 850, 1000),
+            "release_trunk_rot":   (88, 98, 108),
+            # Elbow stress (windmill unloads UCL — lower numbers normal)
+            "elbow_stress_inverse":(45, 36, 28),    # inverted band
+            # Proxies (use defaults when not measured directly)
+            "arm_slot_consistency":(8, 5, 3),       # inverted
+            "back_hip_stability":  None,            # not measured yet
+            "extension":           (5.5, 6.0, 6.5),
+        }
+    return {
+        # Baseball thresholds
+        "hip_shoulder_sep":    (48, 55, 65),
+        "footplant_trunk_rot": (55, 40, 30),       # inverted (lower=better)
+        "lead_knee_ext":       (145, 152, 160),
+        "release_extension":   (6.0, 6.5, 7.0),
+        "arm_slot":            (8, 5, 3),          # inverted
+        "trunk_angular_vel":   (950, 1100, 1300),
+        "release_trunk_rot":   (95, 102, 110),
+        "elbow_stress_inverse":(65, 53, 45),       # inverted
+        "arm_slot_consistency":(8, 5, 3),          # inverted
+        "back_hip_stability":  None,
+        "extension":           (6.0, 6.5, 7.0),
+    }
+
+
+def _score_metric_value(value, band: tuple | None,
+                          inverted: bool = False) -> int | None:
+    """Score a single metric 0-100 against (weak, target, elite) band.
+
+    inverted=True means LOWER values are better (e.g. trunk_rot at foot
+    plant, arm-slot range, elbow stress). In that case `band` is read
+    as (high_warning, target, elite_low).
+    """
+    if value is None or band is None:
+        return None
+    weak, target, elite = band
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not inverted:
+        if v >= elite:
+            return min(100, int(round(95 + (v - elite) / max(1, elite) * 5)))
+        if v >= target:
+            return int(round(80 + (v - target) / max(0.01, elite - target) * 15))
+        if v >= weak:
+            return int(round(55 + (v - weak) / max(0.01, target - weak) * 25))
+        return max(15, int(round(55 - (weak - v) * 1.5)))
+    # Inverted scoring — smaller is better
+    if v <= elite:
+        return min(100, int(round(95 + (elite - v) / max(1, elite) * 5)))
+    if v <= target:
+        return int(round(80 + (target - v) / max(0.01, target - elite) * 15))
+    if v <= weak:
+        return int(round(55 + (weak - v) / max(0.01, weak - target) * 25))
+    return max(15, int(round(55 - (v - weak) * 1.5)))
+
+
+_INVERTED_METRICS = {
+    "footplant_trunk_rot",   # lower = chest stays closed
+    "arm_slot",               # lower variance = more consistent
+    "arm_slot_consistency",
+    "elbow_stress_inverse",
+}
+
+
+def compute_phase_scores(df: pd.DataFrame, sport: str = "Baseball") -> dict:
+    """Compute Driveline-style 0-100 scores for each pitching phase.
+
+    Returns: {
+        "phases": [
+            {"code", "label", "goal", "score" (int|None),
+             "status" ("elite"/"strong"/"average"/"watch"),
+             "metrics": [{"key", "label", "value", "score", "unit"}, ...]},
+            ...
+        ],
+        "overall": int — average across phases that have a score,
+    }
+    """
+    bands = _biomech_thresholds(sport)
+
+    def avg(col):
+        if col not in df.columns: return None
+        s = df[col].dropna()
+        return float(s.mean()) if len(s) else None
+
+    def col_range(col):
+        if col not in df.columns: return None
+        s = df[col].dropna()
+        return float(s.max() - s.min()) if len(s) >= 2 else None
+
+    # Pull raw values
+    knee_ext   = avg("Release_Lead_Knee_Ext")
+    hs_sep     = avg("Peak_Hip_Shoulder_Sep")
+    fp_trunk   = avg("FootPlant_Trunk_Rot")
+    extension  = avg("Extension_ft")
+    arm_slot_r = col_range("Arm_Slot_deg")
+    trunk_vel  = avg("Peak_Trunk_Angular_Vel")
+    rel_trunk  = avg("Release_Trunk_Rot")
+    valgus     = avg("Peak_Valgus_Nm")
+
+    # Metric → (raw value, label, unit) for surface display
+    metric_inputs = {
+        "hip_shoulder_sep":      (hs_sep,    "Hip-shoulder separation",  "°"),
+        "footplant_trunk_rot":   (fp_trunk,  "Trunk rotation at foot-plant", "°"),
+        "lead_knee_ext":         (knee_ext,  "Lead-knee extension at release", "°"),
+        "release_extension":     (extension, "Release extension",        " ft"),
+        "extension":             (extension, "Forward momentum (extension)", " ft"),
+        "arm_slot":              (arm_slot_r,"Arm-slot variance",        "°"),
+        "arm_slot_consistency":  (arm_slot_r,"Arm-slot consistency",     "°"),
+        "trunk_angular_vel":     (trunk_vel, "Trunk angular velocity",   "°/s"),
+        "release_trunk_rot":     (rel_trunk, "Trunk rotation at release","°"),
+        "elbow_stress_inverse":  (valgus,    "Elbow stress (lower is better)", " Nm"),
+        "back_hip_stability":    (None,      "Back-hip stability",       ""),
+    }
+
+    phases_out = []
+    for phase in BIOMECH_PHASES:
+        metric_rows = []
+        scores = []
+        for mkey in phase["metrics"]:
+            val, label, unit = metric_inputs.get(mkey, (None, mkey, ""))
+            band = bands.get(mkey)
+            inverted = mkey in _INVERTED_METRICS
+            score = _score_metric_value(val, band, inverted=inverted)
+            if score is not None:
+                scores.append(score)
+            metric_rows.append({
+                "key":   mkey,
+                "label": label,
+                "value": val,
+                "unit":  unit,
+                "score": score,
+            })
+        phase_score = (int(round(sum(scores) / len(scores)))
+                          if scores else None)
+        if phase_score is None:
+            status = "no_data"
+        elif phase_score >= 90:
+            status = "elite"
+        elif phase_score >= 75:
+            status = "strong"
+        elif phase_score >= 60:
+            status = "average"
+        else:
+            status = "watch"
+        phases_out.append({
+            "code":    phase["code"],
+            "label":   phase["label"],
+            "goal":    phase["goal"],
+            "score":   phase_score,
+            "status":  status,
+            "metrics": metric_rows,
+        })
+
+    scored = [p["score"] for p in phases_out if p["score"] is not None]
+    overall = int(round(sum(scored) / len(scored))) if scored else None
+    return {"phases": phases_out, "overall": overall}
+
+
+# Map each phase-contributing metric to (problem description, drill key)
+# for actionable feedback. Drills are pulled from DRILL_LIBRARY.
+PHASE_METRIC_IMPROVEMENTS = {
+    "arm_slot_consistency": (
+        "Arm slot is varying too much across pitches. Coaches read this as "
+        "an unrepeatable delivery — release point moves, command suffers, "
+        "and tunneling breaks down.",
+        "arm_slot_variance"),
+    "extension": (
+        "Release extension is short. You're letting the ball go too early "
+        "in the delivery — the hitter sees the ball longer, so it 'plays' "
+        "slower than the radar reads.",
+        "low_extension"),
+    "release_extension": (
+        "Release extension is short. Long stride + reach out front adds "
+        "perceived velocity without any other change to the delivery.",
+        "low_extension"),
+    "hip_shoulder_sep": (
+        "Hip-shoulder separation is low. Hips and shoulders are firing "
+        "together instead of in sequence — no rubber-band torque means "
+        "less velocity ceiling.",
+        "low_hip_shoulder_separation"),
+    "footplant_trunk_rot": (
+        "Chest is opening early at foot-plant. Front-side opens before "
+        "the back hip fires — energy leaks AND elbow stress climbs.",
+        "early_trunk_rotation"),
+    "lead_knee_ext": (
+        "Soft front leg at release. The lead knee is collapsing under "
+        "load instead of bracing — energy that should drive the ball "
+        "is absorbed sideways.",
+        "soft_lead_knee"),
+    "arm_slot": (
+        "Arm slot is varying across pitches. Consistent slot = "
+        "consistent release point = better command + tunneling.",
+        "arm_slot_variance"),
+    "trunk_angular_vel": (
+        "Trunk angular velocity is below pro-tier numbers. Sequencing "
+        "drills + rotational power work are the path to a snappier "
+        "delivery and more velocity at release.",
+        "early_trunk_rotation"),
+    "release_trunk_rot": (
+        "Trunk rotation at release isn't completing — you're not finishing "
+        "the rotation fully through the ball.",
+        "early_trunk_rotation"),
+    "elbow_stress_inverse": (
+        "Elbow valgus stress is elevated. Decel work + recovery PLUS "
+        "checking for early trunk rotation (the #1 stress driver) is "
+        "the prescription.",
+        "high_valgus_stress"),
+}
+
+
+def phase_improvement_actions(phase: dict) -> list:
+    """For one phase, return a list of (metric, score, problem, drill_key)
+    tuples for the WEAK contributing metrics (score < 75). Empty list if
+    the phase is already strong."""
+    actions = []
+    for m in phase.get("metrics", []):
+        score = m.get("score")
+        if score is None or score >= 75:
+            continue
+        key = m["key"]
+        if key not in PHASE_METRIC_IMPROVEMENTS:
+            continue
+        problem, drill_key = PHASE_METRIC_IMPROVEMENTS[key]
+        actions.append({
+            "metric_key":   key,
+            "metric_label": m["label"],
+            "score":        score,
+            "problem":      problem,
+            "drill_key":    drill_key,
+        })
+    return actions
+
+
 def analyze_mechanics(df: pd.DataFrame, sport: str = "Baseball") -> dict:
     """Inspect biomech columns and produce strengths + weaknesses, each
     tied to a specific gain category (velocity / control / movement / injury).
@@ -3719,16 +4035,25 @@ def _build_tunnel_batter_view(tunnel_data: dict, sport: str = "Baseball",
     x_title = "Plate Side (ft) — catcher's view" if not mirror_x else \
               "Plate Side (ft) — pitcher's view (mirrored)"
 
+    # Match the new portrait Z range on the main strike zone chart so
+    # the plate + zone read identically across the app. scaleanchor=x
+    # locks 1 ft of horizontal to the same pixel count as 1 ft of
+    # vertical — without it, container-width stretching squashes the
+    # strike zone into a wide-short rectangle that doesn't match real
+    # plate proportions.
     fig.update_layout(
         title=dict(text=title, font=dict(size=13, color="#1a2150")),
         xaxis=dict(title=x_title, range=(-2.0, 2.0),
                     zeroline=False, showgrid=False,
-                    fixedrange=True, autorange=False),
-        # Range now reaches 7.5 ft so the release point (z≈6) is visible
+                    fixedrange=True, autorange=False,
+                    constrain="domain"),
+        # Z range covers release height (z≈6) and the plate area.
         yaxis=dict(title="Height (ft)", range=(-0.5, 7.5),
                     zeroline=False, showgrid=False,
-                    fixedrange=True, autorange=False),
-        height=560, plot_bgcolor="white",
+                    fixedrange=True, autorange=False,
+                    scaleanchor="x", scaleratio=1,
+                    constrain="domain"),
+        height=720, plot_bgcolor="white",
         margin=dict(l=20, r=20, t=50, b=40),
         dragmode=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.05),
@@ -20907,6 +21232,204 @@ def main():
                 "Rapsodo provides it directly; Pitch Logic data gets a projected location "
                 "from release point + break (approximate)."
             )
+
+        # ===== MECHANICS REPORT CARD — Driveline-style phase scoring =====
+        ph_scores = compute_phase_scores(df, sport=athlete_sport)
+        if ph_scores and any(p["score"] is not None for p in ph_scores["phases"]):
+            st.divider()
+            st.subheader("Mechanics Report Card")
+            st.caption(
+                "Driveline-style phase scoring (0-100). Each phase is "
+                "rated against pro-style ideal ranges from the pose data. "
+                "Hover a metric for the value driving the score.")
+            # Headline strip: overall score + sport label
+            ov = ph_scores.get("overall")
+            ov_color = ("#10b981" if (ov or 0) >= 85 else
+                         "#fbbf24" if (ov or 0) >= 70 else
+                         "#f59e0b" if (ov or 0) >= 55 else
+                         "#ef4444")
+            st.markdown(
+                f"<div style='display:flex;gap:16px;align-items:stretch;"
+                f"margin:8px 0 12px 0;flex-wrap:wrap;'>"
+                f"<div style='flex:0 0 auto;min-width:180px;"
+                f"background:#1e293b;border:1px solid #334155;"
+                f"border-left:4px solid {ov_color};border-radius:10px;"
+                f"padding:14px 18px;'>"
+                f"<div style='font-size:11px;letter-spacing:0.10em;"
+                f"font-weight:700;color:#94a3b8;text-transform:uppercase;'>"
+                f"Overall Score</div>"
+                f"<div style='font-size:36px;font-weight:800;color:#f1f5f9;"
+                f"line-height:1.0;margin-top:6px;'>"
+                f"{ov if ov is not None else '—'}"
+                f"<span style='font-size:13px;color:#94a3b8;"
+                f"font-weight:500;'>/100</span></div>"
+                f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>"
+                f"vs. pro-style benchmarks · {athlete_sport.lower()}"
+                f"</div></div></div>",
+                unsafe_allow_html=True)
+
+            # Phase cards (one row of 5; collapses on phone)
+            phase_cols = st.columns(len(ph_scores["phases"]))
+            for col, ph in zip(phase_cols, ph_scores["phases"]):
+                _label_map = {
+                    "elite":   ("ELITE",    "#10b981"),
+                    "strong":  ("STRONG",   "#3b82f6"),
+                    "average": ("AVERAGE",  "#fbbf24"),
+                    "watch":   ("WATCH",    "#ef4444"),
+                    "no_data": ("NO DATA",  "#64748b"),
+                }
+                status_label, status_color = _label_map[ph["status"]]
+                with col:
+                    score_str = (f"{ph['score']}" if ph["score"] is not None
+                                  else "—")
+                    st.markdown(
+                        f"<div style='background:#1e293b;border:1px solid "
+                        f"#334155;border-top:4px solid {status_color};"
+                        f"border-radius:10px;padding:12px 14px;"
+                        f"height:100%;box-sizing:border-box;'>"
+                        f"<div style='font-size:10px;letter-spacing:0.10em;"
+                        f"font-weight:700;color:{status_color};"
+                        f"text-transform:uppercase;'>{status_label}</div>"
+                        f"<div style='font-size:13px;font-weight:700;"
+                        f"color:#f1f5f9;margin-top:2px;line-height:1.25;'>"
+                        f"{ph['label']}</div>"
+                        f"<div style='font-size:28px;font-weight:800;"
+                        f"color:#f1f5f9;margin:6px 0 2px 0;line-height:1.0;'>"
+                        f"{score_str}"
+                        f"<span style='font-size:11px;color:#94a3b8;"
+                        f"font-weight:500;'>/100</span></div>"
+                        f"<div style='font-size:11px;color:#cbd5e1;"
+                        f"line-height:1.45;margin-top:6px;'>"
+                        f"{ph['goal']}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True)
+
+            # Per-phase contributing metrics, in expanders
+            with st.expander("See the metrics behind each phase score",
+                               expanded=False):
+                for ph in ph_scores["phases"]:
+                    st.markdown(
+                        f"**{ph['label']}** — "
+                        + (f"phase score **{ph['score']}/100**"
+                              if ph['score'] is not None
+                              else "no contributing data yet"))
+                    if ph["metrics"]:
+                        for m in ph["metrics"]:
+                            v = m["value"]
+                            v_str = (f"{v:.1f}{m['unit']}"
+                                       if isinstance(v, (int, float))
+                                       else "—")
+                            s_str = (f"{m['score']}/100"
+                                       if m["score"] is not None
+                                       else "(not measured this session)")
+                            st.markdown(
+                                f"- {m['label']}: **{v_str}** · {s_str}")
+                    st.markdown("")
+
+            # ===== How to raise the score — per-phase actionable feedback =====
+            improvement_blocks = []
+            for ph in ph_scores["phases"]:
+                actions = phase_improvement_actions(ph)
+                if actions:
+                    improvement_blocks.append((ph, actions))
+
+            if improvement_blocks:
+                st.markdown(
+                    "<div style='font-size:11px;letter-spacing:0.10em;"
+                    "font-weight:700;color:#d4a634;text-transform:uppercase;"
+                    "margin:14px 0 4px 0;'>"
+                    "How to raise this score</div>",
+                    unsafe_allow_html=True)
+                st.caption(
+                    "For every phase below 75/100, here's the specific "
+                    "metric dragging it down + the drill that fixes it. "
+                    "Tap '+ Add to action plan' to commit the drill to "
+                    "this athlete's weekly work.")
+
+                for ph, actions in improvement_blocks:
+                    # Phase heading strip
+                    st.markdown(
+                        f"<div style='background:#1e293b;border:1px solid "
+                        f"#334155;border-left:4px solid #f59e0b;"
+                        f"border-radius:8px;padding:10px 14px;"
+                        f"margin:12px 0 6px 0;'>"
+                        f"<div style='font-size:11px;letter-spacing:0.08em;"
+                        f"font-weight:700;color:#f59e0b;text-transform:uppercase;'>"
+                        f"{ph['label']} — score {ph['score']}/100</div>"
+                        f"</div>",
+                        unsafe_allow_html=True)
+                    for act in actions:
+                        drill = DRILL_LIBRARY.get(act["drill_key"], {})
+                        drill_block = ""
+                        if drill:
+                            drill_block = (
+                                f"<div style='margin-top:8px;padding-top:8px;"
+                                f"border-top:1px dashed #334155;'>"
+                                f"<div style='font-size:11px;letter-spacing:0.08em;"
+                                f"font-weight:700;color:#10b981;"
+                                f"text-transform:uppercase;margin-bottom:2px;'>"
+                                f"Drill — {drill.get('label', act['drill_key'])}"
+                                f"</div>"
+                                f"<div style='font-size:13px;color:#f1f5f9;"
+                                f"line-height:1.5;'>{drill.get('drill', '')}</div>"
+                                f"<div style='font-size:12px;color:#cbd5e1;"
+                                f"line-height:1.5;margin-top:4px;'>"
+                                f"<b>Protocol:</b> {drill.get('protocol', '')}"
+                                f"</div>"
+                                f"<div style='font-size:11px;color:#94a3b8;"
+                                f"font-style:italic;margin-top:3px;'>"
+                                f"{drill.get('why', '')}</div>"
+                                f"</div>")
+                        st.markdown(
+                            f"<div style='background:#1e293b;border:1px solid "
+                            f"#334155;border-radius:8px;padding:12px 14px;"
+                            f"margin:6px 0 10px 0;'>"
+                            f"<div style='display:flex;gap:8px;align-items:center;"
+                            f"margin-bottom:6px;flex-wrap:wrap;'>"
+                            f"<span style='background:#ef4444;color:white;"
+                            f"padding:2px 8px;border-radius:10px;font-size:10px;"
+                            f"font-weight:700;letter-spacing:0.06em;'>"
+                            f"WEAK · {act['score']}/100</span>"
+                            f"<span style='color:#f1f5f9;font-weight:700;"
+                            f"font-size:14px;'>{act['metric_label']}</span>"
+                            f"</div>"
+                            f"<div style='color:#cbd5e1;font-size:13px;"
+                            f"line-height:1.6;'>{act['problem']}</div>"
+                            f"{drill_block}"
+                            f"</div>",
+                            unsafe_allow_html=True)
+
+                        # "Add to action plan" button — pushes a SHAPE-type
+                        # item so it shows up alongside pitch-shaping work
+                        # at the top of the Action Plan tab.
+                        item_id = (
+                            f"mech::{ph['code']}::{act['metric_key']}"
+                            f"::{act['drill_key']}")
+                        existing = any(
+                            i.get("id") == item_id
+                            for i in _dev_plan_get_items(athlete_name))
+                        add_lbl = ("In your action plan ✓"
+                                    if existing else "+ Add to action plan")
+                        if st.button(
+                            add_lbl,
+                            key=f"mech_add_{ph['code']}_{act['metric_key']}",
+                            disabled=existing,
+                            use_container_width=False):
+                            _dev_plan_add_item(athlete_name, {
+                                "id":          item_id,
+                                "type":        "shape",
+                                "pitch":       ph["label"],
+                                "title":       f"{act['metric_label']} — fix this",
+                                "description": act["problem"],
+                                "grip_refs":   [],
+                                "drill_refs":  [act["drill_key"]],
+                                "direction":   "Mechanics fix",
+                            })
+                            st.success(
+                                f"Added '{act['metric_label']} — fix this' "
+                                "to your action plan.")
+                            st.rerun()
+            st.divider()
 
         # ===== MECHANICS CRITIQUE (moved here so the strike zone is up top) =====
         critique = analyze_mechanics(df, sport=athlete_sport)
