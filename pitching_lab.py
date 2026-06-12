@@ -8727,6 +8727,80 @@ def _render_pitch_detail_panel(pitch: pd.Series, athlete_name: str = "",
     c7.metric("Extension", f"{pitch['Extension_ft']:.1f} ft" if pd.notna(pitch.get('Extension_ft')) else "—")
     c8.metric("Release Height", f"{pitch['Release_Height_ft']:.1f} ft" if pd.notna(pitch.get('Release_Height_ft')) else "—")
 
+    # ===== Spin Axis tilt clock =====
+    # Show the actual measured axis next to the ideal axis for the
+    # currently-labeled pitch type. Green wedge = ideal band, blue
+    # arrow = actual. Coaches use this to spot "gyro-heavy" sliders
+    # (axis way off the 9:00 ideal) or "drifting" fastballs (axis
+    # tilted toward 2:00 instead of 12:30).
+    actual_axis = pitch.get("Spin_Axis_Deg")
+    actual_clock = pitch.get("Spin_Direction_hhmm")
+    if pd.notna(actual_axis) or (isinstance(actual_clock, str) and actual_clock):
+        try:
+            if (not pd.notna(actual_axis)) and isinstance(actual_clock, str):
+                actual_axis = spin_clock_to_degrees(actual_clock)
+        except Exception:
+            pass
+        ax_b = PITCH_AXIS_BASELINES.get(pitch.get("Pitch_Type") or "")
+        with st.expander("Spin axis on the ball — actual vs ideal",
+                            expanded=False):
+            ax_col1, ax_col2 = st.columns([1, 1.4])
+            with ax_col1:
+                png = _render_spin_axis_ball_png(
+                    actual_deg=actual_axis,
+                    ideal_center_deg=(ax_b["center"] if ax_b else None),
+                    ideal_tolerance_deg=(ax_b["tolerance"]
+                                            if ax_b else 25),
+                    pitch_type_label=(pitch.get("Pitch_Type") or ""))
+                if png:
+                    st.image(png, use_container_width=True)
+                else:
+                    st.info("Tilt clock unavailable.")
+            with ax_col2:
+                if pd.notna(actual_axis):
+                    actual_label = axis_clock_label(actual_axis)
+                else:
+                    actual_label = "—"
+                if ax_b:
+                    ideal_label = axis_clock_label(ax_b["center"])
+                    tol = ax_b["tolerance"]
+                    gap = axis_angular_distance(actual_axis, ax_b["center"]) \
+                            if pd.notna(actual_axis) else None
+                    st.markdown(
+                        f"**Actual axis:** {actual_label} "
+                        f"({actual_axis:.0f}°)"
+                        if pd.notna(actual_axis) else "")
+                    st.markdown(
+                        f"**Ideal axis for {pitch.get('Pitch_Type', 'this pitch')}:** "
+                        f"{ideal_label} (±{tol}°)")
+                    if gap is not None:
+                        if gap <= tol:
+                            st.success(f"✓ Axis is within tolerance "
+                                          f"({gap:.0f}° off ideal — "
+                                          f"that's a clean tilt for "
+                                          f"this pitch type).")
+                        elif gap <= tol * 1.6:
+                            st.warning(
+                                f"⚠ Axis is {gap:.0f}° off ideal — "
+                                "outside the comfort band. Some Magnus "
+                                "force is bleeding into a less useful "
+                                "direction.")
+                        else:
+                            st.error(
+                                f"✗ Axis is {gap:.0f}° off ideal — way "
+                                "outside the comfort band. The pitch's "
+                                "spin is going to the wrong direction; "
+                                "the movement isn't matching the label.")
+                else:
+                    st.markdown(
+                        f"**Actual axis:** {actual_label} "
+                        f"({actual_axis:.0f}°)"
+                        if pd.notna(actual_axis) else "")
+                    st.caption(
+                        "No axis ideal defined for this pitch type "
+                        "(e.g. gyroball or knuckleball — axis isn't a "
+                        "meaningful target).")
+
     # Mechanics (if PPAI present)
     if pd.notna(pitch.get("Peak_Hip_Shoulder_Sep")):
         st.markdown("**Mechanics at release:**")
@@ -18742,6 +18816,68 @@ PITCH_TARGETS = {
 }
 
 
+# =====================================================================
+# SPIN AXIS / TILT — clock-position ideals per pitch type
+# Convention: 12:00 = 0°, clockwise. RHP-keyed; LHP axes are mirrored
+# around the vertical (12:00 ↔ 6:00) line at classify time.
+# Stored as (center_deg, tolerance_deg). Pitches without a meaningful
+# axis (gyroball, knuckleball) are set to None — classifier skips axis
+# scoring for those.
+# =====================================================================
+PITCH_AXIS_BASELINES = {
+    # Baseball — RHP convention
+    "Four-Seam Fastball":   {"center": 15,  "tolerance": 30},   # 12:30
+    "Two-Seam Fastball":    {"center": 45,  "tolerance": 25},   # 1:30
+    "Sinker":               {"center": 60,  "tolerance": 25},   # 2:00
+    "One-Seam Fastball":    {"center": 30,  "tolerance": 30},   # 1:00
+    "Cutter":               {"center": 345, "tolerance": 20},   # 11:30
+    "Slider":               {"center": 255, "tolerance": 25},   # 8:30
+    "Sweeper":              {"center": 270, "tolerance": 20},   # 9:00
+    "Slurve":               {"center": 240, "tolerance": 25},   # 8:00
+    "Curveball":            {"center": 195, "tolerance": 25},   # 6:30
+    "Knuckle Curve":        {"center": 200, "tolerance": 20},   # 6:40
+    "Changeup":             {"center": 60,  "tolerance": 25},   # 2:00
+    "Splitter":             {"center": 45,  "tolerance": 30},   # 1:30
+    "Churve":               {"center": 135, "tolerance": 25},   # 4:30
+    "Screwball":            {"center": 120, "tolerance": 25},   # 4:00
+    "Gyroball":             None,    # bullet spin — no meaningful clock axis
+    "Knuckleball":          None,    # near-zero spin — axis is random
+    # Softball — windmill mechanics, different axis conventions
+    "Softball Fastball":    {"center": 0,   "tolerance": 25},   # 12:00 backspin-ish
+    "Rise Ball":            {"center": 0,   "tolerance": 15},   # pure 12:00 backspin
+    "Drop Ball":            {"center": 180, "tolerance": 20},   # 6:00 topspin (peel)
+    "Curveball (softball)": {"center": 255, "tolerance": 25},   # 8:30
+    "Screwball (softball)": {"center": 105, "tolerance": 25},   # 3:30
+    "Change-Up":            {"center": 300, "tolerance": 30},   # 10:00 dead-spin
+}
+
+
+def axis_clock_label(deg) -> str:
+    """Convert spin axis degrees → human-readable clock string (e.g. 15° → '12:30')."""
+    if deg is None:
+        return "—"
+    try:
+        d = float(deg) % 360
+    except Exception:
+        return "—"
+    hour = int(d // 30) % 12
+    if hour == 0: hour = 12
+    minute = int(round((d % 30) / 0.5))
+    if minute >= 60:
+        hour = (hour % 12) + 1
+        minute -= 60
+    return f"{hour}:{minute:02d}"
+
+
+def axis_angular_distance(a, b) -> float:
+    """Smallest angular gap between two axis degrees (handles wrap-around).
+    Returns a value in [0, 180]."""
+    if a is None or b is None:
+        return 0.0
+    diff = abs((float(a) - float(b)) % 360)
+    return min(diff, 360 - diff)
+
+
 def _resolve_pitch_target(pitch_type, sport: str = "Baseball"):
     """Find the closest matching PITCH_TARGETS entry for a label.
 
@@ -19018,7 +19154,8 @@ def _build_arsenal_movement_chart(df, sport: str = "Baseball",
 def classify_pitch(velo, spin, v_break, h_break,
                       sport: str = "Baseball",
                       hand_is_right: bool = True,
-                      spin_eff=None) -> str | None:
+                      spin_eff=None,
+                      spin_axis_deg=None) -> str | None:
     """Auto-classify a pitch from its measured metrics.
 
     Picks the CLOSEST match in PITCH_TARGETS — never returns None unless
@@ -19066,6 +19203,14 @@ def classify_pitch(velo, spin, v_break, h_break,
     # Mirror h_break for LHP so we compare against baselines as if RHP
     h_adj = (h_break if hand_is_right else -h_break) if h_break is not None else None
 
+    # Mirror spin axis for LHP around the 12:00 ↔ 6:00 axis line
+    # (RHP 15° = 12:30 ↔ LHP equivalent is 345° = 11:30, etc.)
+    if spin_axis_deg is not None:
+        axis_adj = (spin_axis_deg if hand_is_right
+                       else (360.0 - float(spin_axis_deg)) % 360.0)
+    else:
+        axis_adj = None
+
     best_key = None
     best_score = float("inf")
     for key, t in candidates:
@@ -19084,6 +19229,12 @@ def classify_pitch(velo, spin, v_break, h_break,
             score += 0.001 * (spin - b["spin"]) ** 2
         if spin_eff is not None and b.get("spin_eff") is not None:
             score += 0.05 * (spin_eff - b["spin_eff"]) ** 2
+        # Spin axis — moderately strong signal when present. A 30° axis
+        # miss adds 180 to the score (similar penalty to a 5 mph velo miss).
+        ax_b = PITCH_AXIS_BASELINES.get(key)
+        if axis_adj is not None and ax_b is not None:
+            ax_dist = axis_angular_distance(axis_adj, ax_b["center"])
+            score += 0.2 * ax_dist ** 2
         if score < best_score:
             best_score = score
             best_key = key
@@ -19120,10 +19271,192 @@ def auto_label_pitch_dataframe(df,
             row.get("Horiz_Break_in"),
             sport=sport,
             hand_is_right=hand_is_right,
-            spin_eff=row.get("Spin_Efficiency_pct"))
+            spin_eff=row.get("Spin_Efficiency_pct"),
+            spin_axis_deg=row.get("Spin_Axis_Deg"))
         if guess:
             df.at[idx, "Pitch_Type"] = guess
     return df
+
+
+def _render_spin_axis_ball_png(actual_deg, ideal_center_deg,
+                                   ideal_tolerance_deg=25,
+                                   width=360, height=360,
+                                   pitch_type_label: str = "") -> bytes | None:
+    """Render a baseball diagram with the spin axis drawn through it.
+
+    White ball with red horseshoe seams (catcher's view, batter's-eye
+    silhouette). A blue line through the ball shows the ACTUAL spin
+    axis with arrows on each end indicating rotation direction. A
+    dotted green ghost line shows the IDEAL axis for the pitch type
+    so a coach can see at a glance how far off the tilt is.
+
+    Spin axis convention: 0° = 12:00 (pure backspin, axis horizontal
+    through the ball's equator), rotating clockwise from the pitcher's
+    perspective. We render from the BATTER'S perspective so a 9:00 axis
+    (slider, RHP) appears as a line going from upper-left to lower-right.
+    """
+    if actual_deg is None and ideal_center_deg is None:
+        return None
+    try:
+        import plotly.graph_objects as go
+        import plotly.io as pio
+    except Exception:
+        return None
+
+    import math
+    fig = go.Figure()
+
+    # ---- Ball body — white circle with a subtle shadow rim ----
+    fig.add_shape(type="circle",
+                    x0=-1, x1=1, y0=-1, y1=1,
+                    line=dict(color="#1e293b", width=2),
+                    fillcolor="#f8fafc", layer="below")
+    # Inner shading for depth
+    fig.add_shape(type="circle",
+                    x0=-0.92, x1=0.92, y0=-0.92, y1=0.92,
+                    line=dict(color="rgba(0,0,0,0)", width=0),
+                    fillcolor="rgba(248,250,252,0.85)", layer="below")
+
+    # ---- Horseshoe seams — two red curves forming the classic baseball
+    # pattern from the batter's view. ----
+    # We draw the seams as two parametric curves. Each seam runs from
+    # one pole of the ball, swings out to the equator, and curves back
+    # to the other pole — the classic horseshoe profile.
+    def _seam_curve(side: int):
+        """side = +1 (right seam) or -1 (left seam)."""
+        xs, ys = [], []
+        for t in [i / 60 for i in range(61)]:
+            # Parametric S-curve — bulges out to ±0.55 ball radii
+            theta = -math.pi/2 + t * math.pi   # -90° to +90°
+            x = side * (0.42 + 0.18 * math.sin(2 * theta + math.pi/2))
+            y = math.sin(theta) * 0.88
+            xs.append(x)
+            ys.append(y)
+        return xs, ys
+
+    for side in (1, -1):
+        sx, sy = _seam_curve(side)
+        fig.add_trace(go.Scatter(
+            x=sx, y=sy, mode="lines",
+            line=dict(color="#c0142a", width=3.5),
+            hoverinfo="skip", showlegend=False,
+        ))
+        # Tiny stitching ticks along the seam (visual character)
+        for i in range(0, 61, 5):
+            # Outward normal direction at each stitch point
+            nx = side * (sx[i] - 0) / max(0.01, math.hypot(sx[i], sy[i]))
+            ny = sy[i] / max(0.01, math.hypot(sx[i], sy[i]))
+            tick_len = 0.04
+            fig.add_shape(type="line",
+                            x0=sx[i] - nx * tick_len/2,
+                            x1=sx[i] + nx * tick_len/2,
+                            y0=sy[i] - ny * tick_len/2,
+                            y1=sy[i] + ny * tick_len/2,
+                            line=dict(color="#c0142a", width=1.4),
+                            layer="above")
+
+    # ---- IDEAL axis — dotted green ghost line through the ball ----
+    if ideal_center_deg is not None:
+        # Convert axis-degrees to a line angle in the ball view.
+        # 0° (12:00) = axis horizontal through the ball's equator.
+        # The axis line is PERPENDICULAR to the spin direction, so
+        # at 0° we draw it horizontal (left-right). At 90° (3:00) we
+        # draw it vertical. Translate by adding 90° to the axis angle
+        # and treating the result as a line through the origin.
+        rad = math.radians(ideal_center_deg)
+        dx, dy = math.sin(rad), math.cos(rad)
+        # Endpoints span the ball
+        fig.add_shape(type="line",
+                        x0=-0.95 * dx, x1=0.95 * dx,
+                        y0=-0.95 * dy, y1=0.95 * dy,
+                        line=dict(color="#10b981", width=3, dash="dot"))
+        # Small "IDEAL" label at one end
+        fig.add_annotation(
+            x=1.05 * dx, y=1.05 * dy, text="IDEAL",
+            showarrow=False,
+            font=dict(color="#10b981", size=11,
+                          family="Inter, sans-serif"),
+            xanchor="center", yanchor="middle",
+            bgcolor="rgba(15,23,42,0.85)", borderpad=2)
+
+    # ---- ACTUAL axis — solid blue line with arrowheads at both ends
+    # indicating the spin direction. ----
+    if actual_deg is not None:
+        rad = math.radians(float(actual_deg))
+        dx, dy = math.sin(rad), math.cos(rad)
+        # The axis line through the ball
+        fig.add_shape(type="line",
+                        x0=-0.88 * dx, x1=0.88 * dx,
+                        y0=-0.88 * dy, y1=0.88 * dy,
+                        line=dict(color="#1d4ed8", width=5))
+        # Arrowheads on each end as small triangles (rotation direction
+        # by right-hand rule — for the +end the rotation curls one way,
+        # for the -end the other)
+        fig.add_trace(go.Scatter(
+            x=[0.88 * dx], y=[0.88 * dy],
+            mode="markers",
+            marker=dict(size=18, color="#1d4ed8", symbol="triangle-up",
+                          angle=actual_deg,
+                          line=dict(color="#dbeafe", width=2)),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[-0.88 * dx], y=[-0.88 * dy],
+            mode="markers",
+            marker=dict(size=18, color="#1d4ed8", symbol="triangle-down",
+                          angle=actual_deg,
+                          line=dict(color="#dbeafe", width=2)),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+        # Curved rotation arrow — small arc showing spin direction
+        # (clockwise from the catcher's POV). Drawn near the front of
+        # the ball.
+        arc_pts_x, arc_pts_y = [], []
+        # The rotation plane is perpendicular to the axis. For the arc,
+        # we draw it in the plane of the screen orbiting the axis line.
+        # Arc center on the axis line at 60% out from origin.
+        cx, cy = 0.50 * dx, 0.50 * dy
+        # Tangent direction (perpendicular to axis in 2D)
+        tx, ty = -dy, dx
+        for t in [i / 24 for i in range(25)]:
+            ang = (t - 0.5) * math.pi * 0.85   # ~150° arc
+            ax = cx + 0.28 * (math.cos(ang) * tx + math.sin(ang) * dx)
+            ay = cy + 0.28 * (math.cos(ang) * ty + math.sin(ang) * dy)
+            arc_pts_x.append(ax)
+            arc_pts_y.append(ay)
+        fig.add_trace(go.Scatter(
+            x=arc_pts_x, y=arc_pts_y, mode="lines",
+            line=dict(color="#fbbf24", width=2.5),
+            hoverinfo="skip", showlegend=False,
+        ))
+        # Arrowhead on the rotation arc to show direction
+        fig.add_trace(go.Scatter(
+            x=[arc_pts_x[-1]], y=[arc_pts_y[-1]],
+            mode="markers",
+            marker=dict(size=14, color="#fbbf24",
+                          line=dict(color="#fef3c7", width=1.5)),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    fig.update_layout(
+        paper_bgcolor="#0f172a", plot_bgcolor="#0f172a",
+        margin=dict(l=20, r=20, t=20, b=20),
+        showlegend=False,
+        xaxis=dict(range=[-1.35, 1.35], visible=False,
+                     fixedrange=True, constrain="domain"),
+        yaxis=dict(range=[-1.35, 1.35], visible=False,
+                     fixedrange=True, scaleanchor="x", scaleratio=1,
+                     constrain="domain"),
+        width=width, height=height,
+    )
+
+    try:
+        png = pio.to_image(fig, format="png", width=width, height=height,
+                              scale=2)
+        return png
+    except Exception:
+        return None
 
 
 def update_pitch_type_in_session(session_id: int, pitch_num: int,
