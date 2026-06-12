@@ -8578,8 +8578,15 @@ def _build_strike_zone_figure(df: pd.DataFrame,
 
 
 def _render_pitch_detail_panel(pitch: pd.Series, athlete_name: str = "",
-                               sport: str = "Baseball"):
-    """Render the per-pitch detail card with outlier badge, metrics, video, grip."""
+                               sport: str = "Baseball",
+                               session_id: int | None = None,
+                               athlete_hand: str = "Right"):
+    """Render the per-pitch detail card with outlier badge, metrics, video, grip.
+
+    When `session_id` is provided, also renders a Pitch Type relabel
+    dropdown that writes the new label back to the saved session.
+    Used to correct auto-classifier mistakes.
+    """
     # Outlier badge
     if pitch["Outlier_Type"] == "positive":
         badge_color, badge_text = "#16a34a", "✓ POSITIVE OUTLIER"
@@ -8598,6 +8605,111 @@ def _render_pitch_detail_panel(pitch: pd.Series, athlete_name: str = "",
     )
     if pitch.get("Outlier_Reasons"):
         st.caption(f"**Why flagged:** {pitch['Outlier_Reasons']}")
+
+    # ===== Pitch type relabel (correct an auto-classifier guess) =====
+    if session_id is not None:
+        # Build sport-appropriate list of pitch labels — same names the
+        # rest of the app uses so downstream features (Pitch Shaping,
+        # Stuff+, grip lookups) get correctly-routed labels.
+        is_sb = (sport or "Baseball").lower().startswith("softball")
+        if is_sb:
+            type_options = [
+                "Softball Fastball", "Rise Ball", "Drop Ball",
+                "Curveball", "Screwball", "Change-Up", "Unknown",
+            ]
+        else:
+            type_options = [
+                "Four-Seam Fastball", "Two-Seam Sinker", "Sinker",
+                "Cutter", "Slider", "Slider Strike-Getter", "Slider Chase",
+                "Sweeper", "Curveball", "Changeup", "Splitter",
+                "Knuckleball", "Unknown",
+            ]
+        current_type = pitch.get("Pitch_Type") or "Unknown"
+        # If the saved label isn't in our standard list (e.g. CSV import
+        # used a non-standard name), prepend it so it stays selectable.
+        if current_type not in type_options:
+            type_options = [current_type] + type_options
+        with st.expander("Relabel pitch type "
+                          "(fix an auto-classifier mistake)",
+                          expanded=False):
+            cur_v = pitch.get("Velocity_mph")
+            cur_vb = pitch.get("Vert_Break_in")
+            cur_hb = pitch.get("Horiz_Break_in")
+            st.caption(
+                "Auto-classifier used velocity + vertical break + "
+                "horizontal break to guess. Override here if needed — "
+                f"current metrics: {cur_v:.1f} mph · "
+                f"{cur_vb:+.1f}\" V · {cur_hb:+.1f}\" H"
+                if (cur_v is not None and cur_vb is not None
+                      and cur_hb is not None) else
+                "Auto-classifier used the measured metrics to guess. "
+                "Override here if needed.")
+            relbl_col1, relbl_col2 = st.columns([3, 1])
+            with relbl_col1:
+                new_type = st.selectbox(
+                    "Correct pitch type",
+                    options=type_options,
+                    index=type_options.index(current_type)
+                            if current_type in type_options else 0,
+                    key=f"relabel_pitch_{int(pitch['Pitch_Num'])}_select",
+                    label_visibility="collapsed")
+            with relbl_col2:
+                save_disabled = (new_type == current_type)
+                if st.button("Save",
+                              key=f"relabel_pitch_{int(pitch['Pitch_Num'])}_save",
+                              disabled=save_disabled,
+                              use_container_width=True,
+                              type="primary"):
+                    ok = update_pitch_type_in_session(
+                        session_id, int(pitch["Pitch_Num"]), new_type)
+                    if ok:
+                        st.success(
+                            f"Pitch #{int(pitch['Pitch_Num'])} relabeled "
+                            f"to {new_type}. Reload the page to see the "
+                            "updated analytics.")
+                        st.rerun()
+                    else:
+                        st.error("Couldn't save the new label — try again.")
+
+            # ---- Metric-vs-label confidence check ----
+            # If the proposed new label disagrees STRONGLY with the
+            # measured metrics, flag it. The user can still save, but
+            # the warning tells them either (a) the metrics are wrong
+            # (sensor error), (b) the label is wrong, or (c) the
+            # athlete needs to refine this pitch to actually look like
+            # what they say it is.
+            hand_is_right = (athlete_hand or "Right") != "Left"
+            classifier_guess = classify_pitch(
+                cur_v, pitch.get("Total_Spin_rpm"),
+                cur_vb, cur_hb,
+                sport=sport, hand_is_right=hand_is_right,
+                spin_eff=pitch.get("Spin_Efficiency_pct"))
+            if (new_type != "Unknown"
+                  and classifier_guess
+                  and classifier_guess != new_type
+                  and new_type != current_type):
+                # Compute how far the metrics are from the new_type's
+                # baseline so we can show a concrete deviation.
+                _, target = _resolve_pitch_target(new_type, sport)
+                if target:
+                    b = target.get("mlb_baseline", {})
+                    dv  = (cur_v  - b.get("velo",    cur_v))    if cur_v  is not None else None
+                    dvb = (cur_vb - b.get("v_break", cur_vb))   if cur_vb is not None else None
+                    dhb = (cur_hb - b.get("h_break", cur_hb))   if cur_hb is not None else None
+                    parts = []
+                    if dv  is not None: parts.append(f"velo {dv:+.1f} mph")
+                    if dvb is not None: parts.append(f"V {dvb:+.1f}\"")
+                    if dhb is not None: parts.append(f"H {dhb:+.1f}\"")
+                    deviation = " · ".join(parts)
+                    st.warning(
+                        f"⚠️ **Heads up — the metrics look more like a "
+                        f"{classifier_guess} than a {new_type}.** "
+                        f"Compared to a typical {new_type}: {deviation}. "
+                        f"You can still save the relabel — but if the "
+                        f"sensor data is right, this pitch isn't quite "
+                        f"shaping like a {new_type} yet. Either the "
+                        f"label is off, or the pitch needs refinement."
+                    )
 
     # Key metrics in a clean 4-column grid
     c1, c2, c3, c4 = st.columns(4)
@@ -14974,6 +15086,23 @@ def _save_pitches_to_history(pitches: list,
             "Outlier_Type":           None,
         })
     cap_df = pd.DataFrame(rows)
+    # Auto-classify every "Unknown" pitch from its measured metrics so
+    # the analytics screens (arsenal grouping, Stuff+, Pitch Shaping,
+    # recruiting report) don't collapse to a single Unknown bucket.
+    # Coaches can override individual labels later in the Pitch Detail
+    # panel.
+    try:
+        ath_row = None
+        with _db_conn() as _c:
+            ath_row = _c.execute(
+                "SELECT sport, hand FROM athletes WHERE id = ?",
+                (active_athlete_id,)).fetchone()
+        _sport = (ath_row[0] if ath_row else "Baseball") or "Baseball"
+        _hand_right = ((ath_row[1] if ath_row else "Right") or "Right") != "Left"
+        cap_df = auto_label_pitch_dataframe(
+            cap_df, sport=_sport, hand_is_right=_hand_right)
+    except Exception:
+        pass
     return save_session(active_athlete_id, cap_df,
                           session_type="real", session_kind="pitching")
 
@@ -16070,12 +16199,28 @@ def run_live_capture_tab(active_athlete_id: int | None,
                         "Outlier_Type":           None,
                     })
                 cap_df = pd.DataFrame(rows)
+                # Auto-classify Unknown labels from measured metrics so
+                # the analytics screens get usable pitch types out of
+                # the box. Coach can override on the Pitch Detail panel.
+                try:
+                    ath_row = None
+                    with _db_conn() as _c:
+                        ath_row = _c.execute(
+                            "SELECT sport, hand FROM athletes WHERE id = ?",
+                            (active_athlete_id,)).fetchone()
+                    _sport = (ath_row[0] if ath_row else "Baseball") or "Baseball"
+                    _hand_right = ((ath_row[1] if ath_row else "Right") or "Right") != "Left"
+                    cap_df = auto_label_pitch_dataframe(
+                        cap_df, sport=_sport, hand_is_right=_hand_right)
+                except Exception:
+                    pass
                 try:
                     new_id = save_session(active_athlete_id, cap_df,
                                             session_type="real",
                                             session_kind="pitching")
                     st.success(f"Saved as session #{new_id}. "
-                                "Open the History tab to see it trended alongside other sessions.")
+                                "Pitch types auto-classified — review on the Overview tab "
+                                "and use the dropdown on any pitch detail card to relabel.")
                     st.session_state["livecap_snapped_pitches"] = []
                 except Exception as e:
                     st.error(f"Could not save: {e}")
@@ -18386,84 +18531,164 @@ def _arsenal_summary(df) -> list:
 # =====================================================================
 PITCH_TARGETS = {
     "Four-Seam Fastball": {
-        "v_break_ideal":  (14, 19),
+        "v_break_ideal":  (14, 20),
         "h_break_ideal":  (-5, 5),
-        "velo_ideal":     (90, 96),
+        "velo_ideal":     (93, 98),
         "spin_ideal":     (2200, 2500),
-        "mlb_baseline":   {"velo": 94, "spin": 2300, "v_break": 16, "h_break": -2},
+        "spin_eff_ideal": (95, 100),
+        "mlb_baseline":   {"velo": 95.5, "spin": 2350, "v_break": 17, "h_break": -2,
+                            "spin_eff": 97},
         "movement_goal":  "Maximize CARRY (ride). Horizontal break near zero.",
     },
     "Two-Seam Fastball": {
         "v_break_ideal":  (6, 12),
-        "h_break_ideal":  (8, 16),
-        "velo_ideal":     (88, 94),
-        "spin_ideal":     (2050, 2300),
-        "mlb_baseline":   {"velo": 92, "spin": 2150, "v_break": 9, "h_break": 12},
+        "h_break_ideal":  (10, 18),
+        "velo_ideal":     (91, 96),
+        "spin_ideal":     (2000, 2350),
+        "spin_eff_ideal": (85, 100),
+        "mlb_baseline":   {"velo": 93.5, "spin": 2175, "v_break": 9, "h_break": 14,
+                            "spin_eff": 92},
         "movement_goal":  "Arm-side run with mild sink — heavy ball.",
     },
     "Sinker": {
         "v_break_ideal":  (2, 8),
-        "h_break_ideal":  (10, 18),
-        "velo_ideal":     (88, 94),
-        "spin_ideal":     (1950, 2200),
-        "mlb_baseline":   {"velo": 93, "spin": 2050, "v_break": 5, "h_break": 14},
+        "h_break_ideal":  (12, 20),
+        "velo_ideal":     (91, 96),
+        "spin_ideal":     (2000, 2350),
+        "spin_eff_ideal": (85, 100),
+        "mlb_baseline":   {"velo": 93.5, "spin": 2150, "v_break": 5, "h_break": 16,
+                            "spin_eff": 92},
         "movement_goal":  "Drop + run. Lower spin = more sink.",
+    },
+    "One-Seam Fastball": {
+        "v_break_ideal":  (8, 14),
+        "h_break_ideal":  (6, 14),
+        "velo_ideal":     (90, 95),
+        "spin_ideal":     (2100, 2300),
+        "spin_eff_ideal": (75, 90),
+        "mlb_baseline":   {"velo": 92.5, "spin": 2200, "v_break": 11, "h_break": 10,
+                            "spin_eff": 82},
+        "movement_goal":  "Erratic late trailing action from asymmetric seam.",
     },
     "Cutter": {
         "v_break_ideal":  (6, 14),
-        "h_break_ideal":  (-6, -1),
-        "velo_ideal":     (84, 92),
-        "spin_ideal":     (2200, 2500),
-        "mlb_baseline":   {"velo": 89, "spin": 2350, "v_break": 8, "h_break": -3},
+        "h_break_ideal":  (-7, -1),
+        "velo_ideal":     (88, 93),
+        "spin_ideal":     (2300, 2600),
+        "spin_eff_ideal": (85, 95),
+        "mlb_baseline":   {"velo": 90.5, "spin": 2450, "v_break": 9, "h_break": -3,
+                            "spin_eff": 90},
         "movement_goal":  "Tight late cut, mostly horizontal glove-side.",
     },
     "Slider": {
         "v_break_ideal":  (-3, 4),
         "h_break_ideal":  (-10, -3),
-        "velo_ideal":     (80, 87),
-        "spin_ideal":     (2350, 2700),
-        "mlb_baseline":   {"velo": 84, "spin": 2500, "v_break": 0, "h_break": -7},
+        "velo_ideal":     (83, 89),
+        "spin_ideal":     (2400, 2800),
+        "spin_eff_ideal": (10, 40),
+        "mlb_baseline":   {"velo": 86, "spin": 2600, "v_break": 0, "h_break": -7,
+                            "spin_eff": 28},
         "movement_goal":  "Tight glove-side break, minor vertical.",
     },
     "Sweeper": {
         "v_break_ideal":  (-2, 5),
         "h_break_ideal":  (-22, -12),
-        "velo_ideal":     (78, 85),
-        "spin_ideal":     (2400, 2800),
-        "mlb_baseline":   {"velo": 82, "spin": 2600, "v_break": 1, "h_break": -16},
+        "velo_ideal":     (78, 84),
+        "spin_ideal":     (2300, 2600),
+        "spin_eff_ideal": (30, 50),
+        "mlb_baseline":   {"velo": 81, "spin": 2450, "v_break": 1, "h_break": -16,
+                            "spin_eff": 40},
         "movement_goal":  "WIDE horizontal sweep. Low vertical.",
     },
+    "Slurve": {
+        "v_break_ideal":  (-9, -3),
+        "h_break_ideal":  (-12, -6),
+        "velo_ideal":     (80, 85),
+        "spin_ideal":     (2400, 2700),
+        "spin_eff_ideal": (45, 70),
+        "mlb_baseline":   {"velo": 82.5, "spin": 2550, "v_break": -6, "h_break": -9,
+                            "spin_eff": 58},
+        "movement_goal":  "Slider/curve hybrid — diagonal break.",
+    },
     "Curveball": {
-        "v_break_ideal":  (-18, -10),
+        "v_break_ideal":  (-20, -12),
         "h_break_ideal":  (-8, 0),
-        "velo_ideal":     (74, 82),
-        "spin_ideal":     (2400, 2800),
-        "mlb_baseline":   {"velo": 79, "spin": 2600, "v_break": -13, "h_break": -4},
+        "velo_ideal":     (74, 80),
+        "spin_ideal":     (2500, 3100),
+        "spin_eff_ideal": (70, 90),
+        "mlb_baseline":   {"velo": 77, "spin": 2800, "v_break": -15, "h_break": -4,
+                            "spin_eff": 80},
         "movement_goal":  "12-to-6 drop. Glove-side bend optional.",
+    },
+    "Knuckle Curve": {
+        "v_break_ideal":  (-22, -14),
+        "h_break_ideal":  (-8, 0),
+        "velo_ideal":     (75, 81),
+        "spin_ideal":     (2600, 3100),
+        "spin_eff_ideal": (75, 92),
+        "mlb_baseline":   {"velo": 78, "spin": 2850, "v_break": -17, "h_break": -4,
+                            "spin_eff": 84},
+        "movement_goal":  "Even deeper drop than standard curve, sharper break.",
     },
     "Changeup": {
         "v_break_ideal":  (3, 10),
-        "h_break_ideal":  (8, 16),
-        "velo_ideal":     (80, 87),
-        "spin_ideal":     (1500, 1900),
-        "mlb_baseline":   {"velo": 84, "spin": 1750, "v_break": 6, "h_break": 12},
+        "h_break_ideal":  (10, 18),
+        "velo_ideal":     (80, 86),
+        "spin_ideal":     (1700, 2100),
+        "spin_eff_ideal": (80, 100),
+        "mlb_baseline":   {"velo": 83, "spin": 1900, "v_break": 6, "h_break": 14,
+                            "spin_eff": 90},
         "movement_goal":  "Fade + sink. 8-12 mph below fastball.",
     },
     "Splitter": {
         "v_break_ideal":  (-2, 6),
-        "h_break_ideal":  (4, 12),
-        "velo_ideal":     (82, 88),
-        "spin_ideal":     (1200, 1700),
-        "mlb_baseline":   {"velo": 86, "spin": 1450, "v_break": 2, "h_break": 8},
+        "h_break_ideal":  (2, 10),
+        "velo_ideal":     (82, 87),
+        "spin_ideal":     (1200, 1600),
+        "spin_eff_ideal": (10, 30),
+        "mlb_baseline":   {"velo": 84.5, "spin": 1400, "v_break": 2, "h_break": 6,
+                            "spin_eff": 20},
         "movement_goal":  "Late dive. Low spin = big drop.",
+    },
+    "Churve": {
+        "v_break_ideal":  (-12, -4),
+        "h_break_ideal":  (4, 12),
+        "velo_ideal":     (78, 83),
+        "spin_ideal":     (1600, 2000),
+        "spin_eff_ideal": (50, 70),
+        "mlb_baseline":   {"velo": 80, "spin": 1800, "v_break": -8, "h_break": 8,
+                            "spin_eff": 60},
+        "movement_goal":  "Changeup-curve hybrid — dive + arm-side fade.",
+    },
+    "Screwball": {
+        "v_break_ideal":  (-4, 4),
+        "h_break_ideal":  (8, 16),
+        "velo_ideal":     (75, 82),
+        "spin_ideal":     (1800, 2200),
+        "spin_eff_ideal": (60, 80),
+        "mlb_baseline":   {"velo": 78, "spin": 2000, "v_break": 0, "h_break": 12,
+                            "spin_eff": 70},
+        "movement_goal":  "Reverse curveball — pronated arm-side break.",
+    },
+    "Gyroball": {
+        "v_break_ideal":  (-4, 4),
+        "h_break_ideal":  (-3, 3),
+        "velo_ideal":     (85, 90),
+        "spin_ideal":     (2200, 2500),
+        "spin_eff_ideal": (0, 5),
+        "mlb_baseline":   {"velo": 87.5, "spin": 2350, "v_break": 0, "h_break": 0,
+                            "spin_eff": 2},
+        "movement_goal":  "Pure bullet spin. No Magnus lift — gravity only.",
     },
     "Knuckleball": {
         "v_break_ideal":  (-6, 6),
         "h_break_ideal":  (-6, 6),
         "velo_ideal":     (60, 75),
-        "spin_ideal":     (100, 600),
-        "mlb_baseline":   {"velo": 70, "spin": 350, "v_break": 0, "h_break": 0},
-        "movement_goal":  "Random — low spin invites the wind.",
+        "spin_ideal":     (50, 200),
+        "spin_eff_ideal": (0, 25),
+        "mlb_baseline":   {"velo": 70, "spin": 125, "v_break": 0, "h_break": 0,
+                            "spin_eff": 10},
+        "movement_goal":  "Random — near-zero spin invites the wind.",
     },
     # ===== SOFTBALL PITCHES =====
     "Softball Fastball": {
@@ -18498,7 +18723,7 @@ PITCH_TARGETS = {
         "mlb_baseline":   {"velo": 56.5, "spin": 1750, "v_break": 0, "h_break": -7},
         "movement_goal":  "Glove-side break with mostly neutral vertical.",
     },
-    "Screwball": {
+    "Screwball (softball)": {
         "v_break_ideal":  (-2, 2),
         "h_break_ideal":  (5, 9),
         "velo_ideal":     (54, 59),
@@ -18539,7 +18764,7 @@ def _resolve_pitch_target(pitch_type, sport: str = "Baseball"):
     if is_softball:
         if "rise" in low:      return "Rise Ball", PITCH_TARGETS["Rise Ball"]
         if "drop" in low:      return "Drop Ball", PITCH_TARGETS["Drop Ball"]
-        if "screw" in low:     return "Screwball", PITCH_TARGETS["Screwball"]
+        if "screw" in low:     return "Screwball (softball)", PITCH_TARGETS["Screwball (softball)"]
         # Softball "Slider" / "Sweeper" / "Cutter" / any "Curve" =
         # glove-side breaker → softball Curveball baseline.
         if any(s in low for s in ("slider", "sweeper", "cutter", "curve")):
@@ -18788,6 +19013,159 @@ def _build_arsenal_movement_chart(df, sport: str = "Baseball",
         ),
     )
     return fig
+
+
+def classify_pitch(velo, spin, v_break, h_break,
+                      sport: str = "Baseball",
+                      hand_is_right: bool = True,
+                      spin_eff=None) -> str | None:
+    """Auto-classify a pitch from its measured metrics.
+
+    Picks the CLOSEST match in PITCH_TARGETS — never returns None unless
+    we have literally nothing to work with (no velocity, no break).
+    Loose by design: a pitch slightly outside published MLB ranges still
+    falls into the nearest bucket, because "no category" is worse than
+    "close-enough category" for downstream features.
+
+    Distance formula is weighted Euclidean over whichever signals are
+    present. Velocity gets the heaviest weight because it's the most
+    discriminating single metric (a 95 mph pitch is a fastball variant
+    regardless of break). For LHP, horizontal break is mirrored before
+    comparison so the same arm-side/glove-side logic applies.
+
+    Args:
+        velo:     pitch velocity in mph
+        spin:     total spin in rpm (optional — used as tiebreaker)
+        v_break:  induced vertical break in inches (optional)
+        h_break:  horizontal break in inches (optional)
+        spin_eff: spin efficiency percentage (optional tiebreaker —
+                   helps distinguish gyroball from fastball, etc.)
+
+    Returns the pitch-type string or None if we have NOTHING to classify
+    with (no velo AND no break data).
+    """
+    # We can classify with ANY combination of velo, v_break, h_break.
+    # Only return None if we have nothing to work with at all.
+    if velo is None and v_break is None and h_break is None:
+        return None
+    is_softball = (sport or "Baseball").lower().startswith("softball")
+    # Filter PITCH_TARGETS to the sport's pitch family
+    _SB_KEYS = {"Softball Fastball", "Rise Ball", "Drop Ball",
+                  "Curveball (softball)", "Screwball (softball)",
+                  "Change-Up"}
+    candidates = []
+    for key, t in PITCH_TARGETS.items():
+        is_sb_target = key in _SB_KEYS
+        if is_softball and not is_sb_target:    continue
+        if not is_softball and is_sb_target:    continue
+        candidates.append((key, t))
+    if not candidates:
+        # Last-ditch fallback: pick the sport's default fastball
+        return ("Softball Fastball" if is_softball else "Four-Seam Fastball")
+
+    # Mirror h_break for LHP so we compare against baselines as if RHP
+    h_adj = (h_break if hand_is_right else -h_break) if h_break is not None else None
+
+    best_key = None
+    best_score = float("inf")
+    for key, t in candidates:
+        b = t["mlb_baseline"]
+        score = 0.0
+        # Add each available dimension to the distance. Velocity gets
+        # weight 3 because it's the strongest discriminator.
+        if velo is not None and b.get("velo") is not None:
+            score += 3.0 * (velo - b["velo"]) ** 2
+        if v_break is not None and b.get("v_break") is not None:
+            score += 1.0 * (v_break - b["v_break"]) ** 2
+        if h_adj  is not None and b.get("h_break") is not None:
+            score += 1.0 * (h_adj  - b["h_break"]) ** 2
+        # Soft tiebreakers — spin rate + spin efficiency when available.
+        if spin is not None and b.get("spin"):
+            score += 0.001 * (spin - b["spin"]) ** 2
+        if spin_eff is not None and b.get("spin_eff") is not None:
+            score += 0.05 * (spin_eff - b["spin_eff"]) ** 2
+        if score < best_score:
+            best_score = score
+            best_key = key
+    # If somehow nothing matched (shouldn't happen with non-empty
+    # candidates, but defensive), return the sport's default fastball.
+    if best_key is None:
+        return "Softball Fastball" if is_softball else "Four-Seam Fastball"
+    return best_key
+
+
+def auto_label_pitch_dataframe(df,
+                                  sport: str = "Baseball",
+                                  hand_is_right: bool = True):
+    """Apply classify_pitch() to every row of `df` that's labeled
+    'Unknown' (or has no Pitch_Type). Returns a NEW df with the labels
+    filled in. Rows that already have a real label are untouched.
+
+    Now spin-efficiency aware AND defensive: any row with even one of
+    {velocity, v_break, h_break} present gets a best-guess label. Only
+    truly empty rows stay 'Unknown'."""
+    if df is None or len(df) == 0:
+        return df
+    df = df.copy()
+    if "Pitch_Type" not in df.columns:
+        df["Pitch_Type"] = "Unknown"
+    for idx, row in df.iterrows():
+        current = row.get("Pitch_Type")
+        if current and current != "Unknown":
+            continue   # already labeled
+        guess = classify_pitch(
+            row.get("Velocity_mph"),
+            row.get("Total_Spin_rpm"),
+            row.get("Vert_Break_in"),
+            row.get("Horiz_Break_in"),
+            sport=sport,
+            hand_is_right=hand_is_right,
+            spin_eff=row.get("Spin_Efficiency_pct"))
+        if guess:
+            df.at[idx, "Pitch_Type"] = guess
+    return df
+
+
+def update_pitch_type_in_session(session_id: int, pitch_num: int,
+                                     new_pitch_type: str) -> bool:
+    """Rewrite the saved session's canonical_data_json so the named pitch
+    has a new Pitch_Type label. Returns True on success.
+
+    Used by the per-pitch relabel UI when the auto-classifier guesses
+    wrong — coach picks the correct type, this writes it back.
+    """
+    import json as _json
+    if not new_pitch_type or pitch_num is None:
+        return False
+    init_db()
+    with _db_conn() as c:
+        row = c.execute(
+            "SELECT canonical_data_json FROM sessions WHERE id = ?",
+            (session_id,)).fetchone()
+        if row is None:
+            return False
+        try:
+            rows = _json.loads(row[0])
+        except Exception:
+            return False
+        if not isinstance(rows, list):
+            return False
+        # Find the matching pitch by Pitch_Num and update it
+        updated = False
+        for r in rows:
+            try:
+                if int(r.get("Pitch_Num", -1)) == int(pitch_num):
+                    r["Pitch_Type"] = new_pitch_type
+                    updated = True
+                    break
+            except Exception:
+                continue
+        if not updated:
+            return False
+        c.execute(
+            "UPDATE sessions SET canonical_data_json = ? WHERE id = ?",
+            (_json.dumps(rows), session_id))
+    return True
 
 
 def _render_pitch_movement_chart(curr_v, curr_h, tgt_v, tgt_h,
@@ -21054,6 +21432,16 @@ def main():
         with st.spinner("Running self-healing timeline aligner..."):
             df = align_pitches(pl_df, pulse_df, ppai_df)
 
+    # Auto-classify any pitches labeled "Unknown" using their measured
+    # metrics. CSVs that already carry real pitch-type labels (Rapsodo
+    # exports etc.) are untouched.
+    try:
+        _hand_right = (athlete_hand or "Right") != "Left"
+        df = auto_label_pitch_dataframe(
+            df, sport=athlete_sport, hand_is_right=_hand_right)
+    except Exception:
+        pass
+
     # -------- Session save (auto for real data, manual for samples) --------
     if active_athlete_id is not None:
         # Fingerprint this session to avoid double-saving across reruns
@@ -21075,16 +21463,20 @@ def main():
                 if save_cols[1].button("💾 Save sample to history",
                                        use_container_width=True,
                                        key="save_sample_btn"):
-                    save_session(active_athlete_id, df, session_type="sample")
+                    _saved_id = save_session(active_athlete_id, df,
+                                                 session_type="sample")
                     st.session_state["_saved_fingerprint"] = fingerprint
+                    st.session_state["active_session_id"] = _saved_id
                     st.toast("Saved to history.")
                     st.rerun()
         else:
             # Real data — auto-save once per session fingerprint
             if st.session_state.get("_saved_fingerprint") != fingerprint:
                 try:
-                    save_session(active_athlete_id, df, session_type="real")
+                    _saved_id = save_session(active_athlete_id, df,
+                                                 session_type="real")
                     st.session_state["_saved_fingerprint"] = fingerprint
+                    st.session_state["active_session_id"] = _saved_id
                 except Exception as e:
                     st.warning(f"Could not auto-save to history: {e}")
 
@@ -21225,7 +21617,11 @@ def main():
             )
             if selected_pitch_num is not None:
                 pitch = df[df["Pitch_Num"] == selected_pitch_num].iloc[0]
-                _render_pitch_detail_panel(pitch, athlete_name=athlete_name, sport=athlete_sport)
+                _render_pitch_detail_panel(
+                    pitch, athlete_name=athlete_name,
+                    sport=athlete_sport,
+                    session_id=st.session_state.get("active_session_id"),
+                    athlete_hand=athlete_hand)
         else:
             st.info(
                 "Strike-zone map requires plate-location data. "
