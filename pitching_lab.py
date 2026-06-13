@@ -15275,6 +15275,31 @@ def _capture_one_camera_for_upload(label: str,
     pitches_session_key = f"{key_prefix}pitches"
     path_session_key    = f"{key_prefix}path"
 
+    # ----- Camera angle selector -----
+    # 'Side' = standard 3rd-base / 1st-base view (ball flight + biomech)
+    # 'Behind catcher' = excellent for plate location, less for biomech
+    # 'Behind pitcher' = excellent biomech (clear hip-shoulder view),
+    #   no ball flight (ball moves away from camera — can't fit trajectory)
+    view_angle = st.radio(
+        "Camera angle for this video",
+        ["Side (3rd-base or 1st-base side)",
+         "Behind catcher",
+         "Behind pitcher (biomech only — no ball flight)"],
+        index=0,
+        key=f"{key_prefix}view_angle",
+        horizontal=True,
+        help="Side view is best overall. Behind-catcher gives sharp plate "
+              "location but pose is fronts-on. Behind-pitcher gives the "
+              "clearest hip-shoulder separation read of any angle, but the "
+              "ball moves away from the camera so velocity / break can't "
+              "be measured — biomech-only.")
+    is_behind_pitcher = view_angle.startswith("Behind pitcher")
+    # Stash for downstream code to know whether to skip ball flight
+    st.session_state[f"{key_prefix}view_angle_kind"] = (
+        "behind_pitcher" if is_behind_pitcher else
+        "behind_catcher" if view_angle.startswith("Behind catcher") else
+        "side")
+
     if uploaded is None:
         st.caption("No video uploaded yet.")
         return st.session_state.get(pitches_session_key, []), \
@@ -15295,27 +15320,41 @@ def _capture_one_camera_for_upload(label: str,
     st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
 
     # ===== Step 2 — calibrate (auto with single-tap fallback) =====
-    st.divider()
-    st.markdown("**Step 2 — Calibrate** (automatic — confirm or one tap if needed)")
-    cal = render_smart_calibration(tmp_path,
-                                       state_prefix=f"{key_prefix}cc_",
-                                       sport=athlete_sport)
-    with st.expander("Power-user: preset / manual numbers",
-                       expanded=False):
-        st.caption(
-            "Falling back here is fine if click-to-calibrate isn't loading. "
-            "Pick a preset or type pixel coordinates by hand. Click-derived "
-            "values above take precedence if both are set.")
-        fallback_cal = render_calibration_with_presets(
-            state_prefix=key_prefix)
-    cal = cal or fallback_cal
-    if cal is None:
-        st.info("Calibrate the plate before processing.")
-        return st.session_state.get(pitches_session_key, []), tmp_path
+    # Behind-the-pitcher view doesn't see the plate — skip calibration
+    # entirely and use a synthetic config. The video will be analyzed
+    # for biomech only (pose extraction).
+    if is_behind_pitcher:
+        st.divider()
+        st.info(
+            "Behind-the-pitcher view selected. No plate calibration "
+            "needed — this video will be analyzed for biomech "
+            "(hip-shoulder separation, lead-knee block, arm slot, "
+            "elbow stress) only. Ball flight isn't measurable from "
+            "this angle because the ball moves away from the camera.")
+        plate_cx = 0; plate_cy = 0; plate_w  = 80
+        ball_min = 6; ball_max = 22
+    else:
+        st.divider()
+        st.markdown("**Step 2 — Calibrate** (automatic — confirm or one tap if needed)")
+        cal = render_smart_calibration(tmp_path,
+                                           state_prefix=f"{key_prefix}cc_",
+                                           sport=athlete_sport)
+        with st.expander("Power-user: preset / manual numbers",
+                           expanded=False):
+            st.caption(
+                "Falling back here is fine if click-to-calibrate isn't loading. "
+                "Pick a preset or type pixel coordinates by hand. Click-derived "
+                "values above take precedence if both are set.")
+            fallback_cal = render_calibration_with_presets(
+                state_prefix=key_prefix)
+        cal = cal or fallback_cal
+        if cal is None:
+            st.info("Calibrate the plate before processing.")
+            return st.session_state.get(pitches_session_key, []), tmp_path
 
-    plate_cx = cal["plate_cx_px"]; plate_cy = cal["plate_cy_px"]
-    plate_w  = cal["plate_w_px"]
-    ball_min = cal["ball_rmin_px"]; ball_max = cal["ball_rmax_px"]
+        plate_cx = cal["plate_cx_px"]; plate_cy = cal["plate_cy_px"]
+        plate_w  = cal["plate_w_px"]
+        ball_min = cal["ball_rmin_px"]; ball_max = cal["ball_rmax_px"]
 
     # ===== Step 3 — process =====
     if st.button("Process video", type="primary", use_container_width=True,
@@ -15864,10 +15903,23 @@ def run_live_capture_tab(active_athlete_id: int | None,
     with st.expander("**Where to put the camera** — full setup guide", expanded=True):
         st.markdown(
             _flat_html(
+                "<div style='background:#0f172a;border:1px solid #1e293b;"
+                "border-left:4px solid #10b981;border-radius:8px;"
+                "padding:14px 18px;margin-bottom:14px;'>"
+                "<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+                "color:#10b981;text-transform:uppercase;margin-bottom:6px;'>"
+                "No measuring required</div>"
+                "<div style='font-size:13px;color:#cbd5e1;line-height:1.6;'>"
+                "You don't need to measure the camera distance, plate width, "
+                "or anything else. The app auto-calibrates from what it sees "
+                "in the frame. <b style='color:#f1f5f9;'>Just get the pitcher "
+                "AND the plate in frame, hit Start, and tap the plate edges "
+                "if prompted.</b> Everything else (pixel-to-feet conversion, "
+                "release distance, scale) is derived automatically.</div></div>"
                 "<div style='font-size:13px;color:#cbd5e1;line-height:1.65;'>"
                 "<b style='color:#f1f5f9;'>What you need:</b> a phone or tablet, "
                 "a tripod (or any stable surface — a bag of helmets on a 5-gal "
-                "bucket works), and ~3 minutes of setup time."
+                "bucket works). That's it."
                 "</div>"
             ),
             unsafe_allow_html=True,
@@ -15886,19 +15938,20 @@ def run_live_capture_tab(active_athlete_id: int | None,
                     "<div style='font-size:14px;font-weight:700;color:#f1f5f9;margin-bottom:8px;'>"
                     "Best for ball-flight metrics</div>"
                     "<div style='font-size:13px;color:#cbd5e1;line-height:1.6;'>"
-                    "<b style='color:#f1f5f9;'>Where:</b> directly behind the catcher, "
-                    "facing the pitcher. About <b>10–15 ft behind home plate</b>. The catcher's "
-                    "head should be in the bottom-center of the frame; the pitcher should "
-                    "appear small in the upper-center.<br><br>"
-                    "<b style='color:#f1f5f9;'>Height:</b> tripod at <b>~4 ft</b> — about "
-                    "the height of the catcher's shoulders when crouched. Don't put it on "
-                    "the ground; you need to see the strike-zone plane.<br><br>"
-                    "<b style='color:#f1f5f9;'>Angle:</b> pan slightly DOWN so the strike "
-                    "zone fills the middle-third of the frame.<br><br>"
-                    "<b style='color:#f1f5f9;'>Strengths:</b> elite velo, plate location, "
-                    "vert + horiz break, spin estimate.<br>"
-                    "<b style='color:#f1f5f9;'>Weakness:</b> can't see stride, less detail "
-                    "on arm slot (pose biomech will work but the pitcher is small)."
+                    "<b style='color:#f1f5f9;'>Where:</b> behind home plate, "
+                    "facing the pitcher. Far enough back that the whole strike "
+                    "zone fits comfortably in frame WITH the pitcher visible "
+                    "behind it. Exact distance doesn't matter.<br><br>"
+                    "<b style='color:#f1f5f9;'>Height:</b> roughly at the strike "
+                    "zone level (chest height of a standing player). Don't put "
+                    "it on the ground — you need to see the zone plane.<br><br>"
+                    "<b style='color:#f1f5f9;'>Angle:</b> aimed so the catcher's "
+                    "mitt sits in the bottom-third and the pitcher in the "
+                    "upper-third.<br><br>"
+                    "<b style='color:#f1f5f9;'>Strengths:</b> velo, plate "
+                    "location, vert + horiz break, spin estimate.<br>"
+                    "<b style='color:#f1f5f9;'>Weakness:</b> less detail on arm "
+                    "slot (pose biomech still works)."
                     "</div></div>"
                 ),
                 unsafe_allow_html=True,
@@ -15914,19 +15967,20 @@ def run_live_capture_tab(active_athlete_id: int | None,
                     "<div style='font-size:14px;font-weight:700;color:#f1f5f9;margin-bottom:8px;'>"
                     "Best for mechanics + biomech</div>"
                     "<div style='font-size:13px;color:#cbd5e1;line-height:1.6;'>"
-                    "<b style='color:#f1f5f9;'>Where:</b> on the open side of the pitcher "
-                    "(<b>3rd-base side for RHP</b>, 1st-base side for LHP). About "
-                    "<b>15–25 ft away</b>, perpendicular to the rubber-to-plate line.<br><br>"
-                    "<b style='color:#f1f5f9;'>Height:</b> tripod at <b>~4 ft</b>. The "
-                    "pitcher's whole body — head to plant foot — should fit in the frame "
-                    "with about 1 ft of headroom above and below.<br><br>"
-                    "<b style='color:#f1f5f9;'>Angle:</b> level, perpendicular to the "
-                    "pitcher's line. NOT angled toward home plate.<br><br>"
-                    "<b style='color:#f1f5f9;'>Strengths:</b> hip-shoulder separation, "
-                    "stride length, lead-knee flex, arm slot, elbow stress estimate.<br>"
-                    "<b style='color:#f1f5f9;'>Weakness:</b> ball-flight metrics (velo, "
-                    "break, plate location) are less accurate — the ball is moving away "
-                    "from the camera at an oblique angle."
+                    "<b style='color:#f1f5f9;'>Where:</b> on the open side of the "
+                    "pitcher (<b>3rd-base side for RHP</b>, 1st-base side for "
+                    "LHP). Far enough back that the whole body fits — head to "
+                    "plant foot — with a little headroom above and below. "
+                    "Exact distance doesn't matter.<br><br>"
+                    "<b style='color:#f1f5f9;'>Height:</b> chest level. Same "
+                    "rule — don't put it on the ground.<br><br>"
+                    "<b style='color:#f1f5f9;'>Angle:</b> level, looking "
+                    "straight across at the pitcher. Not tilted up or down.<br><br>"
+                    "<b style='color:#f1f5f9;'>Strengths:</b> hip-shoulder "
+                    "separation, stride length, lead-knee flex, arm slot, "
+                    "elbow stress.<br>"
+                    "<b style='color:#f1f5f9;'>Weakness:</b> ball-flight numbers "
+                    "are less accurate (ball moves away at an oblique angle)."
                     "</div></div>"
                 ),
                 unsafe_allow_html=True,
@@ -16106,6 +16160,15 @@ def run_live_capture_tab(active_athlete_id: int | None,
             self.plate_cx = 640
             self.plate_cy = 600
             self.plate_w  = 80
+            # Athlete handedness — drives which side of the body the
+            # pose tracker reads for arm slot / lead knee. Default to
+            # RHP; set via set_athlete_hand() before recording starts.
+            self.hand_is_right = True
+
+        def set_athlete_hand(self, hand: str):
+            """Configure the VideoProcessor for the athlete's throwing
+            hand. Affects arm-slot + lead-knee landmark selection."""
+            self.hand_is_right = (hand or "Right") != "Left"
 
         def _compute_metrics(self, landmarks, img_h, img_w):
             """Pull pitcher biomech from MediaPipe landmarks.
@@ -16138,12 +16201,23 @@ def run_live_capture_tab(active_athlete_id: int | None,
                 shld_ang = line_angle(lshld, rshld)
                 hs_sep   = abs((shld_ang - hip_ang + 180) % 360 - 180)
 
-                # Arm slot — angle of the line from the throwing shoulder to
-                # the throwing wrist, measured from horizontal
-                # (Assumes right-handed pitcher — flip for LHP in Phase 1.1)
-                slot_ang = line_angle(rshld, rwrist)
+                # ----- HAND-AWARE LANDMARK SELECTION -----
+                # Throwing-side shoulder/wrist drive arm slot.
+                # Lead leg is the OPPOSITE side from the throwing arm.
+                if self.hand_is_right:
+                    throw_shld, throw_wrist = rshld, rwrist
+                    lead_hip, lead_knee_lm, lead_ankle = lhip, lknee, lankle
+                else:
+                    throw_shld, throw_wrist = lshld, lwrist
+                    lead_hip, lead_knee_lm, lead_ankle = rhip, rknee, rankle
 
-                # Lead-knee flex — angle at the LEFT knee for RHP
+                # Arm slot — angle of the line from the throwing shoulder to
+                # the throwing wrist, measured from horizontal. Now correctly
+                # handles both RHP and LHP.
+                slot_ang = line_angle(throw_shld, throw_wrist)
+
+                # Lead-knee flex — angle at the LEAD knee
+                # (left knee for RHP, right knee for LHP)
                 def joint_angle(p_top, p_mid, p_bot):
                     import math as _m
                     v1 = (p_top.x - p_mid.x, p_top.y - p_mid.y)
@@ -16156,11 +16230,12 @@ def run_live_capture_tab(active_athlete_id: int | None,
                     cos_a = max(-1.0, min(1.0, dot / (mag1 * mag2)))
                     return _m.degrees(_m.acos(cos_a))
                 import math as _m_module  # need it in scope above
-                lead_knee = joint_angle(lhip, lknee, lankle)
+                lead_knee = joint_angle(lead_hip, lead_knee_lm, lead_ankle)
 
-                # Release point pixel — wrist y-position (lower y = higher
-                # in image since 0 is the top)
-                release_y_px = rwrist.y * img_h
+                # Release point pixel — wrist y-position from the
+                # throwing wrist (lower y = higher in image since 0 is
+                # the top)
+                release_y_px = throw_wrist.y * img_h
                 # Approximate body height in pixels (for relative scale)
                 body_px = abs(lshld.y - lankle.y) * img_h
 
@@ -16306,6 +16381,10 @@ def run_live_capture_tab(active_athlete_id: int | None,
         ctx.video_processor.plate_w    = int(plate_w)
         ctx.video_processor.ball_radius_range = (
             int(ball_radius_lo), int(ball_radius_hi))
+        # Hand-aware pose: tells the extractor which side of the body
+        # to read for arm slot + lead knee (RHP throws with the right
+        # arm and lands on the left leg; LHP is mirrored).
+        ctx.video_processor.set_athlete_hand(athlete_hand or "Right")
 
     # ===== Snap-pitch + save controls =====
     st.divider()
@@ -16341,6 +16420,23 @@ def run_live_capture_tab(active_athlete_id: int | None,
                     m["spin_efficiency_pct"]  = fit.get("spin_efficiency_pct")
                     m["tilt_clock"]           = fit.get("tilt_clock")
                     m["assumed_total_spin"]   = fit.get("assumed_total_spin")
+                # Auto-classify the pitch type from the measured metrics
+                # so the instant feedback card can show "Four-Seam" right
+                # away — saves the coach a labeling step and means the
+                # athlete sees their pitch identified between throws.
+                try:
+                    _guess = classify_pitch(
+                        m.get("velocity_mph"),
+                        m.get("useful_spin_rpm"),
+                        m.get("vert_break_in"),
+                        m.get("horiz_break_in"),
+                        sport=athlete_sport,
+                        hand_is_right=((athlete_hand or "Right") != "Left"),
+                        spin_eff=m.get("spin_efficiency_pct"))
+                    if _guess:
+                        m["pitch_type_guess"] = _guess
+                except Exception:
+                    pass
                 st.session_state["livecap_snapped_pitches"].append(m)
                 # Save the most recent pitch so the instant-feedback card
                 # below renders with massive readable numbers
@@ -16409,6 +16505,18 @@ def run_live_capture_tab(active_athlete_id: int | None,
             if useful_spin else "—"
         )
 
+        # ===== Auto-classified pitch-type badge =====
+        # Shows up next to the pitch number so the athlete sees what
+        # the system thinks they just threw (and the coach can spot a
+        # mislabel immediately).
+        guess = last_pitch.get("pitch_type_guess")
+        type_badge = (
+            f"<span style='display:inline-block;background:#1a2150;color:white;"
+            f"padding:4px 12px;border-radius:14px;font-size:13px;"
+            f"font-weight:700;letter-spacing:0.04em;margin-left:10px;'>"
+            f"{guess}</span>"
+        ) if guess else ""
+
         feedback_html = (
             f"<div style='background:white;border:1px solid #e5e7eb;border-radius:16px;"
             f"padding:28px 32px;box-shadow:0 4px 14px rgba(26,33,80,0.10);"
@@ -16417,7 +16525,8 @@ def run_live_capture_tab(active_athlete_id: int | None,
             f"margin-bottom:18px;'>"
             f"<div style='font-size:14px;letter-spacing:0.10em;font-weight:700;"
             f"color:#d4a634;text-transform:uppercase;'>"
-            f"Pitch #{last_pitch.get('pitch_num', '—')} · Live Capture</div>"
+            f"Pitch #{last_pitch.get('pitch_num', '—')} · Live Capture"
+            f"{type_badge}</div>"
             f"<div style='font-size:11px;color:#9ca3af;'>Captured just now</div>"
             f"</div>"
             f"<div style='display:flex;gap:24px;align-items:center;'>"
