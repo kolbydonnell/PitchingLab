@@ -15638,6 +15638,81 @@ def render_click_calibration(video_path: str,
     return cal
 
 
+# ===== Sanity bounds — reject obviously impossible pitch dicts =====
+# When plate calibration goes wrong (auto-detect latches onto noise, or the
+# user uploads an edited/slow-mo video), the trajectory math produces
+# absurd numbers (V+776,000" of break, 636,000 rpm spin, 127 mph cutters,
+# negative plate Z meaning the ball ended up underground). Letting those
+# values reach the UI is a worse customer experience than detecting fewer
+# pitches, so we filter here and flag the pitches we drop.
+#
+# Returns (clean_pitches, dropped_pitches, reasons_list).
+_SANITY_BOUNDS = {
+    "Baseball": {
+        "velo_mph":      (30.0, 110.0),
+        "vert_break_in": (-30.0, 30.0),
+        "horiz_break_in": (-30.0, 30.0),
+        "spin_rpm":      (100,   4500),
+        "plate_x_ft":    (-3.0,  3.0),
+        "plate_z_ft":    (-1.0,  8.0),
+    },
+    "Softball": {
+        "velo_mph":      (20.0, 90.0),
+        "vert_break_in": (-25.0, 25.0),
+        "horiz_break_in": (-25.0, 25.0),
+        "spin_rpm":      (100,   3500),
+        "plate_x_ft":    (-3.0,  3.0),
+        "plate_z_ft":    (-0.5,  7.0),
+    },
+}
+
+
+def _sanity_filter_pitches(pitches: list, sport: str = "Baseball") -> tuple:
+    """Drop pitches whose computed metrics are physically impossible.
+
+    Almost always indicates a plate-calibration failure (the pixels-to-feet
+    scale is off by an order of magnitude). Better to show fewer good
+    pitches than to show garbage with sensible-looking units.
+
+    Returns (kept, dropped, reasons) where reasons is a short list of
+    human-readable strings the caller can surface as a banner.
+    """
+    bounds = _SANITY_BOUNDS.get(sport, _SANITY_BOUNDS["Baseball"])
+    kept, dropped, reasons = [], [], []
+
+    def _in(val, lo, hi):
+        try:
+            return val is None or (lo <= float(val) <= hi)
+        except (TypeError, ValueError):
+            return True
+
+    for p in pitches:
+        bad_keys = []
+        if not _in(p.get("velocity_mph"), *bounds["velo_mph"]):
+            bad_keys.append(f"velo={p.get('velocity_mph')}")
+        if not _in(p.get("vert_break_in"), *bounds["vert_break_in"]):
+            bad_keys.append(f"v_break={p.get('vert_break_in')}")
+        if not _in(p.get("horiz_break_in"), *bounds["horiz_break_in"]):
+            bad_keys.append(f"h_break={p.get('horiz_break_in')}")
+        spin = p.get("useful_spin_rpm") or p.get("total_spin_rpm")
+        if not _in(spin, *bounds["spin_rpm"]):
+            bad_keys.append(f"spin={spin}")
+        if not _in(p.get("plate_x_ft"), *bounds["plate_x_ft"]):
+            bad_keys.append(f"plate_x={p.get('plate_x_ft')}")
+        if not _in(p.get("plate_z_ft"), *bounds["plate_z_ft"]):
+            bad_keys.append(f"plate_z={p.get('plate_z_ft')}")
+        if bad_keys:
+            dropped.append(p)
+            reasons.append(", ".join(bad_keys))
+        else:
+            kept.append(p)
+
+    # Renumber the kept pitches so the UI shows 1..N contiguously
+    for i, p in enumerate(kept, 1):
+        p["pitch_num"] = i
+    return kept, dropped, reasons
+
+
 def process_uploaded_video(video_path: str,
                              calibration: dict,
                              sport: str = "Baseball",
@@ -15744,7 +15819,24 @@ def process_uploaded_video(video_path: str,
         fit["t_start_sec"]  = float(pitch_positions[0][0])
         fit["t_end_sec"]    = float(pitch_positions[-1][0])
         fitted.append(fit)
-    return fitted
+
+    # Sanity-bound filter: drop physically impossible pitches caused by
+    # bad calibration (edited videos, slow-mo replays, plate auto-detect
+    # latching onto noise). Attach the diagnostics so the upload tab can
+    # tell the user *why* their session is mostly empty.
+    kept, dropped, reasons = _sanity_filter_pitches(fitted, sport=sport)
+    if dropped:
+        try:
+            print(f"[upload-side] sanity filter dropped "
+                  f"{len(dropped)}/{len(fitted)} pitches: "
+                  f"{reasons[:3]}")
+        except Exception:
+            pass
+        if kept:
+            kept[0]["_sanity_dropped"] = len(dropped)
+            kept[0]["_sanity_total"]   = len(fitted)
+            kept[0]["_sanity_reasons"] = reasons[:5]
+    return kept
 
 
 # =============================================================================
@@ -15852,6 +15944,160 @@ def _compute_pose_metrics(landmarks, img_h: int, img_w: int,
         }
     except Exception:
         return {}
+
+
+def assess_video_quality(video_path: str) -> dict:
+    """Pre-flight quality check on an uploaded bullpen video.
+
+    Returns a dict with keys:
+        verdict     : "good" | "marginal" | "reject"
+        score       : 0-100
+        fps, width, height, duration_sec, hard_cuts
+        issues      : list of human-readable problem strings
+        suggestions : list of human-readable fix strings
+
+    The verdict drives the UX:
+      - "good"     → process silently
+      - "marginal" → show a yellow caution banner but allow processing
+      - "reject"   → show a red blocking banner with a "Process anyway" link
+
+    Why we do this: an edited highlight reel (Robby Rowland's was the
+    canonical bad input — 640x360, 24 fps, 8.7 min, slow-mo replays cut
+    with full speed) processes for 60+ seconds and then returns garbage.
+    Catching it up front saves the user's time and protects them from
+    seeing "127 mph cutter, 636,000 rpm" output that would erode trust.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return {"verdict": "good", "score": 100, "issues": [],
+                "suggestions": [],
+                "fps": 0, "width": 0, "height": 0,
+                "duration_sec": 0, "hard_cuts": 0}
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {"verdict": "reject", "score": 0,
+                "fps": 0, "width": 0, "height": 0,
+                "duration_sec": 0, "hard_cuts": 0,
+                "issues": ["Couldn't open the video file."],
+                "suggestions": ["Re-encode as .mp4 (H.264) and re-upload."]}
+
+    fps           = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+    width         = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    n_frames      = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration_sec  = (n_frames / fps) if fps else 0.0
+    short_edge    = min(width, height) if (width and height) else 0
+
+    issues       : list[str] = []
+    suggestions  : list[str] = []
+    score = 100
+
+    # ---- FPS sniff ----
+    if fps < 18:
+        issues.append(f"Very low frame rate ({fps:.1f} fps).")
+        suggestions.append(
+            "Record at 30 fps or higher. Phones default to 30 — check "
+            "Settings → Camera → Record Video.")
+        score -= 35
+    elif 23 <= fps <= 25:
+        # 24 fps = cinematic re-encode. Real bullpens are 30/60/120/240.
+        issues.append(
+            f"Frame rate is {fps:.1f} fps — that's cinematic / streaming "
+            f"format, not raw phone footage. Probably a YouTube re-encode.")
+        suggestions.append(
+            "Use the original camera file (30/60/240 fps phone footage) "
+            "instead of a YouTube download. Re-encoded video loses ball "
+            "detection accuracy.")
+        score -= 15
+
+    # ---- Resolution sniff ----
+    if short_edge and short_edge < 480:
+        issues.append(
+            f"Resolution is {width}×{height} — below 480p. Ball "
+            f"detection degrades sharply here.")
+        suggestions.append("Re-record at 720p or higher.")
+        score -= 30
+    elif short_edge and short_edge < 720:
+        issues.append(f"Resolution is {width}×{height} — below 720p.")
+        suggestions.append(
+            "720p+ recommended for crisp ball detection.")
+        score -= 10
+
+    # ---- Duration sniff ----
+    if duration_sec < 5:
+        issues.append(
+            f"Video is only {duration_sec:.1f} seconds long. Probably "
+            f"truncated or single-pitch.")
+        suggestions.append("Record a full bullpen (≥30 sec of pitching).")
+        score -= 15
+    elif duration_sec > 8 * 60:
+        issues.append(
+            f"Video is {duration_sec/60:.1f} minutes long — way longer "
+            f"than a real bullpen. Almost certainly an edited "
+            f"compilation.")
+        suggestions.append(
+            "Trim to a single continuous bullpen segment (1-5 minutes).")
+        score -= 25
+
+    # ---- Cut / scene-change detection ----
+    # Sample frames at fixed intervals, compute histogram similarity
+    # between consecutive samples. Any sharp drop = a hard cut.
+    hard_cuts = 0
+    if n_frames > 30 and fps:
+        sample_count = min(40, max(8, int(duration_sec // 2)))
+        prev_hist = None
+        for k in range(sample_count):
+            frame_idx = int(n_frames * (k + 0.5) / sample_count)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            # Downsample for speed
+            small = cv2.resize(frame, (160, 90))
+            hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            hist = cv2.calcHist([hsv], [0, 1], None, [16, 16],
+                                  [0, 180, 0, 256])
+            cv2.normalize(hist, hist)
+            if prev_hist is not None:
+                # CORREL: 1.0 = identical, drops fast on cuts
+                sim = cv2.compareHist(prev_hist, hist,
+                                          cv2.HISTCMP_CORREL)
+                if sim < 0.35:
+                    hard_cuts += 1
+            prev_hist = hist
+    cap.release()
+    cuts_per_min = (hard_cuts / max(0.1, duration_sec / 60.0))
+    if cuts_per_min > 3.0:
+        issues.append(
+            f"Detected ~{hard_cuts} hard cuts in {duration_sec/60:.1f} "
+            f"min ({cuts_per_min:.1f}/min). Heavy editing or "
+            f"multi-camera switching — pitch segmentation will be "
+            f"unreliable.")
+        suggestions.append(
+            "Use a single continuous take from one fixed camera. No "
+            "editing, no slow-motion replays.")
+        score -= 30
+    elif cuts_per_min > 1.5:
+        issues.append(
+            f"Detected ~{hard_cuts} hard cuts. Some editing detected.")
+        suggestions.append(
+            "Best results come from a single continuous take. "
+            "Editing OK if cuts are between pitches only.")
+        score -= 10
+
+    score = max(0, score)
+    verdict = ("good" if score >= 80 else
+                "marginal" if score >= 50 else "reject")
+    return {
+        "verdict": verdict, "score": score,
+        "fps": round(fps, 1), "width": width, "height": height,
+        "duration_sec": round(duration_sec, 1),
+        "hard_cuts": hard_cuts,
+        "issues": issues, "suggestions": suggestions,
+    }
 
 
 def auto_detect_camera_angle(video_path: str,
@@ -16032,7 +16278,16 @@ def process_uploaded_video_behind_pitcher(
         if progress_cb:
             progress_cb(0.3 + 0.7 * (i + 1) / max(1, len(throws)))
     cap.release()
-    return out
+
+    # Same sanity filter as the side/behind-catcher pipeline. Behind-pitcher
+    # math is the lowest-precision angle, so absurd readings here mean the
+    # input video was the wrong format.
+    kept, dropped, reasons = _sanity_filter_pitches(out, sport=sport)
+    if dropped and kept:
+        kept[0]["_sanity_dropped"] = len(dropped)
+        kept[0]["_sanity_total"]   = len(out)
+        kept[0]["_sanity_reasons"] = reasons[:5]
+    return kept
 
 
 def detect_throw_events_from_pose(video_path: str,
@@ -16380,10 +16635,84 @@ def _capture_one_camera_for_upload(label: str,
             f.write(uploaded.read())
         st.session_state[last_name_key] = uploaded.name
         st.session_state[path_session_key] = tmp_path
-        # Invalidate cached results for the previous video
+        # Invalidate cached results for the previous video — also
+        # invalidate the per-video quality + angle caches so a new file
+        # gets a fresh pre-flight read instead of inheriting stale
+        # judgments from the previous one.
         st.session_state.pop(pitches_session_key, None)
+        st.session_state.pop(f"{key_prefix}quality", None)
+        st.session_state.pop(f"{key_prefix}force_process", None)
+        st.session_state.pop(f"{key_prefix}detected_angle", None)
     tmp_path = st.session_state.get(path_session_key, tmp_path)
     st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
+
+    # ===== Pre-flight video quality check =====
+    # Runs a fast (<3s) sanity pass on the video BEFORE we spend 60+
+    # seconds processing a hopeless file. Blocks on red verdicts unless
+    # the user explicitly overrides, warns on yellow, silent on green.
+    quality_state_key = f"{key_prefix}quality"
+    override_state_key = f"{key_prefix}force_process"
+    if quality_state_key not in st.session_state:
+        with st.spinner("Checking video quality..."):
+            try:
+                st.session_state[quality_state_key] = assess_video_quality(tmp_path)
+            except Exception:
+                st.session_state[quality_state_key] = {
+                    "verdict": "good", "score": 100,
+                    "issues": [], "suggestions": [],
+                    "fps": 0, "width": 0, "height": 0,
+                    "duration_sec": 0, "hard_cuts": 0,
+                }
+    q = st.session_state[quality_state_key]
+    _verdict_meta = {
+        "good":     ("#10b981", "VIDEO LOOKS GOOD", "#064e3b"),
+        "marginal": ("#f59e0b", "QUALITY WARNINGS",  "#78350f"),
+        "reject":   ("#ef4444", "VIDEO NOT RECOMMENDED", "#7f1d1d"),
+    }
+    _color, _label, _bg = _verdict_meta.get(q["verdict"], _verdict_meta["good"])
+    _spec_bits = []
+    if q.get("fps"):           _spec_bits.append(f"{q['fps']:.0f} fps")
+    if q.get("width"):         _spec_bits.append(f"{q['width']}×{q['height']}")
+    if q.get("duration_sec"):  _spec_bits.append(f"{q['duration_sec']:.0f}s")
+    if q.get("hard_cuts") is not None: _spec_bits.append(f"{q['hard_cuts']} cuts")
+    _spec_str = " · ".join(_spec_bits)
+    st.markdown(
+        f"<div style='background:{_bg};border:1px solid {_color};"
+        f"border-left:4px solid {_color};border-radius:8px;"
+        f"padding:12px 18px;margin:10px 0;'>"
+        f"<div style='display:flex;align-items:center;gap:14px;"
+        f"flex-wrap:wrap;'>"
+        f"<div style='font-size:11px;letter-spacing:0.10em;"
+        f"font-weight:700;color:{_color};'>{_label}</div>"
+        f"<div style='font-size:13px;color:#f1f5f9;font-weight:600;'>"
+        f"Quality score: {q['score']}/100</div>"
+        f"<div style='font-size:12px;color:#cbd5e1;'>{_spec_str}</div>"
+        f"</div></div>",
+        unsafe_allow_html=True)
+    if q["issues"]:
+        with st.expander(f"Why ({len(q['issues'])} issue(s) detected)",
+                            expanded=(q["verdict"] != "good")):
+            for issue in q["issues"]:
+                st.markdown(f"- {issue}")
+            if q["suggestions"]:
+                st.markdown("**To fix:**")
+                for s in q["suggestions"]:
+                    st.markdown(f"- {s}")
+    if q["verdict"] == "reject" and not st.session_state.get(override_state_key):
+        st.error(
+            "This video doesn't look like a clean bullpen recording. "
+            "Processing will likely produce inaccurate results. We "
+            "recommend re-recording before continuing.")
+        cols_block = st.columns([1, 1])
+        with cols_block[0]:
+            if st.button("Process anyway",
+                            key=f"{key_prefix}force_btn",
+                            use_container_width=True):
+                st.session_state[override_state_key] = True
+                st.rerun()
+        with cols_block[1]:
+            st.caption("Or upload a different video at the top.")
+        return st.session_state.get(pitches_session_key, []), tmp_path
 
     # ===== Auto-detect camera angle =====
     # Sniffs a handful of frames to figure out what we're looking at:
@@ -16533,8 +16862,37 @@ def _capture_one_camera_for_upload(label: str,
                     "Skeleton overlay + biomech skipped — MediaPipe not "
                     "available. Ball flight metrics were captured.")
             st.session_state[pitches_session_key] = pitches
-            if pitches:
+            # Sanity-filter banner — surface dropped pitches caused by
+            # bad plate calibration (edited videos, slow-mo replays).
+            sanity_dropped = (pitches[0].get("_sanity_dropped")
+                              if pitches else 0)
+            sanity_total = (pitches[0].get("_sanity_total")
+                              if pitches else len(pitches))
+            sanity_reasons = (pitches[0].get("_sanity_reasons") or []
+                              if pitches else [])
+            if pitches and sanity_dropped:
+                st.warning(
+                    f"**Found {len(pitches)} clean pitch(es)** — but "
+                    f"{sanity_dropped} of {sanity_total} candidate pitches "
+                    f"were filtered out because their numbers were "
+                    f"physically impossible (e.g., 127 mph, 600+ inches of "
+                    f"break). That almost always means the plate "
+                    f"calibration found the wrong object, or the video has "
+                    f"slow-motion replays / cuts mixed in.\n\n"
+                    f"**Fix:** re-record with a single static camera, "
+                    f"side angle, full bullpen in one take (no editing), "
+                    f"30 fps or higher, plate clearly visible in frame.")
+            elif pitches:
                 st.success(f"Found {len(pitches)} pitch(es) in this video.")
+            elif sanity_total:
+                # We DID detect motion, but every candidate was nonsense.
+                st.error(
+                    f"Detected {sanity_total} pitch candidates, but every "
+                    f"one failed sanity checks — plate calibration is "
+                    f"almost certainly wrong for this video. Re-record as "
+                    f"a single continuous take from a static side angle, "
+                    f"no slow-motion replays, and make sure home plate is "
+                    f"clearly visible.")
             else:
                 st.warning(
                     f"No pitches detected. Try lowering ball radius min "
