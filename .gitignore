@@ -26,3 +26,16 @@ Thumbs.db
 
 # Streamlit runtime
 .streamlit/credentials.toml
+
+# Test videos — downloaded locally for accuracy testing.
+# GitHub rejects files >100MB and Verlander HD is 175MB. Always ignore.
+test_videos/
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.mkv
+*.webm
+
+# Validation harness output (CSV per video)
+test_videos/*_results.csv
