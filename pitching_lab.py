@@ -16958,6 +16958,109 @@ def _capture_one_camera_for_upload(label: str,
         plate_w  = cal["plate_w_px"]
         ball_min = cal["ball_rmin_px"]; ball_max = cal["ball_rmax_px"]
 
+    # ===== Step 2.5 — Debug: show what the ball detector sees =====
+    # When the pipeline returns "no pitches detected", the user has no
+    # way to know whether the ball detector found ANYTHING or the
+    # trajectory math threw it out. This expander samples 8 frames and
+    # shows each one with the detected ball circled in green (or a red
+    # marker if no detection). One look tells you whether the problem
+    # is detection or downstream segmentation/fitting.
+    with st.expander("Debug: preview what the ball detector finds",
+                       expanded=False):
+        st.caption(
+            "Samples 8 frames evenly across the video and runs ball "
+            "detection at the current radius range. Green circle = "
+            "detected. Red X = no detection.")
+        if st.button("Run detector preview",
+                       key=f"{key_prefix}debug_preview_btn"):
+            try:
+                import cv2 as _cv2
+                import numpy as _np
+                cap_dbg = _cv2.VideoCapture(tmp_path)
+                if not cap_dbg.isOpened():
+                    st.error("Couldn't open the video for preview.")
+                else:
+                    n = int(cap_dbg.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    if n < 8:
+                        st.warning("Video too short for an 8-frame preview.")
+                    else:
+                        preview_imgs = []
+                        captions = []
+                        for k in range(8):
+                            f_idx = int(n * (k + 0.5) / 8)
+                            cap_dbg.set(_cv2.CAP_PROP_POS_FRAMES, f_idx)
+                            ok, fr = cap_dbg.read()
+                            if not ok:
+                                continue
+                            res = detect_ball_in_frame(
+                                fr,
+                                ball_radius_px_range=(int(ball_min),
+                                                          int(ball_max)),
+                                motion_blur_tolerant=True)
+                            anno = fr.copy()
+                            if res:
+                                cx, cy = int(res[0]), int(res[1])
+                                rr = int(res[2]) if len(res) >= 3 else 8
+                                _cv2.circle(anno, (cx, cy),
+                                              max(rr, 8) + 4,
+                                              (0, 255, 0), 3)
+                                _cv2.putText(anno,
+                                              f"r={rr}px",
+                                              (cx + 12, cy - 12),
+                                              _cv2.FONT_HERSHEY_SIMPLEX,
+                                              0.7, (0, 255, 0), 2)
+                                caption = f"Frame {f_idx}: ball at " \
+                                          f"({cx},{cy}) r={rr}px"
+                            else:
+                                h_, w_ = anno.shape[:2]
+                                _cv2.line(anno, (20, 20),
+                                            (80, 80),
+                                            (0, 0, 255), 6)
+                                _cv2.line(anno, (80, 20),
+                                            (20, 80),
+                                            (0, 0, 255), 6)
+                                _cv2.putText(anno,
+                                              "NO DETECTION",
+                                              (100, 60),
+                                              _cv2.FONT_HERSHEY_SIMPLEX,
+                                              1.0, (0, 0, 255), 3)
+                                caption = f"Frame {f_idx}: no ball"
+                            ok_enc, png = _cv2.imencode(".png", anno)
+                            if ok_enc:
+                                preview_imgs.append(png.tobytes())
+                                captions.append(caption)
+                        cap_dbg.release()
+                        cols_dbg = st.columns(2)
+                        for i_p, (img_b, cap_str) in enumerate(
+                                zip(preview_imgs, captions)):
+                            with cols_dbg[i_p % 2]:
+                                st.image(img_b, caption=cap_str,
+                                          use_container_width=True)
+                        n_hit = sum(1 for c in captions if "ball at" in c)
+                        if n_hit == 0:
+                            st.error(
+                                "**Detector found no ball in any of the "
+                                "8 sampled frames.** Try increasing the "
+                                "ball radius MAX (in the calibration "
+                                "section) — for behind-catcher views, "
+                                "balls get bigger as they approach the "
+                                "camera (try max=40). For dimly-lit or "
+                                "low-contrast videos, the brightness "
+                                "threshold may be too strict.")
+                        elif n_hit < 4:
+                            st.warning(
+                                f"Detector found a ball in only "
+                                f"{n_hit}/8 sampled frames. The pipeline "
+                                f"will probably miss some pitches. "
+                                f"Consider widening the radius range.")
+                        else:
+                            st.success(
+                                f"Detector working: ball found in "
+                                f"{n_hit}/8 sampled frames. The full "
+                                f"pipeline should find pitches.")
+            except Exception as e:
+                st.error(f"Preview failed: {e}")
+
     # ===== Step 3 — process =====
     if st.button("Process video", type="primary", use_container_width=True,
                   key=f"{key_prefix}process_btn"):
