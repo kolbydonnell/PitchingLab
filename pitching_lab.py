@@ -15812,7 +15812,9 @@ def render_manual_landmarks_panel(video_path: str,
         key=target_key,
         label_visibility="visible")
 
-    # Show current stored landmarks as a status row
+    # Show current stored landmarks as a HIGHLY VISIBLE status card.
+    # Previously this was a small st.caption that users could miss
+    # entirely after clicking.
     landmark_keys = {
         "pitcher": f"{state_prefix}pitcher_xy",
         "catcher": f"{state_prefix}catcher_xy",
@@ -15820,13 +15822,34 @@ def render_manual_landmarks_panel(video_path: str,
         "ball":    f"{state_prefix}ball_xy",
     }
     cur = {k: st.session_state.get(v) for k, v in landmark_keys.items()}
-    status_bits = []
+    n_stored = sum(1 for v in cur.values() if v)
+    status_html_bits = []
+    color_chips = {"pitcher": "#22d3ee", "catcher": "#22c55e",
+                     "plate":   "#ef4444", "ball":    "#fde047"}
     for k, xy in cur.items():
+        c = color_chips[k]
         if xy:
-            status_bits.append(f"**{k}:** ({xy[0]}, {xy[1]})")
+            status_html_bits.append(
+                f"<span style='background:{c};color:#0f172a;"
+                f"padding:3px 10px;border-radius:6px;font-weight:700;"
+                f"font-size:12px;margin-right:6px;'>"
+                f"✓ {k}: ({xy[0]},{xy[1]})</span>")
         else:
-            status_bits.append(f"{k}: —")
-    st.caption(" · ".join(status_bits))
+            status_html_bits.append(
+                f"<span style='background:#1e293b;color:#475569;"
+                f"padding:3px 10px;border-radius:6px;font-weight:600;"
+                f"font-size:12px;margin-right:6px;border:1px dashed #334155;'>"
+                f"{k}: not set</span>")
+    bar_color = "#22c55e" if n_stored > 0 else "#475569"
+    st.markdown(
+        f"<div style='background:#0f172a;border:1px solid #1e293b;"
+        f"border-left:4px solid {bar_color};border-radius:8px;"
+        f"padding:12px 14px;margin:8px 0;'>"
+        f"<div style='font-size:11px;letter-spacing:0.10em;font-weight:700;"
+        f"color:{bar_color};margin-bottom:8px;'>"
+        f"STORED LANDMARKS — {n_stored}/4</div>"
+        f"<div>{''.join(status_html_bits)}</div></div>",
+        unsafe_allow_html=True)
 
     # Draw existing landmarks as colored circles on the still.
     # streamlit_image_coordinates expects str | Path | np.ndarray | PIL
@@ -17906,7 +17929,15 @@ def _capture_one_camera_for_upload(label: str,
         elif ov.startswith("Force: Behind pitcher"):
             detected = "behind_pitcher"
 
+    # Only TRUE behind-pitcher uses its own pipeline (no calibration,
+    # pose-based throw detection from a close-up pitcher). Behind-catcher
+    # keeps the standard pipeline so manual landmarks + calibration
+    # fusion still work — but we'll flip a flag downstream so the
+    # trajectory fitter knows to use FIXED real-world distance (60.5ft
+    # baseball / 43ft softball) instead of trying to derive it from
+    # pixel motion across the frame.
     is_behind_pitcher = (detected == "behind_pitcher")
+    is_axial_view     = (detected in ("behind_pitcher", "behind_catcher"))
     st.session_state[f"{key_prefix}view_angle_kind"] = detected
 
     # ===== Step 2 — calibrate (auto with single-tap fallback) =====
