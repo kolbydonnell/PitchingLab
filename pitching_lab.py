@@ -14661,7 +14661,8 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
 def detect_ball_in_frame(frame_bgr,
                           ball_radius_px_range: tuple[int, int] = (4, 30),
                           mask_brightness_min: int | str = "auto",
-                          motion_blur_tolerant: bool = True) -> "tuple[int, int] | None":
+                          motion_blur_tolerant: bool = True,
+                          foreground_mask=None) -> "tuple[int, int] | None":
     """Find a single baseball in a BGR image. Returns (x_px, y_px) or None.
 
     Strategy:
@@ -14700,6 +14701,28 @@ def detect_ball_in_frame(frame_bgr,
     else:
         thresh_val = int(mask_brightness_min)
     _, mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
+    # ---- Motion gate ----
+    # If the caller provides a foreground mask (from MOG2 background
+    # subtraction or similar), AND it with the brightness mask. Stadium
+    # lights, white jerseys, scoreboard graphics, etc. are static — they
+    # get zero'd out here. Only the actual moving ball (and any other
+    # legitimate movers like the catcher's mitt) survive.
+    if foreground_mask is not None:
+        try:
+            # Resize to match if shapes differ
+            if foreground_mask.shape[:2] != mask.shape[:2]:
+                foreground_mask = cv2.resize(
+                    foreground_mask, (mask.shape[1], mask.shape[0]))
+            # Dilate the foreground mask a bit so we don't lose ball
+            # pixels at the trailing edge of motion
+            mfg = cv2.dilate(foreground_mask, np.ones((5,5), np.uint8),
+                              iterations=2)
+            mask = cv2.bitwise_and(mask, mfg)
+        except Exception:
+            # Defensive: if anything goes wrong with the motion gate,
+            # fall through to the original brightness-only path so the
+            # detector doesn't silently break.
+            pass
     # Light morphology to consolidate the ball's pixels
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -15747,6 +15770,19 @@ def process_uploaded_video(video_path: str,
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
+    # ----- Background subtractor (motion gate) -----
+    # MOG2 learns the static background over the first few frames, then
+    # gives us a per-frame foreground mask. Pass it to the ball detector
+    # so we ignore stadium lights, white jerseys, scoreboards, and any
+    # other stationary bright objects competing for "looks like a ball".
+    # detectShadows=False because we want a clean binary mask — shadow
+    # pixels (grey 127) would mess with the bitwise AND.
+    bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+        history=120, varThreshold=20, detectShadows=False)
+    # Warm-up: prime the background model on the first 30 frames so we
+    # don't get false "everything is foreground" hits at the very start.
+    warmup_frames = min(30, total_frames // 4 if total_frames else 30)
+
     # ----- Pass 1: detect ball in every frame -----
     positions: list[tuple[float, int, int]] = []
     frame_idx = 0
@@ -15754,10 +15790,16 @@ def process_uploaded_video(video_path: str,
         ok, frame = cap.read()
         if not ok:
             break
+        fg_mask = bg_subtractor.apply(frame)
+        # During warm-up, the bg model isn't trained yet; skip detection.
+        if frame_idx < warmup_frames:
+            frame_idx += 1
+            continue
         pos = detect_ball_in_frame(
             frame,
             ball_radius_px_range=(min_ball_radius, max_ball_radius),
             motion_blur_tolerant=True,
+            foreground_mask=fg_mask,
         )
         if pos:
             t_sec = frame_idx / fps
