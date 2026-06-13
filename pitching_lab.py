@@ -15894,7 +15894,8 @@ def render_manual_landmarks_panel(video_path: str,
         f"<div>{''.join(status_html_bits)}</div></div>",
         unsafe_allow_html=True)
 
-    # Draw existing landmarks as colored circles on the still.
+    # Draw existing landmarks as CROSSHAIR markers (small + dot) so they
+    # don't obscure small things like the ball or a distant pitcher.
     # streamlit_image_coordinates expects str | Path | np.ndarray | PIL
     # Image — NOT bytes — so we pass the decoded numpy array (RGB) to
     # avoid a "must pass a string, Path, numpy array..." ValueError on
@@ -15911,14 +15912,42 @@ def render_manual_landmarks_panel(video_path: str,
                         "catcher": (90, 220, 50),     # green in BGR
                         "plate":   (255, 100, 60),    # red-ish in BGR
                         "ball":    (50, 220, 255)}    # yellow in BGR
+        # Scale marker size with image — smaller markers on smaller stills.
+        _img_h_marker, _img_w_marker = img_bgr.shape[:2]
+        _marker_arm = max(6, min(14, _img_w_marker // 160))   # arm length
+        _marker_dot = 2
+        _gap = 3   # blank gap so the center pixel is visible
+
         for k, xy in cur.items():
-            if xy:
-                _cv2.circle(img_bgr, tuple(int(v) for v in xy),
-                              14, colors_bgr[k], 3)
-                _cv2.putText(img_bgr, k.upper(),
-                                (int(xy[0]) + 18, int(xy[1]) - 6),
-                                _cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                colors_bgr[k], 2)
+            if not xy:
+                continue
+            cx, cy = int(xy[0]), int(xy[1])
+            color = colors_bgr[k]
+            # Crosshair: 4 small line segments around a center gap,
+            # plus a tiny filled dot at exact click point.
+            _cv2.line(img_bgr, (cx - _marker_arm, cy),
+                        (cx - _gap, cy), color, 2)
+            _cv2.line(img_bgr, (cx + _gap, cy),
+                        (cx + _marker_arm, cy), color, 2)
+            _cv2.line(img_bgr, (cx, cy - _marker_arm),
+                        (cx, cy - _gap), color, 2)
+            _cv2.line(img_bgr, (cx, cy + _gap),
+                        (cx, cy + _marker_arm), color, 2)
+            _cv2.circle(img_bgr, (cx, cy), _marker_dot, color, -1)
+            # Short label tag with background pill for contrast
+            label = k[0].upper()   # P / C / Pl / B
+            (tw, th), _bl = _cv2.getTextSize(label,
+                                                  _cv2.FONT_HERSHEY_SIMPLEX,
+                                                  0.5, 1)
+            _x0 = cx + _marker_arm + 4
+            _y0 = cy - th
+            _cv2.rectangle(img_bgr,
+                              (_x0 - 2, _y0 - 2),
+                              (_x0 + tw + 2, _y0 + th + 2),
+                              color, -1)
+            _cv2.putText(img_bgr, label, (_x0, _y0 + th),
+                            _cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (255, 255, 255), 1, _cv2.LINE_AA)
         # streamlit_image_coordinates wants RGB
         display_arg = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2RGB)
     except Exception:
@@ -16610,6 +16639,25 @@ def auto_calibrate_full(video_path: str,
             "plate_width_px":    max(40, frame_width // 20),
             "source":            "fallback (no signals)",
         }
+
+    # AUTHORITATIVE OVERRIDE: any confidence-1.0 candidate is ground
+    # truth — use it ALONE and ignore the lower-confidence auto methods.
+    # Weighted-average fusion drags the answer toward wrong votes when
+    # 3-of-4 auto methods agree on a bad value because they all suffer
+    # from the same upstream problem (pose detection failure on the
+    # video). Manual clicks bypass that.
+    confident_candidates = [c for c in candidates if c[1] >= 1.0]
+    if confident_candidates:
+        # If multiple confidence-1.0 results, pick the most informative
+        # (prefer manual_pitcher_catcher_geometry which uses two clicks
+        # over manual_plate which uses one).
+        confident_candidates.sort(
+            key=lambda c: (0 if "geometry" in c[0] else 1, c[0]))
+        chosen = confident_candidates[0]
+        out = dict(chosen[2])
+        out["source"] = f"authoritative ({chosen[0]}@1.00)"
+        if progress_cb: progress_cb(1.0)
+        return out
 
     # Outlier rejection on scale: drop candidates whose plate_width_px is
     # >3x or <1/3x the median.
