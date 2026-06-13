@@ -6719,6 +6719,53 @@ def init_db():
             if col not in ocols:
                 c.execute(ddl)
 
+    # ===== AUTO-BOOTSTRAP THE OWNER'S ADMIN ACCOUNT =====
+    # First-ever startup creates a baseline admin so the operator
+    # (you) can always sign in even if the DB was wiped. Skipped if
+    # ANY admin account already exists.
+    _bootstrap_owner_admin_account()
+
+
+def _bootstrap_owner_admin_account():
+    """Ensure an `admin` user with the owner's password exists.
+
+    Runs once at startup. If there's already at least one admin in the
+    users table, this is a no-op — so it never overwrites an existing
+    password. If the username 'admin' exists but isn't admin role
+    (legacy), it gets promoted.
+    """
+    import os
+    from datetime import datetime as _dt
+    OWNER_USERNAME = "admin"
+    OWNER_PASSWORD = "panthers"   # change at signin → forgot-password later
+    try:
+        with _db_conn() as c:
+            any_admin = c.execute(
+                "SELECT 1 FROM users WHERE role = 'admin' LIMIT 1"
+            ).fetchone()
+            if any_admin:
+                # Promote 'admin' username to admin role if present but
+                # not yet admin (legacy DBs)
+                c.execute(
+                    "UPDATE users SET role = 'admin' "
+                    "WHERE username = ? AND role != 'admin'",
+                    (OWNER_USERNAME,))
+                return
+            # No admin exists — create one
+            salt = os.urandom(16)
+            c.execute(
+                "INSERT INTO users (username, password_hash, salt, "
+                "created_at, role, org_id, linked_athlete_id, email) "
+                "VALUES (?, ?, ?, ?, 'admin', NULL, NULL, NULL)",
+                (OWNER_USERNAME,
+                 _hash_password(OWNER_PASSWORD, salt),
+                 salt.hex(),
+                 _dt.utcnow().isoformat()))
+    except Exception:
+        # Never block app startup over the bootstrap — if it fails,
+        # the user can still sign up normally.
+        pass
+
 
 # =============================================================================
 # AUTH HELPERS
@@ -13926,19 +13973,21 @@ def run_hitting_lab(athlete_name: str, athlete_hand: str, athlete_class: str,
 
 def detect_ball_in_frame(frame_bgr,
                           ball_radius_px_range: tuple[int, int] = (4, 30),
-                          mask_brightness_min: int = 200,
+                          mask_brightness_min: int | str = "auto",
                           motion_blur_tolerant: bool = True) -> "tuple[int, int] | None":
     """Find a single baseball in a BGR image. Returns (x_px, y_px) or None.
 
     Strategy:
-      1. Convert to grayscale + threshold for bright pixels (baseball is
-         white against most backgrounds: sky, dirt, grass, netting).
+      1. Convert to grayscale + adaptive bright-pixel threshold.
       2. Find connected white regions.
       3. Pick the one most circular and in the expected radius range.
 
     Tuning notes for real-world deployment:
-      - mask_brightness_min: lower for cloudy days / indoor nets, higher
-        for direct sunlight.
+      - mask_brightness_min: pass an int (0-255) to force a fixed
+        threshold, or "auto" (default) to derive it from each frame's
+        actual brightness distribution. Auto handles indoor nets,
+        cloudy days, shaded fields, and bright sun without manual
+        per-field tuning.
       - ball_radius_px_range: depends on camera distance. At ~30 ft from a
         plate, a baseball is roughly 8-15 px. At 60 ft from the mound,
         10-20 px. Field-tune from the first capture.
@@ -13949,7 +13998,21 @@ def detect_ball_in_frame(frame_bgr,
     except Exception:
         return None
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, mask_brightness_min, 255, cv2.THRESH_BINARY)
+    # ---- Adaptive brightness threshold ----
+    # The ball is among the brightest pixels in the frame. Sample the
+    # 99.5th percentile brightness and set the threshold to 80% of that.
+    # This works for indoor nets (where peak brightness might be 150)
+    # AND for bright sun (where peak is 250+). Falls back to the legacy
+    # fixed-200 threshold if percentile math fails.
+    if mask_brightness_min == "auto":
+        try:
+            peak = int(np.percentile(gray, 99.5))
+            thresh_val = max(110, min(230, int(peak * 0.80)))
+        except Exception:
+            thresh_val = 200
+    else:
+        thresh_val = int(mask_brightness_min)
+    _, mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
     # Light morphology to consolidate the ball's pixels
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -14130,7 +14193,11 @@ def fit_pitch_trajectory(positions: "list[tuple[float, int, int]]",
       - n_samples_used
     Or None if there aren't enough samples / data is too noisy.
     """
-    if len(positions) < 5:
+    # 3-sample minimum (was 5) — at 30 fps a 95 mph fastball is only
+    # in the frame ~13 frames, so requiring 5 successful detections is
+    # too strict. 3 lets us still fit a parabola; fewer would mean the
+    # ball was barely visible anyway.
+    if len(positions) < 3:
         return None
     try:
         import numpy as np
