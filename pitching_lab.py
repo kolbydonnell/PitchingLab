@@ -15715,6 +15715,131 @@ _SANITY_BOUNDS = {
 }
 
 
+def _calibrate_from_catcher_pose(video_path: str,
+                                       n_samples: int = 12) -> dict | None:
+    """Estimate plate location + pixel-to-feet scale from the catcher's
+    body using MediaPipe pose detection.
+
+    In a behind-catcher view the catcher is the largest, most visible
+    person in the frame. Their body gives us TWO things our other
+    methods can't:
+      1. PLATE LOCATION — the catcher squats directly above home plate.
+         Median of pelvis-center positions across multiple frames = plate
+         pixel coords.
+      2. SCALE REFERENCE — average adult catcher shoulder width is
+         ~18-20 inches. Their detected shoulder-width in pixels gives
+         us a robust pixels-per-inch ratio. This is MORE reliable than
+         ball-radius scale (which under-measures because the brightness
+         filter only captures the ball's whitest core, not its true
+         diameter).
+
+    Returns calibration dict or None if pose can't be locked in.
+    """
+    if not _is_mediapipe_available():
+        return None
+    try:
+        import cv2 as _cv2
+        import mediapipe as _mp
+    except Exception:
+        return None
+
+    cap = _cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    n_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_h  = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+    frame_w  = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+    if n_frames < 30:
+        cap.release()
+        return None
+
+    mp_pose = _mp.solutions.pose
+    L = mp_pose.PoseLandmark
+
+    plate_xs: list = []
+    plate_ys: list = []
+    shoulder_widths_px: list = []
+    sample_indices = [int(n_frames * (k + 0.5) / n_samples)
+                       for k in range(n_samples)]
+    pose = mp_pose.Pose(model_complexity=1, enable_segmentation=False,
+                          min_detection_confidence=0.5)
+    try:
+        for f_idx in sample_indices:
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+            res = pose.process(rgb)
+            if not res.pose_landmarks:
+                continue
+            lm = res.pose_landmarks.landmark
+            # Catcher heuristic: knees should be bent (catcher squats).
+            # We check that knee-to-hip vertical distance is small AND
+            # knee Y is well below hip Y (knees forward of body).
+            lhip = lm[L.LEFT_HIP.value]
+            rhip = lm[L.RIGHT_HIP.value]
+            lknee = lm[L.LEFT_KNEE.value]
+            rknee = lm[L.RIGHT_KNEE.value]
+            lshoulder = lm[L.LEFT_SHOULDER.value]
+            rshoulder = lm[L.RIGHT_SHOULDER.value]
+            # Average Y positions (normalized 0..1, higher = lower in img)
+            hip_y = (lhip.y + rhip.y) / 2
+            knee_y = (lknee.y + rknee.y) / 2
+            shoulder_y = (lshoulder.y + rshoulder.y) / 2
+            # Catcher: knees BELOW or nearly at hip level (squat). For
+            # a standing pose, knees are well below hips (knee_y - hip_y
+            # ~0.25). For a deep squat, knees are nearly at hip height
+            # (knee_y - hip_y ~0.05). Use < 0.18 as the squat threshold.
+            squat_score = knee_y - hip_y
+            # Also reject pitchers (mid-frame, standing) — catcher is
+            # usually in the LOWER half AND closer to the camera
+            # (larger silhouette).
+            torso_height = max(0.05, knee_y - shoulder_y)
+            is_catcher = (squat_score < 0.18 and shoulder_y > 0.30
+                            and torso_height > 0.15)
+            if not is_catcher:
+                continue
+            # Plate location: under the pelvis center, slightly forward
+            # (in image y) toward the catcher's knees
+            hip_cx = (lhip.x + rhip.x) / 2 * frame_w
+            hip_cy = (lhip.y + rhip.y) / 2 * frame_h
+            knee_cy = (lknee.y + rknee.y) / 2 * frame_h
+            plate_x_px = int(hip_cx)
+            plate_y_px = int((hip_cy + knee_cy) / 2)
+            # Scale: shoulder width in pixels → 19 inches
+            sh_w_px = abs(lshoulder.x - rshoulder.x) * frame_w
+            if sh_w_px < 20:
+                continue
+            plate_xs.append(plate_x_px)
+            plate_ys.append(plate_y_px)
+            shoulder_widths_px.append(sh_w_px)
+    finally:
+        pose.close()
+        cap.release()
+
+    if not shoulder_widths_px or len(shoulder_widths_px) < 2:
+        return None
+
+    plate_xs.sort(); plate_ys.sort(); shoulder_widths_px.sort()
+    plate_x_med = plate_xs[len(plate_xs) // 2]
+    plate_y_med = plate_ys[len(plate_ys) // 2]
+    sh_w_med    = shoulder_widths_px[len(shoulder_widths_px) // 2]
+
+    # Convert shoulder width (~19") to plate width (17")
+    pixels_per_inch = sh_w_med / 19.0
+    plate_w_px = int(pixels_per_inch * 17.0)
+
+    return {
+        "plate_center_x_px": int(plate_x_med),
+        "plate_center_y_px": int(plate_y_med),
+        "plate_width_px":    max(20, plate_w_px),
+        "source":            f"catcher pose ({len(shoulder_widths_px)} "
+                              f"frames, shoulder={sh_w_med:.0f}px)",
+        "confidence":        0.85,   # high — anthropometry-grounded
+    }
+
+
 def auto_calibrate_from_trajectories(pitches_positions: list,
                                           frame_width: int = 1920,
                                           frame_height: int = 1080) -> dict:
@@ -15806,6 +15931,122 @@ def auto_calibrate_from_trajectories(pitches_positions: list,
         "plate_width_px":    plate_w_px,
         "source":            f"auto (median ball r={median_r:.1f}px, "
                               f"{len(end_xs)} trajectory endpoints)",
+    }
+
+
+def auto_calibrate_full(video_path: str,
+                              pitches_positions: list,
+                              frame_width: int = 1920,
+                              frame_height: int = 1080,
+                              progress_cb=None) -> dict:
+    """Multi-modal calibration fusion. Runs every available method,
+    weights them by confidence, and returns the best calibration.
+
+    Robust because no single signal has to work for the app to work:
+      - Catcher present → catcher-pose method gives high-confidence
+        plate location + scale from shoulder width (~19" anthropometric).
+      - Plate visible → image-based plate detection.
+      - Ball detected → trajectory convergence gives plate location,
+        ball radius gives scale (lower confidence due to brightness-
+        filter bias).
+      - Nothing works → fall back to centered frame defaults.
+
+    The fusion strategy: collect all candidates, weight by confidence,
+    take a weighted median of plate position and weighted average of
+    scale. Wildly outlier candidates (>3x off the median) get dropped.
+    """
+    candidates = []   # list of (label, confidence, cal_dict)
+
+    # Method 1: catcher pose (most reliable for behind-catcher views)
+    if progress_cb: progress_cb(0.05)
+    catcher_cal = _calibrate_from_catcher_pose(video_path)
+    if catcher_cal:
+        candidates.append(("catcher_pose", catcher_cal.get("confidence", 0.85),
+                            catcher_cal))
+
+    # Method 2: image-based plate auto-detect
+    if progress_cb: progress_cb(0.30)
+    try:
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(video_path)
+        n = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
+        plate_hit = None
+        for k in range(1, 9):
+            if not n: break
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, int(n * k / 10))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            ok_enc, buf = _cv2.imencode(".jpg", frame)
+            if ok_enc:
+                p = auto_detect_plate(buf.tobytes())
+                if p:
+                    plate_hit = p
+                    break
+        cap.release()
+        if plate_hit:
+            cx, cy, w = plate_hit
+            candidates.append(("plate_image_detect", 0.75, {
+                "plate_center_x_px": int(cx),
+                "plate_center_y_px": int(cy),
+                "plate_width_px":    int(w),
+                "source":            "image plate auto-detect",
+            }))
+    except Exception:
+        pass
+
+    # Method 3: ball-trajectory convergence (always available if we got
+    # this far — fits work means we have trajectories)
+    if progress_cb: progress_cb(0.60)
+    if pitches_positions:
+        traj_cal = auto_calibrate_from_trajectories(
+            pitches_positions, frame_width=frame_width,
+            frame_height=frame_height)
+        # Lower confidence because brightness-filtered ball radius
+        # under-measures the true ball size, biasing scale low.
+        candidates.append(("ball_trajectory", 0.55, traj_cal))
+
+    if progress_cb: progress_cb(0.90)
+
+    # No candidates at all → use frame-center defaults
+    if not candidates:
+        return {
+            "plate_center_x_px": frame_width // 2,
+            "plate_center_y_px": int(frame_height * 0.75),
+            "plate_width_px":    max(40, frame_width // 20),
+            "source":            "fallback (no signals)",
+        }
+
+    # Outlier rejection on scale: drop candidates whose plate_width_px is
+    # >3x or <1/3x the median.
+    widths = sorted(c[2]["plate_width_px"] for c in candidates)
+    median_w = widths[len(widths) // 2]
+    candidates = [c for c in candidates
+                    if (median_w / 3.0) <= c[2]["plate_width_px"] <= (median_w * 3.0)]
+
+    if not candidates:
+        # Everything was an outlier of itself — use the median width
+        # against a frame-centered position
+        return {
+            "plate_center_x_px": frame_width // 2,
+            "plate_center_y_px": int(frame_height * 0.75),
+            "plate_width_px":    median_w,
+            "source":            "fallback (all signals disagreed)",
+        }
+
+    # Weighted-average fusion
+    total_w = sum(c[1] for c in candidates)
+    fused_cx = sum(c[1] * c[2]["plate_center_x_px"] for c in candidates) / total_w
+    fused_cy = sum(c[1] * c[2]["plate_center_y_px"] for c in candidates) / total_w
+    fused_w  = sum(c[1] * c[2]["plate_width_px"] for c in candidates) / total_w
+
+    source_str = " + ".join(f"{c[0]}@{c[1]:.2f}" for c in candidates)
+    if progress_cb: progress_cb(1.0)
+    return {
+        "plate_center_x_px": int(fused_cx),
+        "plate_center_y_px": int(fused_cy),
+        "plate_width_px":    int(fused_w),
+        "source":            f"fused ({source_str})",
     }
 
 
@@ -16036,7 +16277,7 @@ def process_uploaded_video(video_path: str,
                     not cal_in.get("plate_width_px") or
                     cal_in.get("plate_width_px", 0) < 10)
     if needs_auto:
-        # Need frame dims for the fallback inside the auto-calibrator
+        # Frame dims for the fusion calibrator
         try:
             import cv2 as _cv2
             _c = _cv2.VideoCapture(video_path)
@@ -16045,8 +16286,13 @@ def process_uploaded_video(video_path: str,
             _c.release()
         except Exception:
             fw, fh = 1920, 1080
-        auto_cal = auto_calibrate_from_trajectories(
-            pitches, frame_width=fw, frame_height=fh)
+        # Multi-modal fusion: catcher pose + plate detect + ball trajectory.
+        # Each method runs, contributes a weighted vote, outliers get
+        # rejected. Robust to: no plate / no catcher / bad lighting /
+        # blurry ball — as long as SOME signal works, we get calibration.
+        auto_cal = auto_calibrate_full(
+            video_path, pitches,
+            frame_width=fw, frame_height=fh)
         cal_in.update(auto_cal)
         try:
             print(f"[upload-side] auto-calibrated: "
