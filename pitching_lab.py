@@ -15715,6 +15715,56 @@ _SANITY_BOUNDS = {
 }
 
 
+# ===== Module-level diagnostics from the most recent upload run =====
+# Captured so the UI can show "8 pitches detected, all 8 failed sanity"
+# banners even when the final returned list is empty. Keyed by video_path
+# (the canonical input to the upload pipeline).
+_UPLOAD_DIAGNOSTICS: dict = {}
+
+
+def _filter_throw_backs(pitches: list) -> tuple:
+    """Catcher throws the ball back to the pitcher between pitches.
+    Those motion sequences look IDENTICAL to pitches from our detector's
+    perspective (bright moving baseball traversing the frame) but go in
+    the opposite direction. Real pitches all move the same direction;
+    throw-backs are in the minority direction. Filter accordingly.
+
+    Returns (pitches_kept, n_dropped).
+    """
+    if len(pitches) < 2:
+        return list(pitches), 0
+    # Compute net horizontal motion per pitch
+    nets = []
+    for p in pitches:
+        # plate_x_ft is the END position; release_x is the START.
+        # The sign of (plate_x - 0) tells us where the ball ended up
+        # relative to mound — but plate_x is in feet, not pixels.
+        # Simpler: use the raw pixel x at start vs end which lives in
+        # the trajectory samples. Fall back to plate_x_ft sign if not.
+        start_x = p.get("_first_x_px")
+        end_x   = p.get("_last_x_px")
+        if start_x is not None and end_x is not None:
+            nets.append(end_x - start_x)
+        elif p.get("plate_x_ft") is not None:
+            nets.append(p["plate_x_ft"])
+        else:
+            nets.append(0.0)
+    pos_count = sum(1 for v in nets if v > 0)
+    neg_count = sum(1 for v in nets if v < 0)
+    if pos_count == 0 or neg_count == 0:
+        # All moved the same direction — nothing to filter.
+        return list(pitches), 0
+    # Keep the majority direction
+    keep_positive = pos_count >= neg_count
+    kept, dropped = [], 0
+    for p, v in zip(pitches, nets):
+        if (keep_positive and v >= 0) or ((not keep_positive) and v <= 0):
+            kept.append(p)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 def _sanity_filter_pitches(pitches: list, sport: str = "Baseball") -> tuple:
     """Drop pitches whose computed metrics are physically impossible.
 
@@ -15885,24 +15935,49 @@ def process_uploaded_video(video_path: str,
         # Time window of this pitch — used downstream for pose extraction
         fit["t_start_sec"]  = float(pitch_positions[0][0])
         fit["t_end_sec"]    = float(pitch_positions[-1][0])
+        # Stash the raw start/end pixel positions so the throw-back
+        # filter can see motion direction at the trajectory level.
+        fit["_first_x_px"]  = float(pitch_positions[0][1])
+        fit["_last_x_px"]   = float(pitch_positions[-1][1])
         fitted.append(fit)
+
+    # ---- Throw-back filter ----
+    # Catchers throw the ball BACK to the pitcher after every pitch.
+    # Those throws are real moving baseballs but they go in the opposite
+    # horizontal direction. Drop them BEFORE sanity bounds so the user
+    # sees an accurate "real pitches found" count.
+    after_throwback, n_throwback = _filter_throw_backs(fitted)
 
     # Sanity-bound filter: drop physically impossible pitches caused by
     # bad calibration (edited videos, slow-mo replays, plate auto-detect
-    # latching onto noise). Attach the diagnostics so the upload tab can
-    # tell the user *why* their session is mostly empty.
-    kept, dropped, reasons = _sanity_filter_pitches(fitted, sport=sport)
+    # latching onto noise).
+    kept, dropped, reasons = _sanity_filter_pitches(
+        after_throwback, sport=sport)
+
+    # Stash diagnostics in the module-level dict so the UI can show
+    # "8 detected, 3 throw-backs, 5 failed sanity, 0 final" even when
+    # the returned list is empty.
+    _UPLOAD_DIAGNOSTICS[video_path] = {
+        "detected_total":  len(fitted),
+        "throw_backs":     n_throwback,
+        "sanity_dropped":  len(dropped),
+        "sanity_reasons":  reasons[:5],
+        "kept":            len(kept),
+    }
     if dropped:
         try:
-            print(f"[upload-side] sanity filter dropped "
-                  f"{len(dropped)}/{len(fitted)} pitches: "
-                  f"{reasons[:3]}")
+            print(f"[upload-side] detected={len(fitted)}, "
+                  f"throw_backs_dropped={n_throwback}, "
+                  f"sanity_dropped={len(dropped)}, kept={len(kept)}")
         except Exception:
             pass
-        if kept:
-            kept[0]["_sanity_dropped"] = len(dropped)
-            kept[0]["_sanity_total"]   = len(fitted)
-            kept[0]["_sanity_reasons"] = reasons[:5]
+    if kept:
+        # Also attach to the first kept pitch so the existing inline
+        # banner code keeps working.
+        kept[0]["_sanity_dropped"]  = len(dropped)
+        kept[0]["_sanity_total"]    = len(after_throwback)
+        kept[0]["_sanity_reasons"]  = reasons[:5]
+        kept[0]["_throwback_count"] = n_throwback
     return kept
 
 
@@ -17213,37 +17288,60 @@ def _capture_one_camera_for_upload(label: str,
                     "Skeleton overlay + biomech skipped — MediaPipe not "
                     "available. Ball flight metrics were captured.")
             st.session_state[pitches_session_key] = pitches
-            # Sanity-filter banner — surface dropped pitches caused by
-            # bad plate calibration (edited videos, slow-mo replays).
-            sanity_dropped = (pitches[0].get("_sanity_dropped")
-                              if pitches else 0)
-            sanity_total = (pitches[0].get("_sanity_total")
-                              if pitches else len(pitches))
-            sanity_reasons = (pitches[0].get("_sanity_reasons") or []
-                              if pitches else [])
-            if pitches and sanity_dropped:
+            # Pull the module-level diagnostics dict that the upload
+            # pipeline writes. This survives the empty-pitches case so
+            # we can show "8 detected, 3 throw-backs, 5 failed sanity"
+            # banners even when nothing made it to the UI table.
+            diag = _UPLOAD_DIAGNOSTICS.get(
+                proc_path if not is_behind_pitcher else tmp_path, {}) or {}
+            n_detected   = diag.get("detected_total", len(pitches))
+            n_throwback  = diag.get("throw_backs", 0)
+            n_sanity_bad = diag.get("sanity_dropped", 0)
+            sanity_reasons = diag.get("sanity_reasons") or []
+
+            if pitches and (n_throwback or n_sanity_bad):
+                # SOME pitches survived but the pipeline trimmed garbage.
+                breakdown = []
+                if n_throwback:
+                    breakdown.append(
+                        f"{n_throwback} catcher throw-back(s)")
+                if n_sanity_bad:
+                    breakdown.append(
+                        f"{n_sanity_bad} pitch(es) with impossible "
+                        f"numbers (bad calibration)")
                 st.warning(
-                    f"**Found {len(pitches)} clean pitch(es)** — but "
-                    f"{sanity_dropped} of {sanity_total} candidate pitches "
-                    f"were filtered out because their numbers were "
-                    f"physically impossible (e.g., 127 mph, 600+ inches of "
-                    f"break). That almost always means the plate "
-                    f"calibration found the wrong object, or the video has "
-                    f"slow-motion replays / cuts mixed in.\n\n"
-                    f"**Fix:** re-record with a single static camera, "
-                    f"side angle, full bullpen in one take (no editing), "
-                    f"30 fps or higher, plate clearly visible in frame.")
+                    f"**Found {len(pitches)} valid pitch(es)** out of "
+                    f"{n_detected} ball-flight events detected. Filtered "
+                    f"out: {', '.join(breakdown)}.")
             elif pitches:
-                st.success(f"Found {len(pitches)} pitch(es) in this video.")
-            elif sanity_total:
-                # We DID detect motion, but every candidate was nonsense.
-                st.error(
-                    f"Detected {sanity_total} pitch candidates, but every "
-                    f"one failed sanity checks — plate calibration is "
-                    f"almost certainly wrong for this video. Re-record as "
-                    f"a single continuous take from a static side angle, "
-                    f"no slow-motion replays, and make sure home plate is "
-                    f"clearly visible.")
+                st.success(
+                    f"Found {len(pitches)} pitch(es) in this video.")
+            elif n_detected:
+                # We DID detect motion but everything got filtered.
+                lines = [
+                    f"**Detected {n_detected} ball-flight events but kept 0 "
+                    f"after filtering.** Breakdown:",
+                ]
+                if n_throwback:
+                    lines.append(
+                        f"- {n_throwback} were catcher throw-backs "
+                        f"(opposite direction motion)")
+                if n_sanity_bad:
+                    lines.append(
+                        f"- {n_sanity_bad} produced physically impossible "
+                        f"numbers (plate calibration is wrong — the "
+                        f"catcher's shoulder or jersey is probably "
+                        f"covering the plate, so auto-detect locked onto "
+                        f"the wrong object)")
+                if sanity_reasons:
+                    lines.append(
+                        f"- Example failure: `{sanity_reasons[0]}`")
+                lines.append(
+                    "**Fix:** open the calibration panel above and "
+                    "click directly on the plate in a clear frame "
+                    "(when the catcher isn't blocking it). That "
+                    "manual override beats auto-detect.")
+                st.error("\n".join(lines))
             else:
                 st.warning(
                     f"No pitches detected. Try lowering ball radius min "
