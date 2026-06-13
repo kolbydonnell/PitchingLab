@@ -15715,6 +15715,286 @@ _SANITY_BOUNDS = {
 }
 
 
+def render_manual_landmarks_panel(video_path: str,
+                                       state_prefix: str,
+                                       sport: str = "Baseball",
+                                       display_width: int = 720
+                                       ) -> dict:
+    """Last-resort manual fallback. Lets the user click directly on the
+    pitcher, catcher, plate, or a ball in any combination. Returns a
+    dict of whatever they clicked.
+
+    Each click overrides the corresponding auto-detected anchor at
+    confidence 1.0, so if the user provides ANY clicks, those become
+    the ground truth.
+
+    Storage keys (state_prefix-prefixed in session_state):
+      - pitcher_xy: (x_px, y_px) in original video coordinates
+      - catcher_xy: (x_px, y_px)
+      - plate_xy:   (x_px, y_px)
+      - ball_xy:    (x_px, y_px) — used to refine the radius search window
+    """
+    if not _is_click_calibration_available():
+        st.caption(
+            "Manual landmarks need the `streamlit-image-coordinates` "
+            "package. Run `enable_live_capture.command` to install it.")
+        return {}
+
+    from streamlit_image_coordinates import streamlit_image_coordinates
+
+    png, orig_w, orig_h = extract_calibration_still(video_path)
+    if png is None:
+        st.error("Couldn't extract a still from the video.")
+        return {}
+
+    target_key = f"{state_prefix}m_target"
+    if target_key not in st.session_state:
+        st.session_state[target_key] = "pitcher"
+
+    st.markdown(
+        "**Manual landmarks** — click any of these directly on the still "
+        "below. Any click overrides the matching auto-detection.")
+    target = st.radio(
+        "What does the next click identify?",
+        ["pitcher", "catcher", "plate (center)", "ball"],
+        horizontal=True,
+        key=target_key,
+        label_visibility="visible")
+
+    # Show current stored landmarks as a status row
+    landmark_keys = {
+        "pitcher": f"{state_prefix}pitcher_xy",
+        "catcher": f"{state_prefix}catcher_xy",
+        "plate":   f"{state_prefix}plate_xy",
+        "ball":    f"{state_prefix}ball_xy",
+    }
+    cur = {k: st.session_state.get(v) for k, v in landmark_keys.items()}
+    status_bits = []
+    for k, xy in cur.items():
+        if xy:
+            status_bits.append(f"**{k}:** ({xy[0]}, {xy[1]})")
+        else:
+            status_bits.append(f"{k}: —")
+    st.caption(" · ".join(status_bits))
+
+    # Draw existing landmarks as colored circles on the still
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        arr = _np.frombuffer(png, dtype=_np.uint8)
+        img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
+        colors = {"pitcher": (50, 200, 255),    # cyan
+                    "catcher": (50, 220, 90),     # green
+                    "plate":   (60, 100, 255),    # red-ish
+                    "ball":    (255, 220, 50)}    # yellow
+        for k, xy in cur.items():
+            if xy:
+                _cv2.circle(img, xy, 14, colors[k], 3)
+                _cv2.putText(img, k.upper(), (xy[0]+18, xy[1]-6),
+                                _cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[k], 2)
+        ok_enc, png_out = _cv2.imencode(".png", img)
+        if ok_enc:
+            png = png_out.tobytes()
+    except Exception:
+        pass
+
+    click = streamlit_image_coordinates(
+        png, width=display_width,
+        key=f"{state_prefix}manual_landmark_img")
+    if click is not None:
+        scale_x = orig_w / display_width
+        disp_h = int(orig_h * display_width / max(1, orig_w))
+        scale_y = orig_h / max(1, disp_h)
+        clicked_xy = (int(click["x"] * scale_x),
+                       int(click["y"] * scale_y))
+        # Strip "(center)" suffix from the target name
+        target_clean = target.split()[0]
+        store_key = landmark_keys[target_clean]
+        st.session_state[store_key] = clicked_xy
+        st.rerun()
+
+    btn_cols = st.columns(4)
+    for i, label in enumerate(["pitcher", "catcher", "plate", "ball"]):
+        with btn_cols[i]:
+            if st.button(f"Clear {label}",
+                            key=f"{state_prefix}clear_{label}",
+                            use_container_width=True):
+                st.session_state.pop(landmark_keys[label], None)
+                st.rerun()
+
+    # Build return dict
+    out = {}
+    for k, sk in landmark_keys.items():
+        v = st.session_state.get(sk)
+        if v:
+            out[f"{k}_xy"] = v
+    return out
+
+
+def _detect_pitcher_catcher_anchors(video_path: str,
+                                          n_samples: int = 16) -> dict:
+    """Detect pitcher and catcher anchor points from pose across multiple
+    frames. Returns:
+        {
+          "pitcher_xy":     (x_px, y_px) or None,
+          "catcher_xy":     (x_px, y_px) or None,
+          "frame_width":    int,
+          "frame_height":   int,
+          "n_frames_seen":  {"pitcher": int, "catcher": int},
+        }
+
+    Strategy:
+      - Sample N frames evenly across the video.
+      - Run MediaPipe Pose on each. Classify each detection as pitcher
+        (standing — knees nearly straight) or catcher (squatting — knees
+        bent below ~120°).
+      - Within each class, take the median pelvis position as the anchor.
+      - In side view, the pitcher is the high-motion cluster and the
+        catcher is the low-motion cluster.
+      - Anchors are used downstream to constrain ROI, filter throw-backs
+        by start/end region, and (most powerfully) derive a high-
+        confidence pixels-per-foot scale from the KNOWN real-world
+        distance between pitcher and catcher.
+    """
+    out = {
+        "pitcher_xy":    None,
+        "catcher_xy":    None,
+        "frame_width":   1920,
+        "frame_height":  1080,
+        "n_frames_seen": {"pitcher": 0, "catcher": 0},
+    }
+    if not _is_mediapipe_available():
+        return out
+    try:
+        import cv2 as _cv2
+        import mediapipe as _mp
+    except Exception:
+        return out
+    cap = _cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return out
+    n_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
+    out["frame_width"]  = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+    out["frame_height"] = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+    if n_frames < 30:
+        cap.release()
+        return out
+
+    mp_pose = _mp.solutions.pose
+    L = mp_pose.PoseLandmark
+    pose = mp_pose.Pose(model_complexity=1, enable_segmentation=False,
+                          min_detection_confidence=0.4)
+    pitcher_pts: list = []
+    catcher_pts: list = []
+    sample_indices = [int(n_frames * (k + 0.5) / n_samples)
+                       for k in range(n_samples)]
+    try:
+        for f_idx in sample_indices:
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+            res = pose.process(rgb)
+            if not res.pose_landmarks:
+                continue
+            lm = res.pose_landmarks.landmark
+            # Joint angles + position to classify as pitcher vs catcher
+            lhip   = lm[L.LEFT_HIP.value]
+            rhip   = lm[L.RIGHT_HIP.value]
+            lknee  = lm[L.LEFT_KNEE.value]
+            rknee  = lm[L.RIGHT_KNEE.value]
+            lankle = lm[L.LEFT_ANKLE.value]
+            rankle = lm[L.RIGHT_ANKLE.value]
+            # Knee bend angle = hip-knee-ankle. Standing ~170°, squat ~80°.
+            def _angle(p_top, p_mid, p_bot):
+                import math as _m
+                v1 = (p_top.x - p_mid.x, p_top.y - p_mid.y)
+                v2 = (p_bot.x - p_mid.x, p_bot.y - p_mid.y)
+                dot = v1[0]*v2[0] + v1[1]*v2[1]
+                mag1 = (v1[0]**2 + v1[1]**2) ** 0.5
+                mag2 = (v2[0]**2 + v2[1]**2) ** 0.5
+                if mag1 * mag2 == 0: return 180.0
+                cos_a = max(-1.0, min(1.0, dot/(mag1*mag2)))
+                return _m.degrees(_m.acos(cos_a))
+            lkb = _angle(lhip, lknee, lankle)
+            rkb = _angle(rhip, rknee, rankle)
+            knee_bend = (lkb + rkb) / 2
+            hip_cx = (lhip.x + rhip.x) / 2 * out["frame_width"]
+            hip_cy = (lhip.y + rhip.y) / 2 * out["frame_height"]
+            if knee_bend < 130:
+                # Squatting → catcher
+                catcher_pts.append((hip_cx, hip_cy))
+            elif knee_bend > 155:
+                # Standing → pitcher
+                pitcher_pts.append((hip_cx, hip_cy))
+            # else: ambiguous (transition pose), skip
+    finally:
+        pose.close()
+        cap.release()
+
+    out["n_frames_seen"]["pitcher"] = len(pitcher_pts)
+    out["n_frames_seen"]["catcher"] = len(catcher_pts)
+
+    def _median_xy(pts):
+        if not pts:
+            return None
+        xs = sorted(p[0] for p in pts)
+        ys = sorted(p[1] for p in pts)
+        return (int(xs[len(xs)//2]), int(ys[len(ys)//2]))
+
+    out["pitcher_xy"] = _median_xy(pitcher_pts)
+    out["catcher_xy"] = _median_xy(catcher_pts)
+    return out
+
+
+def _calibrate_from_pitcher_catcher_geometry(video_path: str,
+                                                  sport: str = "Baseball",
+                                                  ) -> dict | None:
+    """Highest-confidence calibration: use the KNOWN real-world distance
+    between pitcher and catcher (60.5 ft baseball, 43 ft softball) and
+    their detected pixel positions to compute pixels-per-foot directly.
+
+    This beats all other scale methods because:
+      - It doesn't depend on a visible plate.
+      - It doesn't depend on anthropometric estimates (shoulder width
+        varies by athlete).
+      - It doesn't depend on the brightness-filtered ball radius
+        (which under-measures the true ball).
+      - The distance is fixed by rule — no measurement error in the
+        reference.
+    """
+    anchors = _detect_pitcher_catcher_anchors(video_path)
+    p_xy = anchors["pitcher_xy"]
+    c_xy = anchors["catcher_xy"]
+    if not p_xy or not c_xy:
+        return None
+    dx = p_xy[0] - c_xy[0]
+    dy = p_xy[1] - c_xy[1]
+    pixel_dist = (dx * dx + dy * dy) ** 0.5
+    if pixel_dist < 50:
+        # Pitcher and catcher detected too close together — likely both
+        # are the same person (pose detection latched onto one twice).
+        return None
+    real_dist_ft = TUNNEL_CONSTANTS.get(sport, TUNNEL_CONSTANTS["Baseball"]
+                                            )["rubber_distance_ft"]
+    pixels_per_foot = pixel_dist / real_dist_ft
+    # Plate width = 17 inches = 17/12 feet
+    plate_w_px = int(pixels_per_foot * (17.0 / 12.0))
+    return {
+        "plate_center_x_px": int(c_xy[0]),
+        "plate_center_y_px": int(c_xy[1]),
+        "plate_width_px":    max(20, plate_w_px),
+        "source":            f"pitcher-catcher geometry "
+                              f"(d={pixel_dist:.0f}px = {real_dist_ft}ft, "
+                              f"pitcher@({p_xy[0]},{p_xy[1]}), "
+                              f"catcher@({c_xy[0]},{c_xy[1]}))",
+        "confidence":        0.95,   # highest possible — fixed-rule distance
+        "pitcher_xy":        p_xy,
+        "catcher_xy":        c_xy,
+    }
+
+
 def _calibrate_from_catcher_pose(video_path: str,
                                        n_samples: int = 12) -> dict | None:
     """Estimate plate location + pixel-to-feet scale from the catcher's
@@ -15938,6 +16218,8 @@ def auto_calibrate_full(video_path: str,
                               pitches_positions: list,
                               frame_width: int = 1920,
                               frame_height: int = 1080,
+                              manual_landmarks: dict | None = None,
+                              sport: str = "Baseball",
                               progress_cb=None) -> dict:
     """Multi-modal calibration fusion. Runs every available method,
     weights them by confidence, and returns the best calibration.
@@ -15957,8 +16239,63 @@ def auto_calibrate_full(video_path: str,
     """
     candidates = []   # list of (label, confidence, cal_dict)
 
-    # Method 1: catcher pose (most reliable for behind-catcher views)
-    if progress_cb: progress_cb(0.05)
+    # Method -1: MANUAL LANDMARKS (when user explicitly clicks).
+    # User-clicked landmarks override every auto method at confidence 1.0.
+    # If user provided pitcher+catcher, we can compute geometry-based
+    # scale exactly like the auto version. If only plate was clicked, we
+    # use that directly. Mix-and-match supported.
+    m = manual_landmarks or {}
+    pitcher_xy = m.get("pitcher_xy")
+    catcher_xy = m.get("catcher_xy")
+    plate_xy   = m.get("plate_xy")
+    ball_xy    = m.get("ball_xy")
+    if pitcher_xy and catcher_xy:
+        dx = pitcher_xy[0] - catcher_xy[0]
+        dy = pitcher_xy[1] - catcher_xy[1]
+        pixel_dist = (dx * dx + dy * dy) ** 0.5
+        if pixel_dist > 30:
+            real_dist_ft = TUNNEL_CONSTANTS.get(sport,
+                                                    TUNNEL_CONSTANTS["Baseball"]
+                                                    )["rubber_distance_ft"]
+            pixels_per_foot = pixel_dist / real_dist_ft
+            plate_w_px = int(pixels_per_foot * (17.0 / 12.0))
+            # If user clicked plate, use that location; otherwise put it
+            # at the catcher's clicked position.
+            anchor_xy = plate_xy if plate_xy else catcher_xy
+            candidates.append(("manual_pitcher_catcher_geometry", 1.0, {
+                "plate_center_x_px": int(anchor_xy[0]),
+                "plate_center_y_px": int(anchor_xy[1]),
+                "plate_width_px":    max(20, plate_w_px),
+                "source":            "manual pitcher+catcher clicks "
+                                      f"(d={pixel_dist:.0f}px = "
+                                      f"{real_dist_ft}ft)",
+            }))
+    elif plate_xy:
+        # User clicked just the plate — use a resolution-derived default
+        # for width since they didn't give us another reference.
+        plate_w_px = max(40, int(frame_width / 20))
+        candidates.append(("manual_plate", 1.0, {
+            "plate_center_x_px": int(plate_xy[0]),
+            "plate_center_y_px": int(plate_xy[1]),
+            "plate_width_px":    plate_w_px,
+            "source":            "manual plate click (width estimated "
+                                  "from resolution)",
+        }))
+
+    # Method 0: pitcher↔catcher geometry — HIGHEST CONFIDENCE.
+    # Real-world distance between pitcher and catcher is fixed by rule
+    # (60.5 ft baseball, 43 ft softball). If pose can find both, we
+    # know pixels-per-foot with no anthropometric or detector bias.
+    if progress_cb: progress_cb(0.02)
+    geom_cal = _calibrate_from_pitcher_catcher_geometry(video_path)
+    if geom_cal:
+        candidates.append(("pitcher_catcher_geometry",
+                            geom_cal.get("confidence", 0.95),
+                            geom_cal))
+
+    # Method 1: catcher pose (works in behind-catcher views, fallback
+    # when pitcher isn't detected for the geometry method).
+    if progress_cb: progress_cb(0.15)
     catcher_cal = _calibrate_from_catcher_pose(video_path)
     if catcher_cal:
         candidates.append(("catcher_pose", catcher_cal.get("confidence", 0.85),
@@ -16290,9 +16627,16 @@ def process_uploaded_video(video_path: str,
         # Each method runs, contributes a weighted vote, outliers get
         # rejected. Robust to: no plate / no catcher / bad lighting /
         # blurry ball — as long as SOME signal works, we get calibration.
+        # Pull manual landmarks out of the user-supplied calibration dict
+        # if present. process_uploaded_video accepts them via the
+        # calibration dict (key "manual_landmarks") so the public
+        # signature stays unchanged.
+        _ml = cal_in.get("manual_landmarks") if isinstance(cal_in, dict) else None
         auto_cal = auto_calibrate_full(
             video_path, pitches,
-            frame_width=fw, frame_height=fh)
+            frame_width=fw, frame_height=fh,
+            manual_landmarks=_ml,
+            sport=sport)
         cal_in.update(auto_cal)
         try:
             print(f"[upload-side] auto-calibrated: "
@@ -16344,6 +16688,14 @@ def process_uploaded_video(video_path: str,
         "sanity_dropped":  len(dropped),
         "sanity_reasons":  reasons[:5],
         "kept":            len(kept),
+        # Surface the calibration source string so the user (and us)
+        # can see WHICH fusion method actually anchored the math —
+        # "fused (catcher_pose@0.85 + ball_trajectory@0.55)" tells the
+        # whole story.
+        "calibration_source": cal_in.get("source", "user-supplied"),
+        "plate_width_px":     cal_in.get("plate_width_px"),
+        "plate_center_x_px":  cal_in.get("plate_center_x_px"),
+        "plate_center_y_px":  cal_in.get("plate_center_y_px"),
     }
     if dropped:
         try:
@@ -17492,12 +17844,36 @@ def _capture_one_camera_for_upload(label: str,
                   "click the plate location.")
         if auto_cal_on:
             st.caption(
-                "No plate required. The pipeline will derive scale + "
-                "location from the ball trajectories themselves.")
+                "No plate required. The pipeline runs four detection "
+                "methods in parallel: pitcher↔catcher geometry, "
+                "catcher anthropometry, image plate detect, ball "
+                "trajectory convergence — then fuses the survivors.")
             # Provide a sane default for the radius range — the auto-cal
             # will refine the scale from actual detected radii.
             ball_min, ball_max = 4, 40
             plate_cx = 0; plate_cy = 0; plate_w = 0   # signal: auto
+
+            # Manual landmarks fallback: when auto methods fail
+            # (uniform lighting, no plate, no catcher, etc.), the user
+            # can click each anchor directly. Highest confidence
+            # signal (1.0) — overrides every auto method.
+            with st.expander(
+                    "Manual landmarks (last-resort fallback — click "
+                    "pitcher, catcher, plate, or ball)",
+                    expanded=False):
+                st.caption(
+                    "Auto-calibration handles most videos. Use this if "
+                    "the automatic methods can't lock in. Any clicks "
+                    "you provide override the auto-detection at "
+                    "highest confidence.")
+                manual_landmarks = render_manual_landmarks_panel(
+                    tmp_path,
+                    state_prefix=f"{key_prefix}ml_",
+                    sport=athlete_sport)
+                if manual_landmarks:
+                    st.success(
+                        f"Manual landmarks active: "
+                        f"{list(manual_landmarks.keys())}")
         else:
             cal = render_smart_calibration(tmp_path,
                                                state_prefix=f"{key_prefix}cc_",
@@ -17635,11 +18011,19 @@ def _capture_one_camera_for_upload(label: str,
         def _cb(frac):
             progress.progress(min(1.0, frac),
                                 text=f"Scanning frames... {int(frac*100)}%")
+        # Pick up manual landmarks the user set in the fallback panel
+        # (they live in session_state, keyed by f"{key_prefix}ml_*_xy").
+        _manual_landmarks = {}
+        for _name in ("pitcher", "catcher", "plate", "ball"):
+            _xy = st.session_state.get(f"{key_prefix}ml_{_name}_xy")
+            if _xy:
+                _manual_landmarks[f"{_name}_xy"] = _xy
         calibration = {
-            "plate_center_x_px": int(plate_cx),
-            "plate_center_y_px": int(plate_cy),
-            "plate_width_px":    int(plate_w),
-            "sport":             athlete_sport,
+            "plate_center_x_px":  int(plate_cx),
+            "plate_center_y_px":  int(plate_cy),
+            "plate_width_px":     int(plate_w),
+            "sport":              athlete_sport,
+            "manual_landmarks":   _manual_landmarks or None,
         }
         try:
             # ---- Auto-upsample low-fps videos before processing ----
@@ -17723,6 +18107,8 @@ def _capture_one_camera_for_upload(label: str,
                     f"Found {len(pitches)} pitch(es) in this video.")
             elif n_detected:
                 # We DID detect motion but everything got filtered.
+                cal_source = diag.get("calibration_source", "unknown")
+                plate_w = diag.get("plate_width_px")
                 lines = [
                     f"**Detected {n_detected} ball-flight events but kept 0 "
                     f"after filtering.** Breakdown:",
@@ -17734,18 +18120,28 @@ def _capture_one_camera_for_upload(label: str,
                 if n_sanity_bad:
                     lines.append(
                         f"- {n_sanity_bad} produced physically impossible "
-                        f"numbers (plate calibration is wrong — the "
-                        f"catcher's shoulder or jersey is probably "
-                        f"covering the plate, so auto-detect locked onto "
-                        f"the wrong object)")
+                        f"numbers — calibration scale is off.")
                 if sanity_reasons:
                     lines.append(
                         f"- Example failure: `{sanity_reasons[0]}`")
+                lines.append("")
                 lines.append(
-                    "**Fix:** open the calibration panel above and "
-                    "click directly on the plate in a clear frame "
-                    "(when the catcher isn't blocking it). That "
-                    "manual override beats auto-detect.")
+                    f"**Calibration source:** `{cal_source}` "
+                    f"(plate_w={plate_w}px)")
+                if "catcher_pose" not in (cal_source or ""):
+                    lines.append(
+                        "Catcher pose detection didn't lock in for this "
+                        "video — likely because the catcher is cropped "
+                        "out of frame at the bottom (legs not visible), "
+                        "or the angle is from too low. Falling back to "
+                        "ball-trajectory-only scale, which is less "
+                        "accurate. If that's wrong, click manual "
+                        "calibration below.")
+                else:
+                    lines.append(
+                        "Catcher pose IS contributing — if numbers are "
+                        "still off, the scale estimate may need "
+                        "refinement. Try the manual fallback below.")
                 st.error("\n".join(lines))
             else:
                 st.warning(
