@@ -15901,17 +15901,28 @@ def render_manual_landmarks_panel(video_path: str,
     click = streamlit_image_coordinates(
         display_arg, width=display_width,
         key=f"{state_prefix}manual_landmark_img")
+    # CRITICAL: streamlit_image_coordinates returns the LAST clicked value
+    # on every render, not just on a fresh click. If we naively act on
+    # every non-None click + call st.rerun(), we get an infinite loop
+    # (render → click is set → handle → rerun → render → click is STILL
+    # set → handle → rerun → forever). The fix is to track the last
+    # CLICK VALUE we processed and only act when it changes.
+    last_click_key = f"{state_prefix}_last_click_xy"
     if click is not None:
-        scale_x = orig_w / display_width
-        disp_h = int(orig_h * display_width / max(1, orig_w))
-        scale_y = orig_h / max(1, disp_h)
-        clicked_xy = (int(click["x"] * scale_x),
-                       int(click["y"] * scale_y))
-        # Strip "(center)" suffix from the target name
-        target_clean = target.split()[0]
-        store_key = landmark_keys[target_clean]
-        st.session_state[store_key] = clicked_xy
-        st.rerun()
+        new_click_sig = (click.get("x"), click.get("y"), target)
+        if new_click_sig != st.session_state.get(last_click_key):
+            scale_x = orig_w / display_width
+            disp_h = int(orig_h * display_width / max(1, orig_w))
+            scale_y = orig_h / max(1, disp_h)
+            clicked_xy = (int(click["x"] * scale_x),
+                           int(click["y"] * scale_y))
+            target_clean = target.split()[0]
+            store_key = landmark_keys[target_clean]
+            st.session_state[store_key] = clicked_xy
+            st.session_state[last_click_key] = new_click_sig
+            # No st.rerun() — Streamlit already reran when the user
+            # clicked the image. Re-running here would just kick off
+            # another wasted render cycle.
 
     btn_cols = st.columns(4)
     for i, label in enumerate(["pitcher", "catcher", "plate", "ball"]):
