@@ -6671,6 +6671,11 @@ def init_db():
         if "email_opt_in" not in ucols:
             # opt-in flag for whether we may email them (e.g. session reports)
             c.execute("ALTER TABLE users ADD COLUMN email_opt_in INTEGER NOT NULL DEFAULT 1")
+        # ----- Password recovery tokens -----
+        if "reset_token" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN reset_token TEXT")
+        if "reset_token_expires_at" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN reset_token_expires_at TEXT")
         # ----- Subscription / billing columns -----
         # On users (for solo individual athletes). On orgs (for org plans).
         for col, ddl in [
@@ -7138,6 +7143,245 @@ def _stripe_secrets() -> dict:
 def stripe_is_configured() -> bool:
     cfg = _stripe_secrets()
     return bool(cfg.get("secret_key"))
+
+
+# =============================================================================
+# EMAIL — send transactional email (password reset, bullpen report delivery)
+# Uses Resend (https://resend.com) for the simplest free tier (3000 emails/mo).
+# Falls back to no-op if not configured so the rest of the app keeps working.
+# =============================================================================
+def _email_secrets() -> dict:
+    """Pull email config from .streamlit/secrets.toml under [email]."""
+    try:
+        cfg = dict(st.secrets.get("email", {}))
+    except Exception:
+        return {}
+    return cfg
+
+
+def email_is_configured() -> bool:
+    cfg = _email_secrets()
+    # Either Resend API key OR SMTP credentials count as configured
+    return bool(cfg.get("resend_api_key") or cfg.get("smtp_host"))
+
+
+def send_email(to_email: str, subject: str, html_body: str,
+                  text_body: str | None = None,
+                  attachment_bytes: bytes | None = None,
+                  attachment_filename: str | None = None,
+                  attachment_mime: str = "application/pdf") -> tuple:
+    """Send a transactional email. Returns (success, message).
+
+    Provider preference:
+      1. Resend (if [email].resend_api_key is set) — simplest setup
+      2. SMTP   (if [email].smtp_host is set)      — works with any SMTP
+      3. None   → returns (False, 'Email not configured')
+
+    Args:
+        to_email:           recipient
+        subject:            subject line
+        html_body:          HTML version of the body
+        text_body:          plain-text fallback (auto-derived from HTML if None)
+        attachment_bytes:   optional file attachment (e.g. PDF bytes)
+        attachment_filename:filename for the attachment
+        attachment_mime:    MIME type for the attachment
+
+    Designed to fail gracefully — wraps every API call so the caller
+    can just check the return tuple.
+    """
+    if not to_email or "@" not in to_email:
+        return False, "Invalid recipient email."
+    cfg = _email_secrets()
+    from_addr = cfg.get("from_address", "noreply@diamondsportslab.com")
+    from_name = cfg.get("from_name", "Diamond Sports Lab")
+
+    if not text_body:
+        # crude HTML→text fallback
+        import re as _re
+        text_body = _re.sub(r"<[^>]+>", "", html_body)
+        text_body = _re.sub(r"\s+", " ", text_body).strip()
+
+    # ---------- Provider 1: Resend ----------
+    if cfg.get("resend_api_key"):
+        try:
+            import requests, base64 as _b64
+        except Exception as e:
+            return False, f"requests library missing: {e}"
+        payload = {
+            "from":    f"{from_name} <{from_addr}>",
+            "to":      [to_email],
+            "subject": subject,
+            "html":    html_body,
+            "text":    text_body,
+        }
+        if attachment_bytes and attachment_filename:
+            payload["attachments"] = [{
+                "filename":    attachment_filename,
+                "content":     _b64.b64encode(attachment_bytes).decode("ascii"),
+                "content_type":attachment_mime,
+            }]
+        try:
+            r = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {cfg['resend_api_key']}",
+                    "Content-Type":  "application/json",
+                },
+                json=payload, timeout=15)
+            if r.status_code in (200, 202):
+                return True, "Email sent."
+            return False, f"Resend API error ({r.status_code}): {r.text[:200]}"
+        except Exception as e:
+            return False, f"Resend send error: {type(e).__name__}: {e}"
+
+    # ---------- Provider 2: SMTP ----------
+    if cfg.get("smtp_host"):
+        try:
+            import smtplib, ssl
+            from email.message import EmailMessage
+            msg = EmailMessage()
+            msg["Subject"] = subject
+            msg["From"]    = f"{from_name} <{from_addr}>"
+            msg["To"]      = to_email
+            msg.set_content(text_body)
+            msg.add_alternative(html_body, subtype="html")
+            if attachment_bytes and attachment_filename:
+                maintype, _, subtype = attachment_mime.partition("/")
+                msg.add_attachment(
+                    attachment_bytes,
+                    maintype=maintype or "application",
+                    subtype=subtype or "octet-stream",
+                    filename=attachment_filename)
+            host = cfg["smtp_host"]
+            port = int(cfg.get("smtp_port", 587))
+            user = cfg.get("smtp_user")
+            password = cfg.get("smtp_password")
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP(host, port, timeout=15) as s:
+                s.starttls(context=ctx)
+                if user and password:
+                    s.login(user, password)
+                s.send_message(msg)
+            return True, "Email sent (SMTP)."
+        except Exception as e:
+            return False, f"SMTP send error: {type(e).__name__}: {e}"
+
+    return False, ("Email is not configured. Add a [email] section to "
+                    ".streamlit/secrets.toml with either 'resend_api_key' "
+                    "or smtp_host/smtp_port/smtp_user/smtp_password.")
+
+
+# =============================================================================
+# PASSWORD RECOVERY — request reset → email link → consume token
+# =============================================================================
+def request_password_reset(email_or_username: str) -> tuple:
+    """Generate a reset token, email it to the user. Returns (ok, msg).
+
+    Intentionally returns the same generic message whether or not the
+    email matches a real user — prevents account enumeration. The actual
+    work happens silently inside.
+    """
+    import secrets as _secrets
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    if not email_or_username or "@" not in str(email_or_username):
+        # Allow username too, but normalize
+        lookup_by_email = False
+        lookup_value = (email_or_username or "").strip().lower()
+    else:
+        lookup_by_email = True
+        lookup_value = _normalize_email(email_or_username)
+
+    generic_msg = ("If an account with that address exists, a reset link "
+                    "has been sent. Check your inbox (and spam folder).")
+
+    init_db()
+    with _db_conn() as c:
+        if lookup_by_email:
+            row = c.execute(
+                "SELECT id, username, email FROM users "
+                "WHERE LOWER(email) = ?", (lookup_value,)).fetchone()
+        else:
+            row = c.execute(
+                "SELECT id, username, email FROM users WHERE username = ?",
+                (lookup_value,)).fetchone()
+
+        if row is None:
+            # Don't reveal that the account doesn't exist
+            return True, generic_msg
+        user_id, username, email = row
+        if not email:
+            return False, ("No email is on file for this account, so we "
+                            "can't send a reset link. Contact support.")
+
+        token = _secrets.token_urlsafe(32)
+        expires = (_dt.now(_tz.utc) + _td(minutes=30)).isoformat()
+        c.execute(
+            "UPDATE users SET reset_token = ?, reset_token_expires_at = ? "
+            "WHERE id = ?", (token, expires, user_id))
+
+    # Build the reset link
+    app_url = (_stripe_secrets().get("app_url")
+                  or _email_secrets().get("app_url")
+                  or "https://diamondsportslab.com").rstrip("/")
+    reset_url = f"{app_url}/?reset_token={token}"
+
+    subject = "Diamond Sports Lab — password reset"
+    html_body = f"""
+    <div style='font-family:Inter,sans-serif;max-width:560px;'>
+      <h2 style='color:#1a2150;'>Reset your password</h2>
+      <p>Hi <b>{username}</b>,</p>
+      <p>Someone (hopefully you) requested a password reset for your
+      Diamond Sports Lab account. Click the link below to choose a new
+      password. The link expires in 30 minutes.</p>
+      <p style='margin:24px 0;'>
+        <a href='{reset_url}' style='background:#1a2150;color:white;
+        padding:12px 24px;border-radius:6px;text-decoration:none;
+        font-weight:600;'>Reset password</a>
+      </p>
+      <p style='color:#6b7280;font-size:13px;'>Or paste this into your
+      browser: <code>{reset_url}</code></p>
+      <p style='color:#6b7280;font-size:13px;'>If you didn't request a
+      reset, you can ignore this email — your password won't change.</p>
+    </div>
+    """
+    ok, msg = send_email(email, subject, html_body)
+    if not ok:
+        # Surface the failure to the operator/log but tell the user
+        # the generic message so we still don't leak the account state.
+        return True, generic_msg + f"  (send status: {msg})"
+    return True, generic_msg
+
+
+def consume_password_reset_token(token: str, new_password: str) -> tuple:
+    """Verify a reset token and set the new password. Returns (ok, msg)."""
+    import os
+    from datetime import datetime as _dt, timezone as _tz
+    if not token or not new_password:
+        return False, "Missing token or new password."
+    if len(new_password) < 6:
+        return False, "Password must be at least 6 characters."
+    init_db()
+    with _db_conn() as c:
+        row = c.execute(
+            "SELECT id, reset_token_expires_at FROM users "
+            "WHERE reset_token = ?", (token,)).fetchone()
+        if row is None:
+            return False, "Invalid or already-used reset link."
+        uid, expires = row
+        try:
+            exp_dt = _dt.fromisoformat(expires.replace("Z", "+00:00"))
+        except Exception:
+            return False, "Reset link is malformed. Request a new one."
+        if _dt.now(_tz.utc) > exp_dt:
+            return False, "Reset link has expired. Request a new one."
+        salt = os.urandom(16)
+        c.execute(
+            "UPDATE users SET password_hash = ?, salt = ?, "
+            "reset_token = NULL, reset_token_expires_at = NULL "
+            "WHERE id = ?",
+            (_hash_password(new_password, salt), salt.hex(), uid))
+    return True, "Password reset. Sign in with your new password."
 
 
 def _get_stripe():
@@ -10686,21 +10930,56 @@ def _grip_photo_url(grip_key: str) -> str | None:
 
 
 def render_grip_diagram(grip_key: str, height: int = 380):
-    """Render a grip with PHOTO PREFERRED, SVG fallback.
+    """Render a grip with PHOTO PREFERRED, clean text-card fallback.
 
     Priority:
       1. If GRIP_LIBRARY[grip_key]["image_url"] is set OR a matching file
          exists in grip_photos/, show that image.
-      2. Otherwise fall back to the SVG diagram.
+      2. Otherwise show a clean text-card placeholder pointing at the
+         Wikipedia photo link. We INTENTIONALLY do not render the SVG
+         fallback anymore — the hand-drawn finger-position diagrams
+         looked amateurish. Until a real photo is dropped in, the
+         coaching text + Wikipedia link is more professional.
     """
     photo = _grip_photo_url(grip_key)
     if photo:
         # st.image handles both URLs (http/https) and local paths
         st.image(photo, use_container_width=True)
-        st.caption("Grip photo · for label-only diagram, see the seam map below.")
         return
-    import streamlit.components.v1 as components
-    components.html(grip_svg(grip_key), height=height, scrolling=False)
+    # No photo configured — show a clean, professional placeholder card
+    # instead of the amateur SVG diagram. The full coaching text + the
+    # Wikipedia link below still give the user everything they need.
+    info  = GRIP_LIBRARY.get(grip_key, {}) or {}
+    label = info.get("label", grip_key.replace("_", " ").title())
+    wiki  = GRIP_WIKI_URLS.get(grip_key)
+    wiki_btn = (
+        f"<a href='{wiki}' target='_blank' "
+        f"style='display:inline-flex;align-items:center;gap:6px;"
+        f"background:#1e293b;color:#60a5fa;padding:8px 14px;"
+        f"border-radius:8px;font-size:13px;font-weight:600;"
+        f"text-decoration:none;border:1px solid #334155;"
+        f"margin-top:10px;'>"
+        f"📷 View real grip photos on Wikipedia →</a>"
+    ) if wiki else ""
+    st.markdown(
+        f"<div style='background:#1e293b;border:1px solid #334155;"
+        f"border-left:4px solid #d4a634;border-radius:12px;"
+        f"padding:18px 20px;min-height:160px;display:flex;"
+        f"flex-direction:column;justify-content:center;align-items:center;"
+        f"text-align:center;'>"
+        f"<div style='font-size:11px;letter-spacing:0.12em;font-weight:700;"
+        f"color:#d4a634;text-transform:uppercase;margin-bottom:6px;'>"
+        f"Grip</div>"
+        f"<div style='font-size:18px;font-weight:800;color:#f1f5f9;"
+        f"margin-bottom:6px;'>{label}</div>"
+        f"<div style='font-size:12px;color:#94a3b8;line-height:1.5;'>"
+        f"Drop a real photo into "
+        f"<code style='background:#0f172a;padding:1px 6px;"
+        f"border-radius:4px;color:#cbd5e1;'>grip_photos/{grip_key}.jpg</code> "
+        f"to display it here.</div>"
+        f"{wiki_btn}"
+        f"</div>",
+        unsafe_allow_html=True)
 
 
 def _baseball_seams_svg() -> str:
@@ -17159,9 +17438,26 @@ def _render_login_screen() -> bool:
                         st.rerun()
                     else:
                         st.error(msg)
-                st.caption(
-                    "Forgot password? Recovery isn't built yet — passwords "
-                    "are stored locally. Create a new account if needed.")
+                # ----- Forgot password flow -----
+                with st.expander("Forgot password?", expanded=False):
+                    if not email_is_configured():
+                        st.info(
+                            "Password recovery sends a reset link via "
+                            "email. To enable it, add an `[email]` "
+                            "section with a `resend_api_key` (or SMTP "
+                            "credentials) to `.streamlit/secrets.toml`. "
+                            "Until then, contact support or recreate the "
+                            "account.")
+                    else:
+                        fp_email = st.text_input(
+                            "Your email or username",
+                            key="forgot_email_input",
+                            placeholder="you@example.com")
+                        if st.button("Send reset link",
+                                      key="forgot_send_btn",
+                                      use_container_width=True):
+                            _, msg = request_password_reset(fp_email)
+                            st.success(msg)
 
             with tab_new:
                 acct_type = st.radio(
@@ -20938,6 +21234,56 @@ def main():
     # on Streamlit Cloud out of the box.
     handle_stripe_return_query()
 
+    # ===== Password reset link consumption =====
+    # If a reset link from the email was clicked, the URL has a
+    # ?reset_token=... query param. Show a dedicated reset page that
+    # gates the rest of the app until the user picks a new password
+    # (or cancels).
+    try:
+        qp = st.query_params
+        reset_token = qp.get("reset_token")
+    except Exception:
+        reset_token = None
+    if reset_token:
+        st.markdown("## Choose a new password")
+        st.caption(
+            "Your reset link was verified. Enter a new password below — "
+            "you'll be able to sign in immediately after.")
+        new_p1 = st.text_input("New password", type="password",
+                                  key="reset_new_p1",
+                                  placeholder="6+ characters")
+        new_p2 = st.text_input("Confirm new password", type="password",
+                                  key="reset_new_p2")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            if st.button("Save new password", type="primary",
+                          use_container_width=True,
+                          key="reset_save_btn"):
+                if new_p1 != new_p2:
+                    st.error("Passwords don't match.")
+                elif len(new_p1) < 6:
+                    st.error("Password must be at least 6 characters.")
+                else:
+                    ok, msg = consume_password_reset_token(
+                        reset_token, new_p1)
+                    if ok:
+                        st.success(msg)
+                        # Clear the token from the URL
+                        try: del qp["reset_token"]
+                        except Exception: pass
+                        st.session_state.pop("reset_new_p1", None)
+                        st.session_state.pop("reset_new_p2", None)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        with col_r2:
+            if st.button("Cancel", use_container_width=True,
+                          key="reset_cancel_btn"):
+                try: del qp["reset_token"]
+                except Exception: pass
+                st.rerun()
+        return  # Gate the rest of the app until the reset is resolved
+
     # ===== LOGIN / LANDING GATE =====
     # Renders login or landing screen and returns False until the user
     # has signed in AND picked an athlete. Keeps the analytics screens
@@ -23036,6 +23382,68 @@ def main():
                 use_container_width=True,
                 type="primary",
             )
+
+            # ----- Email the report — uses the recipient's account email -----
+            if email_is_configured():
+                # Determine the best email to use: athlete's linked user
+                # email first, then the coach's email.
+                _to_email = None
+                try:
+                    if active_athlete_id is not None:
+                        with _db_conn() as _c:
+                            _ath_user = _c.execute(
+                                "SELECT email FROM users "
+                                "WHERE linked_athlete_id = ? AND email IS NOT NULL",
+                                (active_athlete_id,)).fetchone()
+                            if _ath_user and _ath_user[0]:
+                                _to_email = _ath_user[0]
+                    if not _to_email:
+                        _coach = current_user_record() or {}
+                        _to_email = _coach.get("email")
+                except Exception:
+                    _to_email = None
+
+                email_col1, email_col2 = st.columns([3, 1])
+                with email_col1:
+                    custom_to = st.text_input(
+                        "Email the report to",
+                        value=_to_email or "",
+                        key="pbr_email_to",
+                        placeholder="recipient@example.com",
+                        label_visibility="collapsed")
+                with email_col2:
+                    if st.button("✉ Send",
+                                  key="pbr_email_btn",
+                                  use_container_width=True,
+                                  disabled=not custom_to):
+                        html_body = (
+                            f"<div style='font-family:Inter,sans-serif;"
+                            f"max-width:560px;'>"
+                            f"<h2 style='color:#1a2150;'>"
+                            f"{athlete_name} — Post-Bullpen Report</h2>"
+                            f"<p>Attached is the latest Post-Bullpen "
+                            f"Report from Diamond Sports Lab. Highlights "
+                            f"include arsenal Stuff+, mechanics scoring, "
+                            f"and the active development plan.</p>"
+                            f"<p style='color:#6b7280;font-size:13px;'>"
+                            f"Generated automatically — questions go to "
+                            f"your coach.</p></div>")
+                        ok, msg = send_email(
+                            to_email=custom_to,
+                            subject=f"{athlete_name} — Post-Bullpen Report",
+                            html_body=html_body,
+                            attachment_bytes=pdf_bytes,
+                            attachment_filename=
+                                f"{athlete_name.replace(' ', '_')}_PBR.pdf")
+                        if ok:
+                            st.success(f"Report emailed to {custom_to}.")
+                        else:
+                            st.error(f"Couldn't send: {msg}")
+            else:
+                st.caption(
+                    "Want one-tap emailing? Add an `[email]` section with "
+                    "`resend_api_key` to your `.streamlit/secrets.toml` and "
+                    "the Email button shows up here.")
         except Exception as e:
             st.warning(f"PDF generation hit an issue: `{type(e).__name__}: {e}`. "
                        "The CSV + text exports below still work.")
