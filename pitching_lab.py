@@ -16677,41 +16677,99 @@ def _capture_one_camera_for_upload(label: str,
     import tempfile, os
     st.markdown(f"### {label}")
 
-    # ===== Step 1 — upload =====
-    st.markdown("**Step 1 — Upload video**")
-    uploaded = st.file_uploader(
-        "Drop a .mp4 / .mov / .m4v file here",
-        type=["mp4", "mov", "m4v", "avi"],
-        key=f"{key_prefix}file",
-        help="iPhone 1080p, 30-240 fps. Native camera output works directly.",
-    )
+    # ===== Step 1 — upload (browser) OR pick from disk =====
+    # When the app is running locally, the file already lives on the same
+    # machine — routing a 175MB video through the browser file uploader
+    # is pointless overhead. The "Load from local folder" tab lets power
+    # users / testers point straight at a path. The browser upload tab
+    # remains the default for normal users who film on their phone.
+    st.markdown("**Step 1 — Choose a video**")
     pitches_session_key = f"{key_prefix}pitches"
     path_session_key    = f"{key_prefix}path"
 
-    if uploaded is None:
-        st.caption("No video uploaded yet.")
+    upload_tab, disk_tab = st.tabs(
+        ["Upload from device", "Load from local folder (faster for testing)"])
+
+    uploaded = None
+    disk_path = None
+    with upload_tab:
+        uploaded = st.file_uploader(
+            "Drop a .mp4 / .mov / .m4v file here",
+            type=["mp4", "mov", "m4v", "avi"],
+            key=f"{key_prefix}file",
+            help="iPhone 1080p, 30-240 fps. Native camera output works directly.",
+        )
+    with disk_tab:
+        import os as _os
+        # Default the picker to the test_videos folder. Falls back to
+        # the working directory if it doesn't exist.
+        default_dir = _os.path.expanduser("~/Desktop/PitchingLab/test_videos")
+        if not _os.path.isdir(default_dir):
+            default_dir = _os.getcwd()
+        folder_path = st.text_input(
+            "Folder to scan",
+            value=st.session_state.get(f"{key_prefix}disk_folder", default_dir),
+            key=f"{key_prefix}disk_folder",
+            help="Any folder on your computer. Defaults to test_videos/.")
+        if folder_path and _os.path.isdir(folder_path):
+            vids = [f for f in sorted(_os.listdir(folder_path))
+                      if f.lower().endswith(
+                          (".mp4", ".mov", ".m4v", ".avi", ".mkv"))]
+            if vids:
+                pick = st.selectbox(
+                    "Video file",
+                    ["(none)"] + vids,
+                    key=f"{key_prefix}disk_pick")
+                if pick != "(none)":
+                    disk_path = _os.path.join(folder_path, pick)
+                    size_mb = _os.path.getsize(disk_path) / 1024 / 1024
+                    st.caption(f"Selected: `{disk_path}` ({size_mb:.1f} MB) "
+                                  f"— no upload, no waiting.")
+            else:
+                st.caption(f"No video files in `{folder_path}`.")
+        elif folder_path:
+            st.warning(f"Folder not found: `{folder_path}`")
+
+    if uploaded is None and disk_path is None:
+        st.caption("No video selected yet.")
         return st.session_state.get(pitches_session_key, []), \
                 st.session_state.get(path_session_key)
 
     # Persist file once per upload (avoid re-writing every rerun)
     last_name_key = f"{key_prefix}last_filename"
-    tmp_path = os.path.join(tempfile.gettempdir(),
-                              f"{key_prefix}{uploaded.name}")
-    if st.session_state.get(last_name_key) != uploaded.name:
-        with open(tmp_path, "wb") as f:
-            f.write(uploaded.read())
-        st.session_state[last_name_key] = uploaded.name
-        st.session_state[path_session_key] = tmp_path
-        # Invalidate cached results for the previous video — also
-        # invalidate the per-video quality + angle caches so a new file
-        # gets a fresh pre-flight read instead of inheriting stale
-        # judgments from the previous one.
-        st.session_state.pop(pitches_session_key, None)
-        st.session_state.pop(f"{key_prefix}quality", None)
-        st.session_state.pop(f"{key_prefix}force_process", None)
-        st.session_state.pop(f"{key_prefix}detected_angle", None)
-    tmp_path = st.session_state.get(path_session_key, tmp_path)
-    st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
+    if disk_path:
+        # Local-folder path: use the file in place — zero copy, zero wait.
+        source_name = os.path.basename(disk_path)
+        tmp_path = disk_path
+        size_mb = os.path.getsize(disk_path) / 1024 / 1024
+        if st.session_state.get(last_name_key) != f"disk:{source_name}":
+            st.session_state[last_name_key] = f"disk:{source_name}"
+            st.session_state[path_session_key] = tmp_path
+            # Reset per-video caches since the source changed
+            st.session_state.pop(pitches_session_key, None)
+            st.session_state.pop(f"{key_prefix}quality", None)
+            st.session_state.pop(f"{key_prefix}force_process", None)
+            st.session_state.pop(f"{key_prefix}detected_angle", None)
+        st.caption(f"Using local file: `{tmp_path}` ({size_mb:.1f} MB)")
+    else:
+        source_name = uploaded.name
+        tmp_path = os.path.join(tempfile.gettempdir(),
+                                  f"{key_prefix}{uploaded.name}")
+        if st.session_state.get(last_name_key) != uploaded.name:
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded.read())
+            st.session_state[last_name_key] = uploaded.name
+            st.session_state[path_session_key] = tmp_path
+            # Invalidate cached results for the previous video — also
+            # invalidate the per-video quality + angle caches so a new
+            # file gets a fresh pre-flight read instead of inheriting
+            # stale judgments from the previous one.
+            st.session_state.pop(pitches_session_key, None)
+            st.session_state.pop(f"{key_prefix}quality", None)
+            st.session_state.pop(f"{key_prefix}force_process", None)
+            st.session_state.pop(f"{key_prefix}detected_angle", None)
+        tmp_path = st.session_state.get(path_session_key, tmp_path)
+        st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
 
     # ===== Pre-flight video quality check =====
     # Runs a fast (<3s) sanity pass on the video BEFORE we spend 60+
