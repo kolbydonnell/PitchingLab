@@ -15523,7 +15523,24 @@ def render_smart_calibration(video_path: str,
         f"plate</b> in the image below — that's all the app needs. Width is "
         f"estimated from your video resolution.</div></div>",
         unsafe_allow_html=True)
-    click = streamlit_image_coordinates(png, width=display_width,
+    # streamlit_image_coordinates needs str | Path | np.ndarray | PIL —
+    # NOT raw bytes. Decode to numpy array (RGB) before passing.
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        _arr = _np.frombuffer(png, dtype=_np.uint8)
+        _bgr = _cv2.imdecode(_arr, _cv2.IMREAD_COLOR)
+        _click_arg = _cv2.cvtColor(_bgr, _cv2.COLOR_BGR2RGB) if _bgr is not None else None
+    except Exception:
+        _click_arg = None
+    if _click_arg is None:
+        # Fallback: temp file path
+        import tempfile as _tf, os as _os
+        _tmp_p = _os.path.join(_tf.gettempdir(), f"{state_prefix}smart_still.png")
+        with open(_tmp_p, "wb") as _f:
+            _f.write(png)
+        _click_arg = _tmp_p
+    click = streamlit_image_coordinates(_click_arg, width=display_width,
                                             key=f"{state_prefix}manual_img")
     if click is not None:
         scale_x = orig_w / display_width
@@ -15617,9 +15634,25 @@ def render_click_calibration(video_path: str,
         unsafe_allow_html=True,
     )
 
-    # Render the still and capture the click
+    # Render the still and capture the click. streamlit_image_coordinates
+    # needs str | Path | np.ndarray | PIL — NOT raw bytes — so decode to
+    # numpy first (newer library versions reject bytes outright).
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        _arr = _np.frombuffer(png, dtype=_np.uint8)
+        _bgr = _cv2.imdecode(_arr, _cv2.IMREAD_COLOR)
+        _cc_img = _cv2.cvtColor(_bgr, _cv2.COLOR_BGR2RGB) if _bgr is not None else None
+    except Exception:
+        _cc_img = None
+    if _cc_img is None:
+        import tempfile as _tf, os as _os
+        _tmp_p = _os.path.join(_tf.gettempdir(), f"{state_prefix}cc_still.png")
+        with open(_tmp_p, "wb") as _f:
+            _f.write(png)
+        _cc_img = _tmp_p
     click = streamlit_image_coordinates(
-        png,
+        _cc_img,
         width=display_width,
         key=f"{state_prefix}cc_img",
     )
@@ -15734,15 +15767,33 @@ def render_manual_landmarks_panel(video_path: str,
       - plate_xy:   (x_px, y_px)
       - ball_xy:    (x_px, y_px) — used to refine the radius search window
     """
+    # Defensive: no video path → nothing to click on. Don't try to
+    # extract a still from a None/missing file.
+    if not video_path:
+        st.caption("Pick a video first.")
+        return {}
+    import os as _os
+    if not _os.path.exists(video_path):
+        st.caption(f"Video file not found: `{video_path}`.")
+        return {}
+
     if not _is_click_calibration_available():
         st.caption(
             "Manual landmarks need the `streamlit-image-coordinates` "
             "package. Run `enable_live_capture.command` to install it.")
         return {}
 
-    from streamlit_image_coordinates import streamlit_image_coordinates
+    try:
+        from streamlit_image_coordinates import streamlit_image_coordinates
+    except Exception as e:
+        st.caption(f"streamlit-image-coordinates failed to import: {e}")
+        return {}
 
-    png, orig_w, orig_h = extract_calibration_still(video_path)
+    try:
+        png, orig_w, orig_h = extract_calibration_still(video_path)
+    except Exception as e:
+        st.caption(f"Couldn't extract a still: {e}")
+        return {}
     if png is None:
         st.error("Couldn't extract a still from the video.")
         return {}
@@ -15777,29 +15828,55 @@ def render_manual_landmarks_panel(video_path: str,
             status_bits.append(f"{k}: —")
     st.caption(" · ".join(status_bits))
 
-    # Draw existing landmarks as colored circles on the still
+    # Draw existing landmarks as colored circles on the still.
+    # streamlit_image_coordinates expects str | Path | np.ndarray | PIL
+    # Image — NOT bytes — so we pass the decoded numpy array (RGB) to
+    # avoid a "must pass a string, Path, numpy array..." ValueError on
+    # newer versions of the library.
+    display_arg = None
     try:
         import cv2 as _cv2
         import numpy as _np
         arr = _np.frombuffer(png, dtype=_np.uint8)
-        img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
-        colors = {"pitcher": (50, 200, 255),    # cyan
-                    "catcher": (50, 220, 90),     # green
-                    "plate":   (60, 100, 255),    # red-ish
-                    "ball":    (255, 220, 50)}    # yellow
+        img_bgr = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise ValueError("imdecode returned None")
+        colors_bgr = {"pitcher": (255, 200, 50),    # cyan in BGR
+                        "catcher": (90, 220, 50),     # green in BGR
+                        "plate":   (255, 100, 60),    # red-ish in BGR
+                        "ball":    (50, 220, 255)}    # yellow in BGR
         for k, xy in cur.items():
             if xy:
-                _cv2.circle(img, xy, 14, colors[k], 3)
-                _cv2.putText(img, k.upper(), (xy[0]+18, xy[1]-6),
-                                _cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[k], 2)
-        ok_enc, png_out = _cv2.imencode(".png", img)
-        if ok_enc:
-            png = png_out.tobytes()
+                _cv2.circle(img_bgr, tuple(int(v) for v in xy),
+                              14, colors_bgr[k], 3)
+                _cv2.putText(img_bgr, k.upper(),
+                                (int(xy[0]) + 18, int(xy[1]) - 6),
+                                _cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                colors_bgr[k], 2)
+        # streamlit_image_coordinates wants RGB
+        display_arg = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2RGB)
     except Exception:
-        pass
+        display_arg = None
+
+    if display_arg is None:
+        # Last-resort fallback: write the PNG bytes to a temp file and
+        # pass the PATH instead. Bytes alone won't work on newer
+        # streamlit-image-coordinates.
+        try:
+            import tempfile as _tf, os as _os
+            tmp_dir = _tf.gettempdir()
+            tmp_img_path = _os.path.join(tmp_dir,
+                                            f"{state_prefix}still.png")
+            with open(tmp_img_path, "wb") as _f:
+                _f.write(png)
+            display_arg = tmp_img_path
+        except Exception as e:
+            st.caption(f"Couldn't prepare still for clicks: {e}")
+            return {k.replace("_xy", "") + "_xy": v
+                     for k, v in cur.items() if v}
 
     click = streamlit_image_coordinates(
-        png, width=display_width,
+        display_arg, width=display_width,
         key=f"{state_prefix}manual_landmark_img")
     if click is not None:
         scale_x = orig_w / display_width
@@ -17089,19 +17166,41 @@ def auto_detect_camera_angle(video_path: str,
                                   sample_frames: int = 8) -> str:
     """Sniff a few frames to guess the camera angle.
 
-    Strategy:
-      1. Sample evenly-spaced frames across the video.
-      2. Try to auto-detect the plate in each. If found in ≥2 frames →
-         the camera sees the plate, so it's either SIDE or BEHIND CATCHER.
-      3. Decide between side / behind-catcher by checking the plate's
-         horizontal position — centered = behind catcher, off-center
-         = side view.
-      4. If no plate found in any sample → assume BEHIND PITCHER (no
-         plate in frame).
+    Strategy (revised — pose-first because plate is often occluded):
+      1. Run pose detection across a dozen frames. Classify each
+         detected person as pitcher (standing) or catcher (squatting).
+      2. If BOTH pitcher and catcher are detected reliably → SIDE view.
+      3. If ONLY catcher is detected (large in frame, pitcher is too
+         small/distant to register) → BEHIND CATCHER.
+      4. If ONLY pitcher is detected (large in frame, catcher too
+         distant) → BEHIND PITCHER.
+      5. If pose can't classify anything, fall back to plate-position
+         heuristic (the legacy method).
 
     Returns one of: "side", "behind_catcher", "behind_pitcher".
     Conservative default on failure: "side" (most accurate pipeline).
     """
+    # ---- Method 1: pose-based ----
+    # Most reliable because the catcher is ALWAYS visible from behind-
+    # catcher view (they're huge in frame) and the pitcher is ALWAYS
+    # visible from behind-pitcher view. Plate visibility is unreliable.
+    try:
+        anchors = _detect_pitcher_catcher_anchors(video_path, n_samples=12)
+        n_pitcher = anchors.get("n_frames_seen", {}).get("pitcher", 0)
+        n_catcher = anchors.get("n_frames_seen", {}).get("catcher", 0)
+        # Need at least 3 confident detections of either to trust pose
+        if n_pitcher >= 3 and n_catcher >= 3:
+            return "side"
+        if n_catcher >= 3 and n_pitcher < 2:
+            return "behind_catcher"
+        if n_pitcher >= 3 and n_catcher < 2:
+            return "behind_pitcher"
+        # Else pose was inconclusive (e.g., short video, weird lighting,
+        # pose detection couldn't lock in) → fall through to plate logic
+    except Exception:
+        pass
+
+    # ---- Method 2 (fallback): plate position ----
     try:
         import cv2
     except Exception:
@@ -17115,16 +17214,13 @@ def auto_detect_camera_angle(video_path: str,
         return "side"
 
     plate_hits = 0
-    plate_positions_x = []   # 0.0 = far left, 1.0 = far right
+    plate_positions_x = []
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
     for k in range(sample_frames):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (k + 1) / (sample_frames + 1)))
         ok, frame = cap.read()
         if not ok:
             continue
-        # Reuse the existing plate auto-detector (it takes bytes, so
-        # encode this frame as JPEG first)
         try:
             ok_enc, buf = cv2.imencode(".jpg", frame)
             if ok_enc:
@@ -17140,9 +17236,14 @@ def auto_detect_camera_angle(video_path: str,
     cap.release()
 
     if plate_hits == 0:
-        return "behind_pitcher"
+        # No plate AND pose was inconclusive — most likely a behind-
+        # catcher view where the catcher's body blocks the plate AND
+        # crops out enough of the catcher's legs that pose detection
+        # couldn't classify them as a squat. Default to behind-catcher
+        # (rather than behind-pitcher) — for unedited bullpens this is
+        # the more common case.
+        return "behind_catcher"
     avg_x = sum(plate_positions_x) / len(plate_positions_x)
-    # If plate sits in the middle 40% of the frame → likely behind-catcher
     if 0.30 <= avg_x <= 0.70:
         return "behind_catcher"
     return "side"
