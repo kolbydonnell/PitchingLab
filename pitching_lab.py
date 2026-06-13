@@ -17112,6 +17112,42 @@ def process_uploaded_video(video_path: str,
 # MediaPipe is optional. If it's not installed (e.g. Python 3.13/3.14 on
 # Streamlit Cloud), these helpers return (None, None) cleanly and the caller
 # falls back to ball-only metrics.
+def _try_fix_mediapipe_permissions() -> bool:
+    """Attempt to chmod the mediapipe tflite model files when they have
+    broken permissions on Streamlit Cloud.
+
+    Returns True if any file was successfully made readable. Safe-fails
+    on any exception (e.g., no write permission on the file's directory).
+    """
+    try:
+        import mediapipe as _mp
+        import os, stat, pathlib
+        # The tflite models live alongside the mediapipe package
+        mp_root = pathlib.Path(_mp.__file__).parent
+        fixed_any = False
+        for tflite_path in mp_root.rglob("*.tflite"):
+            try:
+                cur = tflite_path.stat().st_mode
+                target = cur | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
+                if cur != target:
+                    os.chmod(tflite_path, target)
+                    fixed_any = True
+            except Exception:
+                continue
+        for binarypb_path in mp_root.rglob("*.binarypb"):
+            try:
+                cur = binarypb_path.stat().st_mode
+                target = cur | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
+                if cur != target:
+                    os.chmod(binarypb_path, target)
+                    fixed_any = True
+            except Exception:
+                continue
+        return fixed_any
+    except Exception:
+        return False
+
+
 def _is_mediapipe_available() -> bool:
     """True only if mediapipe imports AND exposes the legacy solutions API
     AND can actually load its model file.
@@ -17122,24 +17158,35 @@ def _is_mediapipe_available() -> bool:
     imports cleanly but is missing the `solutions` submodule. Both
     failure modes need to be caught here so the rest of the app
     gracefully degrades instead of crashing.
+
+    Recovery path: if the smoke test fails the first time, we try a
+    runtime chmod on the tflite files and retry. Some Streamlit Cloud
+    installs leave the package readable but the bundled models not.
     """
     try:
         import mediapipe as _mp  # noqa: F401
         # Real builds expose mediapipe.solutions.pose; stubs don't.
         _ = _mp.solutions.pose            # type: ignore[attr-defined]
         _ = _mp.solutions.drawing_utils   # type: ignore[attr-defined]
-        # Smoke test: actually try to instantiate Pose() with the lowest
-        # model_complexity. This forces the .tflite file load and surfaces
-        # the PermissionError BEFORE any pipeline runs. If it fails, we
-        # treat MediaPipe as unavailable rather than crashing later.
-        try:
-            _test_pose = _mp.solutions.pose.Pose(model_complexity=0)
-            _test_pose.close()
-        except Exception:
-            return False
-        return True
     except Exception:
         return False
+
+    def _smoke_test() -> bool:
+        try:
+            import mediapipe as _mp2
+            _test_pose = _mp2.solutions.pose.Pose(model_complexity=0)
+            _test_pose.close()
+            return True
+        except Exception:
+            return False
+
+    # First attempt
+    if _smoke_test():
+        return True
+    # Recovery: try chmod-ing the model files and retry once
+    if _try_fix_mediapipe_permissions():
+        return _smoke_test()
+    return False
 
 
 def _compute_pose_metrics(landmarks, img_h: int, img_w: int,
