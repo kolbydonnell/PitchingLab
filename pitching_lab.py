@@ -14779,27 +14779,19 @@ def detect_ball_in_frame(frame_bgr,
             mean_brightness = 200.0
         # 0..1 scale: 200 brightness = 0, 250+ brightness = 1
         brightness_score = max(0.0, min(1.0, (mean_brightness - 200) / 50.0))
-        # IMPORTANT: rebalanced scoring.
-        # Previous version weighted brightness 15x assuming the ball is
-        # always the whitest moving thing. That FAILS on distant stadium
-        # footage where the catcher's jersey, helmet, even stadium lights
-        # are brighter than a small motion-blurred ball.
-        #
-        # The ball's REAL distinguishing features are:
-        #  1. SMALL — typically 4-15 px radius at HD resolution
-        #  2. ROUND — circularity above 0.65
-        #  3. FILLED — fill ratio above 0.5
-        #  4. (Fast-moving — handled in process_uploaded_video post-pass)
-        #
-        # We now PREFER smaller candidates (size bonus inversely
-        # proportional to radius), with brightness as a tie-breaker.
-        # This stops jersey logos / helmets from winning over the ball.
-        # Smaller-better bonus: radius 4 → 1.0, radius 30 → 0.0
-        size_score = max(0.0, min(1.0, (30.0 - r) / 26.0))
-        score = (size_score * 8.0
-                  + circularity * 6.0
-                  + fill_ratio * 4.0
-                  + brightness_score * 3.0)
+        # Rebalanced scoring — prefer SHAPE over size or brightness.
+        # The ball is round + solid + moving — those properties win.
+        # Size: prefer the MIDDLE of the user-specified radius range
+        # (rmin to rmax). Both very small noise blobs AND very large
+        # jersey logos / helmets get equal penalty for being at the
+        # range extremes. Real balls are within the middle.
+        mid_r = (rmin + rmax) / 2.0
+        range_half = max(1.0, (rmax - rmin) / 2.0)
+        size_score = max(0.0, 1.0 - abs(r - mid_r) / range_half)
+        score = (circularity * 8.0       # roundness — strongest signal
+                  + fill_ratio * 5.0      # solid (not hollow)
+                  + size_score * 3.0      # mid-range radius preferred
+                  + brightness_score * 2.0)  # tie-breaker only
         if score > best_score:
             best_score = score
             # Sub-pixel centroid via moments — more accurate than
@@ -15802,8 +15794,46 @@ def render_manual_landmarks_panel(video_path: str,
         st.caption(f"streamlit-image-coordinates failed to import: {e}")
         return {}
 
+    # Get video duration so we can let the user scrub to a useful frame.
+    # The default still is at 1 second which often catches the pre-pitch
+    # setup phase — pitcher hasn't started his motion, catcher hasn't
+    # set up. User needs to navigate to a frame where the pitcher is at
+    # release AND the catcher's glove is visible.
     try:
-        png, orig_w, orig_h = extract_calibration_still(video_path)
+        import cv2 as _cv2_meta
+        _meta_cap = _cv2_meta.VideoCapture(video_path)
+        _vid_fps    = float(_meta_cap.get(_cv2_meta.CAP_PROP_FPS) or 30.0)
+        _vid_total  = int(_meta_cap.get(_cv2_meta.CAP_PROP_FRAME_COUNT) or 0)
+        _meta_cap.release()
+        _vid_duration = (_vid_total / _vid_fps) if _vid_fps else 0.0
+    except Exception:
+        _vid_duration = 0.0
+        _vid_fps = 30.0
+        _vid_total = 0
+
+    frame_key = f"{state_prefix}m_frame_time"
+    if frame_key not in st.session_state and _vid_duration:
+        # Default scrub position = middle of video (most likely to have
+        # actual pitching activity, not setup time)
+        st.session_state[frame_key] = _vid_duration / 2.0
+
+    if _vid_duration > 0.5:
+        scrub_t = st.slider(
+            "Scrub to a frame where the pitcher is releasing AND the "
+            "catcher's glove is up (drag to find a good frame)",
+            min_value=0.0,
+            max_value=float(_vid_duration),
+            value=float(st.session_state.get(frame_key,
+                                                _vid_duration / 2.0)),
+            step=0.1,
+            key=frame_key,
+            format="%.1f sec")
+    else:
+        scrub_t = 1.0
+
+    try:
+        png, orig_w, orig_h = extract_calibration_still(video_path,
+                                                              target_time_sec=scrub_t)
     except Exception as e:
         st.caption(f"Couldn't extract a still: {e}")
         return {}
@@ -16748,51 +16778,68 @@ def process_uploaded_video(video_path: str,
 
     # ----- Pitcher-catcher ROI corridor -----
     # The ball can only exist along the corridor between the pitcher's
-    # release point and the catcher's glove. Everything outside this
-    # corridor is by definition NOT the ball — it's stadium lights,
-    # jerseys, hands, gear, etc. Restricting ball search to this corridor
-    # eliminates 80%+ of false positives BEFORE the detector scores them.
-    # This is the single biggest accuracy gain for stadium / behind-
-    # catcher footage where the ball is the smallest bright thing in
-    # frame and lots of larger bright objects compete for "ball" status.
+    # release point and the catcher's glove. Manual clicks (when given)
+    # OVERRIDE pose detection so the corridor lands where the USER says
+    # it should — pose detection on bad footage may pick the wrong
+    # people or miss them entirely.
     roi_corridor_mask = None
     try:
-        _anchors = _detect_pitcher_catcher_anchors(video_path, n_samples=10)
-        # PREFER the wrist anchors (release point + glove) since those
-        # are where the ball actually exists at start/end of flight.
-        # Fall back to body centers if wrist detection failed.
-        # Pitcher: max-extent throwing wrist > median wrist > hip
-        _pxy = (_anchors.get("pitcher_wrist_extent_xy")
-                  or _anchors.get("pitcher_wrist_xy")
-                  or _anchors.get("pitcher_xy"))
-        # Catcher: glove (forward wrist) > hip
-        _cxy = (_anchors.get("catcher_glove_xy")
-                  or _anchors.get("catcher_xy"))
-        _anchor_source = "wrist-based" if (
-            _anchors.get("pitcher_wrist_xy")
-            and _anchors.get("catcher_glove_xy")
-        ) else "mixed (body+wrist)" if (
-            _anchors.get("pitcher_wrist_xy")
-            or _anchors.get("catcher_glove_xy")
-        ) else "body-only (wrist fallback failed)"
+        # FIRST: check if the calibration dict has manual landmarks.
+        # These are user-provided ground truth and override everything.
+        _ml = calibration.get("manual_landmarks") if isinstance(calibration, dict) else None
+        _ml = _ml or {}
+        _manual_pxy = _ml.get("pitcher_xy")
+        _manual_cxy = _ml.get("catcher_xy")
+        _pxy = None
+        _cxy = None
+        _anchor_source = "none"
+
+        if _manual_pxy and _manual_cxy:
+            _pxy = tuple(int(v) for v in _manual_pxy)
+            _cxy = tuple(int(v) for v in _manual_cxy)
+            _anchor_source = "manual-clicks"
+        else:
+            # Fall back to pose detection
+            _anchors = _detect_pitcher_catcher_anchors(video_path, n_samples=10)
+            _pose_pxy = (_anchors.get("pitcher_wrist_extent_xy")
+                          or _anchors.get("pitcher_wrist_xy")
+                          or _anchors.get("pitcher_xy"))
+            _pose_cxy = (_anchors.get("catcher_glove_xy")
+                          or _anchors.get("catcher_xy"))
+            # Use manual values where provided, pose for the other
+            _pxy = (tuple(int(v) for v in _manual_pxy)
+                     if _manual_pxy else _pose_pxy)
+            _cxy = (tuple(int(v) for v in _manual_cxy)
+                     if _manual_cxy else _pose_cxy)
+            if _manual_pxy or _manual_cxy:
+                _anchor_source = "mixed (manual+pose)"
+            elif (_anchors.get("pitcher_wrist_xy")
+                    and _anchors.get("catcher_glove_xy")):
+                _anchor_source = "pose wrist-based"
+            elif _pxy and _cxy:
+                _anchor_source = "pose body-only"
+
         if _pxy and _cxy:
-            # Build a fat line segment between them as a binary mask
             import numpy as _np
             roi_corridor_mask = _np.zeros((fh_video, fw_video),
                                               dtype=_np.uint8)
-            # Tighter corridor when wrist-anchored (more accurate
-            # endpoints). Wider when body-anchored (less accurate).
-            if "wrist-based" in _anchor_source:
+            # Width depends on anchor source confidence
+            if _anchor_source == "manual-clicks":
+                corridor_w = int(min(fw_video, fh_video) * 0.22)
+            elif _anchor_source.startswith("pose wrist"):
                 corridor_w = int(min(fw_video, fh_video) * 0.18)
             else:
-                corridor_w = int(min(fw_video, fh_video) * 0.28)
+                corridor_w = int(min(fw_video, fh_video) * 0.30)
             cv2.line(roi_corridor_mask, _pxy, _cxy, 255,
                        thickness=corridor_w)
-            anchor_r = int(corridor_w * 0.75)
+            anchor_r = int(corridor_w * 0.85)
             cv2.circle(roi_corridor_mask, _pxy, anchor_r, 255, -1)
             cv2.circle(roi_corridor_mask, _cxy, anchor_r, 255, -1)
             print(f"[upload-side] corridor ROI ({_anchor_source}): "
                   f"pitcher@{_pxy} → catcher@{_cxy}, width={corridor_w}px")
+        else:
+            print(f"[upload-side] corridor NOT built — no anchors. "
+                  f"Detector will run without ROI constraint.")
     except Exception as _e:
         try: print(f"[upload-side] ROI build failed (non-fatal): {_e}")
         except Exception: pass
@@ -18237,14 +18284,64 @@ def _capture_one_camera_for_upload(label: str,
             try:
                 import cv2 as _cv2
                 import numpy as _np
+                # Build the pose-based corridor ROI exactly like the
+                # full pipeline will use. This lets you VISUALLY VERIFY:
+                #   - Was the pitcher correctly located?
+                #   - Was the catcher correctly located?
+                #   - Does the corridor between them cover the throwing
+                #     line, or does pose detection need help (manual
+                #     landmark click)?
+                with st.spinner("Building pose corridor (one-time per video)..."):
+                    _dbg_anchors = _detect_pitcher_catcher_anchors(
+                        tmp_path, n_samples=10)
+                _p_anchor = (_dbg_anchors.get("pitcher_wrist_extent_xy")
+                              or _dbg_anchors.get("pitcher_wrist_xy")
+                              or _dbg_anchors.get("pitcher_xy"))
+                _c_anchor = (_dbg_anchors.get("catcher_glove_xy")
+                              or _dbg_anchors.get("catcher_xy"))
+                _anchor_source = "wrist-based" if (
+                    _dbg_anchors.get("pitcher_wrist_xy")
+                    and _dbg_anchors.get("catcher_glove_xy")
+                ) else "body-only" if (_p_anchor and _c_anchor) else "none"
+                if _anchor_source == "none":
+                    st.warning(
+                        "**Pose detection failed.** Couldn't find pitcher "
+                        "and/or catcher in any sample frame. The corridor "
+                        "ROI won't be applied. Use the **Manual landmarks** "
+                        "panel above to click pitcher and catcher manually.")
+                else:
+                    st.caption(
+                        f"Pose anchors: pitcher@{_p_anchor}, "
+                        f"catcher@{_c_anchor} — source: **{_anchor_source}**. "
+                        f"The yellow box on each preview frame is the "
+                        f"search corridor. Green circle = detected ball. "
+                        f"Red X = no detection.")
+
                 cap_dbg = _cv2.VideoCapture(tmp_path)
                 if not cap_dbg.isOpened():
                     st.error("Couldn't open the video for preview.")
                 else:
                     n = int(cap_dbg.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    fw_dbg = int(cap_dbg.get(_cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+                    fh_dbg = int(cap_dbg.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
                     if n < 8:
                         st.warning("Video too short for an 8-frame preview.")
                     else:
+                        # Build the corridor mask once, reuse for all frames
+                        corridor_mask_dbg = None
+                        if _p_anchor and _c_anchor:
+                            corridor_mask_dbg = _np.zeros((fh_dbg, fw_dbg),
+                                                              dtype=_np.uint8)
+                            corridor_w = int(min(fw_dbg, fh_dbg) *
+                                              (0.18 if _anchor_source == "wrist-based"
+                                                else 0.28))
+                            _cv2.line(corridor_mask_dbg, _p_anchor, _c_anchor,
+                                        255, thickness=corridor_w)
+                            anc_r = int(corridor_w * 0.75)
+                            _cv2.circle(corridor_mask_dbg, _p_anchor,
+                                          anc_r, 255, -1)
+                            _cv2.circle(corridor_mask_dbg, _c_anchor,
+                                          anc_r, 255, -1)
                         preview_imgs = []
                         captions = []
                         for k in range(8):
@@ -18257,8 +18354,31 @@ def _capture_one_camera_for_upload(label: str,
                                 fr,
                                 ball_radius_px_range=(int(ball_min),
                                                           int(ball_max)),
-                                motion_blur_tolerant=True)
+                                motion_blur_tolerant=True,
+                                foreground_mask=corridor_mask_dbg)
                             anno = fr.copy()
+                            # Draw corridor outline (yellow) on every frame
+                            if corridor_mask_dbg is not None:
+                                contours_, _ = _cv2.findContours(
+                                    corridor_mask_dbg, _cv2.RETR_EXTERNAL,
+                                    _cv2.CHAIN_APPROX_SIMPLE)
+                                _cv2.drawContours(anno, contours_, -1,
+                                                    (0, 220, 255), 3)
+                                # Mark pitcher (cyan) and catcher (green)
+                                if _p_anchor:
+                                    _cv2.circle(anno, _p_anchor, 18,
+                                                  (255, 200, 50), 3)
+                                    _cv2.putText(anno, "P",
+                                                    (_p_anchor[0]+22, _p_anchor[1]-4),
+                                                    _cv2.FONT_HERSHEY_SIMPLEX,
+                                                    0.9, (255, 200, 50), 3)
+                                if _c_anchor:
+                                    _cv2.circle(anno, _c_anchor, 18,
+                                                  (90, 220, 50), 3)
+                                    _cv2.putText(anno, "C",
+                                                    (_c_anchor[0]+22, _c_anchor[1]-4),
+                                                    _cv2.FONT_HERSHEY_SIMPLEX,
+                                                    0.9, (90, 220, 50), 3)
                             if res:
                                 cx, cy = int(res[0]), int(res[1])
                                 rr = int(res[2]) if len(res) >= 3 else 8
@@ -18273,7 +18393,6 @@ def _capture_one_camera_for_upload(label: str,
                                 caption = f"Frame {f_idx}: ball at " \
                                           f"({cx},{cy}) r={rr}px"
                             else:
-                                h_, w_ = anno.shape[:2]
                                 _cv2.line(anno, (20, 20),
                                             (80, 80),
                                             (0, 0, 255), 6)
@@ -18285,7 +18404,7 @@ def _capture_one_camera_for_upload(label: str,
                                               (100, 60),
                                               _cv2.FONT_HERSHEY_SIMPLEX,
                                               1.0, (0, 0, 255), 3)
-                                caption = f"Frame {f_idx}: no ball"
+                                caption = f"Frame {f_idx}: no ball in corridor"
                             ok_enc, png = _cv2.imencode(".png", anno)
                             if ok_enc:
                                 preview_imgs.append(png.tobytes())
@@ -18298,27 +18417,29 @@ def _capture_one_camera_for_upload(label: str,
                                 st.image(img_b, caption=cap_str,
                                           use_container_width=True)
                         n_hit = sum(1 for c in captions if "ball at" in c)
-                        if n_hit == 0:
+                        if _anchor_source == "none":
                             st.error(
-                                "**Detector found no ball in any of the "
-                                "8 sampled frames.** Try increasing the "
-                                "ball radius MAX (in the calibration "
-                                "section) — for behind-catcher views, "
-                                "balls get bigger as they approach the "
-                                "camera (try max=40). For dimly-lit or "
-                                "low-contrast videos, the brightness "
-                                "threshold may be too strict.")
-                        elif n_hit < 4:
+                                "Pose anchors couldn't be built. The "
+                                "detector ran without the corridor "
+                                "constraint, so it can pick up anything "
+                                "bright + moving in the frame. Use "
+                                "Manual landmarks to provide pitcher "
+                                "and catcher locations.")
+                        elif n_hit == 0:
                             st.warning(
-                                f"Detector found a ball in only "
-                                f"{n_hit}/8 sampled frames. The pipeline "
-                                f"will probably miss some pitches. "
-                                f"Consider widening the radius range.")
+                                f"Corridor is built ({_anchor_source}) "
+                                f"but detector found no ball in it. "
+                                f"Verify the yellow corridor outline "
+                                f"actually covers the pitcher→catcher "
+                                f"throwing line in the frames above. "
+                                f"If it doesn't, click the right "
+                                f"pitcher/catcher locations in Manual "
+                                f"Landmarks.")
                         else:
                             st.success(
-                                f"Detector working: ball found in "
-                                f"{n_hit}/8 sampled frames. The full "
-                                f"pipeline should find pitches.")
+                                f"Detector found {n_hit}/8 candidates "
+                                f"inside the corridor "
+                                f"({_anchor_source}).")
             except Exception as e:
                 st.error(f"Preview failed: {e}")
 
@@ -18342,6 +18463,54 @@ def _capture_one_camera_for_upload(label: str,
             _xy = st.session_state.get(f"{key_prefix}ml_{_name}_xy")
             if _xy:
                 _manual_landmarks[f"{_name}_xy"] = _xy
+
+        # If user clicked a ball, sample the actual ball-blob radius at
+        # that pixel and tighten the radius search window around it.
+        # Kills most non-ball candidates outside that size band.
+        ball_click = _manual_landmarks.get("ball_xy")
+        if ball_click:
+            try:
+                import cv2 as _cv2_b
+                import numpy as _np_b
+                _bcap = _cv2_b.VideoCapture(tmp_path)
+                _bn = int(_bcap.get(_cv2_b.CAP_PROP_FRAME_COUNT) or 0)
+                # Sample around the middle of the video for the frame
+                _bcap.set(_cv2_b.CAP_PROP_POS_FRAMES, _bn // 2)
+                _ok_b, _frame_b = _bcap.read()
+                _bcap.release()
+                if _ok_b and _frame_b is not None:
+                    # Look for the brightest small blob near the click
+                    _gray_b = _cv2_b.cvtColor(_frame_b, _cv2_b.COLOR_BGR2GRAY)
+                    _peak_b = int(_np_b.percentile(_gray_b, 99.5))
+                    _t_b = max(110, min(245, int(_peak_b * 0.85)))
+                    _, _mask_b = _cv2_b.threshold(_gray_b, _t_b, 255,
+                                                       _cv2_b.THRESH_BINARY)
+                    # Restrict mask to a 100x100 window around click
+                    _cx_b, _cy_b = int(ball_click[0]), int(ball_click[1])
+                    _h_b, _w_b = _mask_b.shape[:2]
+                    _x0 = max(0, _cx_b - 50); _x1 = min(_w_b, _cx_b + 50)
+                    _y0 = max(0, _cy_b - 50); _y1 = min(_h_b, _cy_b + 50)
+                    _patch = _mask_b[_y0:_y1, _x0:_x1]
+                    _ctrs, _ = _cv2_b.findContours(
+                        _patch, _cv2_b.RETR_EXTERNAL,
+                        _cv2_b.CHAIN_APPROX_SIMPLE)
+                    _best_r = None
+                    for _c in _ctrs:
+                        (_x, _y), _r = _cv2_b.minEnclosingCircle(_c)
+                        if 2 <= _r <= 50:
+                            if _best_r is None or _r > _best_r:
+                                _best_r = float(_r)
+                    if _best_r:
+                        # Set search range to ±50% of observed radius
+                        ball_min = max(2, int(_best_r * 0.55))
+                        ball_max = max(ball_min + 2, int(_best_r * 1.55))
+                        st.caption(
+                            f"Ball click sampled — observed radius "
+                            f"~{_best_r:.1f}px → search range set to "
+                            f"{ball_min}-{ball_max}px.")
+            except Exception:
+                pass
+
         calibration = {
             "plate_center_x_px":  int(plate_cx),
             "plate_center_y_px":  int(plate_cy),
