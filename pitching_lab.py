@@ -15715,6 +15715,100 @@ _SANITY_BOUNDS = {
 }
 
 
+def auto_calibrate_from_trajectories(pitches_positions: list,
+                                          frame_width: int = 1920,
+                                          frame_height: int = 1080) -> dict:
+    """Derive calibration (plate location + pixel-to-feet scale) from the
+    ball trajectories themselves, no plate required.
+
+    This solves the realistic-bullpen problem: behind-catcher views always
+    have the catcher's body covering home plate; backyard / indoor /
+    coach-throwing bullpens may have NO physical plate at all; high-school
+    fields with dusty plates may not match the white-circular profile our
+    auto-detector looks for. As long as the ball detector works (which
+    we've solved), we can compute calibration from the data.
+
+    The two key insights:
+      1. A baseball is exactly 2.9 inches in diameter (1.45 in radius).
+         The detected ball radius gives us a real-world scale reference
+         with no external data — radius × (17 in / 1.45 in) = pixels per
+         plate width.
+      2. Pitches converge at the plate. The median endpoint (last
+         detection of each pitch trajectory) IS the plate location, to
+         within a few inches, regardless of whether you can see the
+         physical plate or not.
+
+    pitches_positions: list of trajectories, each a list of (t, x, y, r)
+        tuples. r = detected ball radius in pixels.
+    frame_width/height: video frame dimensions for sane-bounds fallback.
+
+    Returns a calibration dict matching the format process_uploaded_video
+    expects.
+    """
+    if not pitches_positions:
+        # No data — return a placeholder using middle-of-frame defaults.
+        return {
+            "plate_center_x_px": frame_width // 2,
+            "plate_center_y_px": int(frame_height * 0.75),
+            "plate_width_px":    max(40, frame_width // 20),
+            "source":            "default (no trajectories)",
+        }
+
+    # ---- Pixel-to-inches scale from ball radius ----
+    # Sample radii from the MIDDLE of each trajectory (avoids any motion-
+    # blur artifacts at release and catch frames).
+    all_radii: list = []
+    for traj in pitches_positions:
+        if len(traj) < 3:
+            continue
+        mid_start = len(traj) // 4
+        mid_end   = 3 * len(traj) // 4
+        for p in traj[mid_start:mid_end]:
+            if len(p) >= 4 and p[3] is not None:
+                all_radii.append(float(p[3]))
+    if not all_radii:
+        # Fall back to a resolution-derived default
+        median_r = max(6.0, frame_width / 200.0)
+    else:
+        all_radii.sort()
+        median_r = all_radii[len(all_radii) // 2]
+
+    # plate_width_in = 17, ball_radius_in = 1.45 → plate width is ~5.86x
+    # ball diameter, or 11.72x ball radius.
+    plate_w_px = max(20, int(median_r * 11.72))
+
+    # ---- Plate position from trajectory endpoints ----
+    # The last 2-3 detections of each pitch sit near the plate (in side
+    # view) or directly on the plate (behind catcher). Take the median.
+    end_xs: list = []
+    end_ys: list = []
+    for traj in pitches_positions:
+        if len(traj) < 3:
+            continue
+        # Use the last 3 samples averaged (robust to single-frame noise)
+        tail = traj[-3:]
+        avg_x = sum(p[1] for p in tail) / len(tail)
+        avg_y = sum(p[2] for p in tail) / len(tail)
+        end_xs.append(avg_x)
+        end_ys.append(avg_y)
+
+    if end_xs:
+        end_xs.sort(); end_ys.sort()
+        plate_cx = int(end_xs[len(end_xs) // 2])
+        plate_cy = int(end_ys[len(end_ys) // 2])
+    else:
+        plate_cx = frame_width // 2
+        plate_cy = int(frame_height * 0.75)
+
+    return {
+        "plate_center_x_px": plate_cx,
+        "plate_center_y_px": plate_cy,
+        "plate_width_px":    plate_w_px,
+        "source":            f"auto (median ball r={median_r:.1f}px, "
+                              f"{len(end_xs)} trajectory endpoints)",
+    }
+
+
 # ===== Module-level diagnostics from the most recent upload run =====
 # Captured so the UI can show "8 pitches detected, all 8 failed sanity"
 # banners even when the final returned list is empty. Keyed by video_path
@@ -15859,7 +15953,11 @@ def process_uploaded_video(video_path: str,
     warmup_frames = min(30, total_frames // 4 if total_frames else 30)
 
     # ----- Pass 1: detect ball in every frame -----
-    positions: list[tuple[float, int, int]] = []
+    # We now capture ball radius alongside (x, y) so the auto-calibrator
+    # can use the ball as a real-world scale reference. A baseball is
+    # exactly 2.9 in diameter, so detected radius gives us pixels-per-inch
+    # without needing a visible plate.
+    positions: list[tuple] = []   # (t, x, y, r)
     frame_idx = 0
     while True:
         ok, frame = cap.read()
@@ -15878,7 +15976,8 @@ def process_uploaded_video(video_path: str,
         )
         if pos:
             t_sec = frame_idx / fps
-            positions.append((t_sec, pos[0], pos[1]))
+            r_px  = pos[2] if len(pos) >= 3 else 8.0
+            positions.append((t_sec, pos[0], pos[1], r_px))
         frame_idx += 1
         if progress_cb and frame_idx % 30 == 0 and total_frames > 0:
             progress_cb(min(1.0, frame_idx / total_frames))
@@ -15893,22 +15992,25 @@ def process_uploaded_video(video_path: str,
     # A pitch is a burst of consecutive detections where the ball is
     # moving fast and continuously. Pitches are separated by quiet periods
     # (no detection or near-stationary motion lasting min_quiet_frames).
-    pitches: list[list[tuple[float, int, int]]] = []
-    current: list[tuple[float, int, int]] = []
+    # positions are 4-tuples (t, x, y, radius_px) — radius is preserved
+    # through segmentation so the auto-calibrator can use it later.
+    pitches: list = []
+    current: list = []
     for i in range(len(positions)):
-        t, x, y = positions[i]
+        sample = positions[i]
+        t, x, y = sample[0], sample[1], sample[2]
         if not current:
-            current.append((t, x, y))
+            current.append(sample)
             continue
-        prev_t, prev_x, prev_y = current[-1]
+        prev_t = current[-1][0]
         gap_frames = (t - prev_t) * fps
         if gap_frames > min_quiet_frames:
             # Long gap → previous pitch ended
             if len(current) >= 5:
                 pitches.append(current)
-            current = [(t, x, y)]
+            current = [sample]
         else:
-            current.append((t, x, y))
+            current.append(sample)
     if len(current) >= 5:
         pitches.append(current)
 
@@ -15922,10 +16024,43 @@ def process_uploaded_video(video_path: str,
         ) >= min_pitch_motion_px
     ]
 
+    # ----- Pass 2.5: auto-calibration -----
+    # If the caller passed calibration={"auto": True} OR the supplied
+    # calibration's plate_width_px is implausible (too small or absent),
+    # derive calibration from the trajectories themselves. This is the
+    # plate-free path: works on behind-catcher views where the catcher
+    # blocks the plate, on backyard bullpens with no physical plate, and
+    # on indoor cages with a target dot instead of a plate.
+    cal_in = dict(calibration) if calibration else {}
+    needs_auto = (cal_in.get("auto") is True or
+                    not cal_in.get("plate_width_px") or
+                    cal_in.get("plate_width_px", 0) < 10)
+    if needs_auto:
+        # Need frame dims for the fallback inside the auto-calibrator
+        try:
+            import cv2 as _cv2
+            _c = _cv2.VideoCapture(video_path)
+            fw = int(_c.get(_cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+            fh = int(_c.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+            _c.release()
+        except Exception:
+            fw, fh = 1920, 1080
+        auto_cal = auto_calibrate_from_trajectories(
+            pitches, frame_width=fw, frame_height=fh)
+        cal_in.update(auto_cal)
+        try:
+            print(f"[upload-side] auto-calibrated: "
+                  f"plate=({auto_cal['plate_center_x_px']},"
+                  f"{auto_cal['plate_center_y_px']}), "
+                  f"w={auto_cal['plate_width_px']}px "
+                  f"({auto_cal.get('source','')})")
+        except Exception:
+            pass
+
     # ----- Pass 3: fit each pitch's metrics -----
     fitted = []
     for i, pitch_positions in enumerate(pitches):
-        cal = dict(calibration)
+        cal = dict(cal_in)
         cal["sport"] = sport
         fit = fit_pitch_trajectory(pitch_positions, cal)
         if fit is None:
@@ -17093,26 +17228,50 @@ def _capture_one_camera_for_upload(label: str,
         ball_min = 6; ball_max = 22
     else:
         st.divider()
-        st.markdown("**Step 2 — Calibrate** (automatic — confirm or one tap if needed)")
-        cal = render_smart_calibration(tmp_path,
-                                           state_prefix=f"{key_prefix}cc_",
-                                           sport=athlete_sport)
-        with st.expander("Power-user: preset / manual numbers",
-                           expanded=False):
+        st.markdown("**Step 2 — Calibrate**")
+        # Default-ON self-calibration. Solves the real-world problem that
+        # plates are often covered (catcher's shoulder), worn out, or
+        # don't exist (backyard / indoor / coach-throwing bullpens).
+        # When ON, we use the ball's known physical size + the
+        # convergence point of detected pitches as our reference, so the
+        # user never has to touch calibration.
+        auto_cal_on = st.checkbox(
+            "Self-calibrate from detected ball flight  ★ recommended",
+            value=True, key=f"{key_prefix}auto_cal",
+            help="Uses the ball's known 2.9-inch diameter as a pixel-to-"
+                  "inches scale, and the convergence point of detected "
+                  "pitches as the plate location. Works without a "
+                  "visible plate (catcher blocking, no plate, dirty "
+                  "plate, etc.). Uncheck only if you want to manually "
+                  "click the plate location.")
+        if auto_cal_on:
             st.caption(
-                "Falling back here is fine if click-to-calibrate isn't loading. "
-                "Pick a preset or type pixel coordinates by hand. Click-derived "
-                "values above take precedence if both are set.")
-            fallback_cal = render_calibration_with_presets(
-                state_prefix=key_prefix)
-        cal = cal or fallback_cal
-        if cal is None:
-            st.info("Calibrate the plate before processing.")
-            return st.session_state.get(pitches_session_key, []), tmp_path
+                "No plate required. The pipeline will derive scale + "
+                "location from the ball trajectories themselves.")
+            # Provide a sane default for the radius range — the auto-cal
+            # will refine the scale from actual detected radii.
+            ball_min, ball_max = 4, 40
+            plate_cx = 0; plate_cy = 0; plate_w = 0   # signal: auto
+        else:
+            cal = render_smart_calibration(tmp_path,
+                                               state_prefix=f"{key_prefix}cc_",
+                                               sport=athlete_sport)
+            with st.expander("Power-user: preset / manual numbers",
+                               expanded=False):
+                st.caption(
+                    "Falling back here is fine if click-to-calibrate isn't loading. "
+                    "Pick a preset or type pixel coordinates by hand. Click-derived "
+                    "values above take precedence if both are set.")
+                fallback_cal = render_calibration_with_presets(
+                    state_prefix=key_prefix)
+            cal = cal or fallback_cal
+            if cal is None:
+                st.info("Calibrate the plate before processing.")
+                return st.session_state.get(pitches_session_key, []), tmp_path
 
-        plate_cx = cal["plate_cx_px"]; plate_cy = cal["plate_cy_px"]
-        plate_w  = cal["plate_w_px"]
-        ball_min = cal["ball_rmin_px"]; ball_max = cal["ball_rmax_px"]
+            plate_cx = cal["plate_cx_px"]; plate_cy = cal["plate_cy_px"]
+            plate_w  = cal["plate_w_px"]
+            ball_min = cal["ball_rmin_px"]; ball_max = cal["ball_rmax_px"]
 
     # ===== Step 2.5 — Debug: show what the ball detector sees =====
     # When the pipeline returns "no pitches detected", the user has no
