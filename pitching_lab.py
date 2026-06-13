@@ -15991,24 +15991,53 @@ def maybe_upsample_video_fps(video_path: str,
         return out_path
 
     # Motion-compensated frame interpolation via ffmpeg's minterpolate
-    # filter. mci_mode=aobmc gives the cleanest results for ball tracking
-    # (less ghosting than blend, sharper than dup).
+    # filter. `blend` mode is fast and produces a guaranteed-valid mp4
+    # that cv2 can definitely read. `mci` mode is sharper but unreliable
+    # on some Mac ffmpeg builds (motion vector failures produce corrupt
+    # output that cv2 can't open).
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", video_path,
-        "-vf", f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc"
-                 f":me_mode=bidir:vsbmc=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-vf", f"minterpolate=fps={target_fps}:mi_mode=blend",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p",  # ensures broad codec compatibility
+        "-movflags", "+faststart",
         "-an",  # drop audio — pose/ball detection doesn't need it
         out_path,
     ]
     try:
-        subprocess.run(cmd, check=True, timeout=300)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
-            return out_path
+        result = subprocess.run(cmd, check=True, timeout=300,
+                                  capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        # Upsampler ran too long. Bail and use original.
+        try: os.remove(out_path)
+        except Exception: pass
+        return video_path
     except Exception:
-        pass
-    return video_path
+        try: os.remove(out_path)
+        except Exception: pass
+        return video_path
+
+    # Verify the output file is actually readable by cv2 — we've seen
+    # cases where ffmpeg exits 0 but writes an unreadable file. If cv2
+    # can't open it, the rest of the pipeline crashes hard, so we'd
+    # rather return the original.
+    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1024):
+        return video_path
+    try:
+        verify_cap = cv2.VideoCapture(out_path)
+        verify_ok = verify_cap.isOpened()
+        n_frames = int(verify_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        verify_cap.release()
+        if not verify_ok or n_frames < 10:
+            try: os.remove(out_path)
+            except Exception: pass
+            return video_path
+    except Exception:
+        try: os.remove(out_path)
+        except Exception: pass
+        return video_path
+    return out_path
 
 
 def assess_video_quality(video_path: str) -> dict:
