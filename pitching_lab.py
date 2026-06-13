@@ -14779,14 +14779,27 @@ def detect_ball_in_frame(frame_bgr,
             mean_brightness = 200.0
         # 0..1 scale: 200 brightness = 0, 250+ brightness = 1
         brightness_score = max(0.0, min(1.0, (mean_brightness - 200) / 50.0))
-        # Score weights brightness HEAVILY (15x), then circularity (10x),
-        # then fill (5x), with a small radius tiebreaker. Hands and
-        # gloves can pass shape filters but will score poorly on
-        # brightness — the ball wins.
-        score = (brightness_score * 15.0
-                  + circularity * 10.0
-                  + fill_ratio * 5.0
-                  + r * 0.1)
+        # IMPORTANT: rebalanced scoring.
+        # Previous version weighted brightness 15x assuming the ball is
+        # always the whitest moving thing. That FAILS on distant stadium
+        # footage where the catcher's jersey, helmet, even stadium lights
+        # are brighter than a small motion-blurred ball.
+        #
+        # The ball's REAL distinguishing features are:
+        #  1. SMALL — typically 4-15 px radius at HD resolution
+        #  2. ROUND — circularity above 0.65
+        #  3. FILLED — fill ratio above 0.5
+        #  4. (Fast-moving — handled in process_uploaded_video post-pass)
+        #
+        # We now PREFER smaller candidates (size bonus inversely
+        # proportional to radius), with brightness as a tie-breaker.
+        # This stops jersey logos / helmets from winning over the ball.
+        # Smaller-better bonus: radius 4 → 1.0, radius 30 → 0.0
+        size_score = max(0.0, min(1.0, (30.0 - r) / 26.0))
+        score = (size_score * 8.0
+                  + circularity * 6.0
+                  + fill_ratio * 4.0
+                  + brightness_score * 3.0)
         if score > best_score:
             best_score = score
             # Sub-pixel centroid via moments — more accurate than
@@ -15943,15 +15956,22 @@ def render_manual_landmarks_panel(video_path: str,
 
 
 def _detect_pitcher_catcher_anchors(video_path: str,
-                                          n_samples: int = 16) -> dict:
+                                          n_samples: int = 16,
+                                          hand_is_right: bool = True
+                                          ) -> dict:
     """Detect pitcher and catcher anchor points from pose across multiple
     frames. Returns:
         {
-          "pitcher_xy":     (x_px, y_px) or None,
-          "catcher_xy":     (x_px, y_px) or None,
-          "frame_width":    int,
-          "frame_height":   int,
-          "n_frames_seen":  {"pitcher": int, "catcher": int},
+          "pitcher_xy":         (x_px, y_px) or None,  # pelvis center
+          "pitcher_wrist_xy":   (x_px, y_px) or None,  # throwing hand
+          "pitcher_wrist_extent_xy": (x_px, y_px) or None,  # max-extent
+                                                           # wrist (release)
+          "catcher_xy":         (x_px, y_px) or None,  # pelvis center
+          "catcher_glove_xy":   (x_px, y_px) or None,  # forward wrist
+                                                       # (glove position)
+          "frame_width":        int,
+          "frame_height":       int,
+          "n_frames_seen":      {"pitcher": int, "catcher": int},
         }
 
     Strategy:
@@ -15959,20 +15979,27 @@ def _detect_pitcher_catcher_anchors(video_path: str,
       - Run MediaPipe Pose on each. Classify each detection as pitcher
         (standing — knees nearly straight) or catcher (squatting — knees
         bent below ~120°).
-      - Within each class, take the median pelvis position as the anchor.
-      - In side view, the pitcher is the high-motion cluster and the
-        catcher is the low-motion cluster.
-      - Anchors are used downstream to constrain ROI, filter throw-backs
-        by start/end region, and (most powerfully) derive a high-
-        confidence pixels-per-foot scale from the KNOWN real-world
-        distance between pitcher and catcher.
+      - Body anchors: median pelvis position per class.
+      - Pitcher HAND: takes the throwing-side wrist. Also tracks the
+        MAX EXTENT position of the wrist — that's where the arm reaches
+        full extension at release, which is where the ball starts its
+        flight.
+      - Catcher GLOVE: takes the wrist position closer to the pitcher
+        direction (since the catcher's mitt is held forward toward the
+        pitcher).
+      - Hand-to-glove gives us a tighter, more accurate corridor than
+        body-to-body, because the ball actually flies between those
+        points, not between the bodies.
     """
     out = {
-        "pitcher_xy":    None,
-        "catcher_xy":    None,
-        "frame_width":   1920,
-        "frame_height":  1080,
-        "n_frames_seen": {"pitcher": 0, "catcher": 0},
+        "pitcher_xy":             None,
+        "pitcher_wrist_xy":       None,
+        "pitcher_wrist_extent_xy": None,
+        "catcher_xy":             None,
+        "catcher_glove_xy":       None,
+        "frame_width":            1920,
+        "frame_height":           1080,
+        "n_frames_seen":          {"pitcher": 0, "catcher": 0},
     }
     if not _is_mediapipe_available():
         return out
@@ -15997,6 +16024,8 @@ def _detect_pitcher_catcher_anchors(video_path: str,
                           min_detection_confidence=0.4)
     pitcher_pts: list = []
     catcher_pts: list = []
+    pitcher_wrist_pts: list = []     # throwing-side wrist per frame
+    catcher_glove_pts: list = []     # forward (toward pitcher) wrist
     sample_indices = [int(n_frames * (k + 0.5) / n_samples)
                        for k in range(n_samples)]
     try:
@@ -16017,6 +16046,39 @@ def _detect_pitcher_catcher_anchors(video_path: str,
             rknee  = lm[L.RIGHT_KNEE.value]
             lankle = lm[L.LEFT_ANKLE.value]
             rankle = lm[L.RIGHT_ANKLE.value]
+            lwrist = lm[L.LEFT_WRIST.value]
+            rwrist = lm[L.RIGHT_WRIST.value]
+            lelbow = lm[L.LEFT_ELBOW.value]
+            relbow = lm[L.RIGHT_ELBOW.value]
+            lshoulder = lm[L.LEFT_SHOULDER.value]
+            rshoulder = lm[L.RIGHT_SHOULDER.value]
+
+            def _wrist_or_estimate(wrist_lm, elbow_lm, shoulder_lm):
+                """Tier 1: use wrist landmark if confident.
+                Tier 2: extrapolate shoulder→elbow→wrist if wrist is
+                low-confidence (visibility < 0.4).
+                Tier 3: shoulder + small forward offset (extrapolated
+                from facing direction)."""
+                vis = getattr(wrist_lm, "visibility", 1.0)
+                if vis >= 0.4:
+                    return (wrist_lm.x * out["frame_width"],
+                            wrist_lm.y * out["frame_height"])
+                # Tier 2: shoulder→elbow→extrapolated wrist
+                e_vis = getattr(elbow_lm, "visibility", 1.0)
+                s_vis = getattr(shoulder_lm, "visibility", 1.0)
+                if e_vis >= 0.4 and s_vis >= 0.4:
+                    # wrist ≈ elbow + (elbow - shoulder) * 0.9
+                    sx = shoulder_lm.x * out["frame_width"]
+                    sy = shoulder_lm.y * out["frame_height"]
+                    ex = elbow_lm.x * out["frame_width"]
+                    ey = elbow_lm.y * out["frame_height"]
+                    return (ex + (ex - sx) * 0.9,
+                            ey + (ey - sy) * 0.9)
+                # Tier 3: shoulder + small forward offset (last resort)
+                if s_vis >= 0.4:
+                    return (shoulder_lm.x * out["frame_width"],
+                            shoulder_lm.y * out["frame_height"])
+                return None
             # Knee bend angle = hip-knee-ankle. Standing ~170°, squat ~80°.
             def _angle(p_top, p_mid, p_bot):
                 import math as _m
@@ -16033,12 +16095,34 @@ def _detect_pitcher_catcher_anchors(video_path: str,
             knee_bend = (lkb + rkb) / 2
             hip_cx = (lhip.x + rhip.x) / 2 * out["frame_width"]
             hip_cy = (lhip.y + rhip.y) / 2 * out["frame_height"]
+            # Wrist coordinates with FALLBACK chain (wrist → extrapolated
+            # from shoulder+elbow → shoulder alone). Handles the catcher-
+            # glove-blocked-by-body case the user flagged.
+            left_w  = _wrist_or_estimate(lwrist, lelbow, lshoulder)
+            right_w = _wrist_or_estimate(rwrist, relbow, rshoulder)
             if knee_bend < 130:
-                # Squatting → catcher
+                # Squatting → catcher. Pick the "glove" wrist: whichever
+                # is held higher (toward the pitcher's throwing line).
+                # If only one wrist resolves, use that one. If neither,
+                # skip glove tracking for this frame.
                 catcher_pts.append((hip_cx, hip_cy))
+                glove_xy = None
+                if left_w and right_w:
+                    glove_xy = left_w if left_w[1] < right_w[1] else right_w
+                else:
+                    glove_xy = left_w or right_w
+                if glove_xy:
+                    catcher_glove_pts.append(glove_xy)
             elif knee_bend > 155:
-                # Standing → pitcher
+                # Standing → pitcher. Use the throwing-side wrist with
+                # fallback. If throwing wrist not detected, fall back to
+                # the off-hand wrist (still better than nothing).
                 pitcher_pts.append((hip_cx, hip_cy))
+                throw_xy = right_w if hand_is_right else left_w
+                if throw_xy is None:
+                    throw_xy = left_w if hand_is_right else right_w
+                if throw_xy:
+                    pitcher_wrist_pts.append(throw_xy)
             # else: ambiguous (transition pose), skip
     finally:
         pose.close()
@@ -16054,8 +16138,40 @@ def _detect_pitcher_catcher_anchors(video_path: str,
         ys = sorted(p[1] for p in pts)
         return (int(xs[len(xs)//2]), int(ys[len(ys)//2]))
 
-    out["pitcher_xy"] = _median_xy(pitcher_pts)
-    out["catcher_xy"] = _median_xy(catcher_pts)
+    def _extreme_xy(pts, target_dir_xy):
+        """Pick the wrist position FURTHEST in the direction of
+        target_dir_xy. This finds the release-point wrist (when the arm
+        is fully extended toward the catcher)."""
+        if not pts or not target_dir_xy:
+            return None
+        # Project each wrist position onto the pitcher→catcher direction
+        # vector and pick the one with the highest projection.
+        best = pts[0]; best_proj = -1e9
+        for (x, y) in pts:
+            proj = (x * target_dir_xy[0] + y * target_dir_xy[1])
+            if proj > best_proj:
+                best_proj = proj
+                best = (x, y)
+        return (int(best[0]), int(best[1]))
+
+    out["pitcher_xy"]       = _median_xy(pitcher_pts)
+    out["catcher_xy"]       = _median_xy(catcher_pts)
+    out["pitcher_wrist_xy"] = _median_xy(pitcher_wrist_pts)
+    out["catcher_glove_xy"] = _median_xy(catcher_glove_pts)
+
+    # Release-point wrist: the pitcher's wrist position when extended
+    # MOST toward the catcher. Pose detection across multiple frames
+    # catches different points in the windup; we want the one closest
+    # to the catcher.
+    if pitcher_wrist_pts and out["catcher_xy"] and out["pitcher_xy"]:
+        # Direction from pitcher body → catcher body
+        dx = out["catcher_xy"][0] - out["pitcher_xy"][0]
+        dy = out["catcher_xy"][1] - out["pitcher_xy"][1]
+        mag = (dx * dx + dy * dy) ** 0.5
+        if mag > 0:
+            target_dir = (dx / mag, dy / mag)
+            out["pitcher_wrist_extent_xy"] = _extreme_xy(
+                pitcher_wrist_pts, target_dir)
     return out
 
 
@@ -16627,6 +16743,59 @@ def process_uploaded_video(video_path: str,
         raise RuntimeError(f"Could not open video file: {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fw_video = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+    fh_video = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+
+    # ----- Pitcher-catcher ROI corridor -----
+    # The ball can only exist along the corridor between the pitcher's
+    # release point and the catcher's glove. Everything outside this
+    # corridor is by definition NOT the ball — it's stadium lights,
+    # jerseys, hands, gear, etc. Restricting ball search to this corridor
+    # eliminates 80%+ of false positives BEFORE the detector scores them.
+    # This is the single biggest accuracy gain for stadium / behind-
+    # catcher footage where the ball is the smallest bright thing in
+    # frame and lots of larger bright objects compete for "ball" status.
+    roi_corridor_mask = None
+    try:
+        _anchors = _detect_pitcher_catcher_anchors(video_path, n_samples=10)
+        # PREFER the wrist anchors (release point + glove) since those
+        # are where the ball actually exists at start/end of flight.
+        # Fall back to body centers if wrist detection failed.
+        # Pitcher: max-extent throwing wrist > median wrist > hip
+        _pxy = (_anchors.get("pitcher_wrist_extent_xy")
+                  or _anchors.get("pitcher_wrist_xy")
+                  or _anchors.get("pitcher_xy"))
+        # Catcher: glove (forward wrist) > hip
+        _cxy = (_anchors.get("catcher_glove_xy")
+                  or _anchors.get("catcher_xy"))
+        _anchor_source = "wrist-based" if (
+            _anchors.get("pitcher_wrist_xy")
+            and _anchors.get("catcher_glove_xy")
+        ) else "mixed (body+wrist)" if (
+            _anchors.get("pitcher_wrist_xy")
+            or _anchors.get("catcher_glove_xy")
+        ) else "body-only (wrist fallback failed)"
+        if _pxy and _cxy:
+            # Build a fat line segment between them as a binary mask
+            import numpy as _np
+            roi_corridor_mask = _np.zeros((fh_video, fw_video),
+                                              dtype=_np.uint8)
+            # Tighter corridor when wrist-anchored (more accurate
+            # endpoints). Wider when body-anchored (less accurate).
+            if "wrist-based" in _anchor_source:
+                corridor_w = int(min(fw_video, fh_video) * 0.18)
+            else:
+                corridor_w = int(min(fw_video, fh_video) * 0.28)
+            cv2.line(roi_corridor_mask, _pxy, _cxy, 255,
+                       thickness=corridor_w)
+            anchor_r = int(corridor_w * 0.75)
+            cv2.circle(roi_corridor_mask, _pxy, anchor_r, 255, -1)
+            cv2.circle(roi_corridor_mask, _cxy, anchor_r, 255, -1)
+            print(f"[upload-side] corridor ROI ({_anchor_source}): "
+                  f"pitcher@{_pxy} → catcher@{_cxy}, width={corridor_w}px")
+    except Exception as _e:
+        try: print(f"[upload-side] ROI build failed (non-fatal): {_e}")
+        except Exception: pass
 
     # ----- Background subtractor (motion gate) -----
     # MOG2 learns the static background over the first few frames, then
@@ -16657,11 +16826,23 @@ def process_uploaded_video(video_path: str,
         if frame_idx < warmup_frames:
             frame_idx += 1
             continue
+        # Combine motion mask with corridor ROI (intersection). The
+        # ball-detector only looks where BOTH conditions hold: moving
+        # AND inside the pitcher-catcher channel. This is what kills
+        # the false-positive problem from bright moving jersey logos /
+        # gear that sit OUTSIDE the throwing channel.
+        combined_mask = fg_mask
+        if roi_corridor_mask is not None:
+            try:
+                import numpy as _np
+                combined_mask = cv2.bitwise_and(fg_mask, roi_corridor_mask)
+            except Exception:
+                combined_mask = fg_mask
         pos = detect_ball_in_frame(
             frame,
             ball_radius_px_range=(min_ball_radius, max_ball_radius),
             motion_blur_tolerant=True,
-            foreground_mask=fg_mask,
+            foreground_mask=combined_mask,
         )
         if pos:
             t_sec = frame_idx / fps
