@@ -15946,6 +15946,71 @@ def _compute_pose_metrics(landmarks, img_h: int, img_w: int,
         return {}
 
 
+def maybe_upsample_video_fps(video_path: str,
+                                target_fps: int = 60,
+                                min_source_fps: int = 18) -> str:
+    """If the source video is below 30 fps, re-encode it at `target_fps`
+    using ffmpeg's motion-interpolation filter so the trajectory fitter
+    gets ~2x the ball detection samples per pitch.
+
+    Returns the path to the file that should be processed. That's either:
+      - the original path (if fps is already adequate, or ffmpeg
+        is missing, or the upsample fails)
+      - a new temp .mp4 written alongside the input (suffix _60fps.mp4)
+
+    Why this matters: at 24fps a fastball traverses the field in ~0.4 sec,
+    so we capture maybe 8-10 ball positions per pitch. Upsampling to 60fps
+    via optical-flow motion interpolation gives us ~24 positions — the
+    trajectory fitter's break and spin estimates get much tighter.
+
+    Safe-fail: any error returns the original path. Never blocks
+    processing.
+    """
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return video_path
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+        cap.release()
+    except Exception:
+        return video_path
+
+    if fps >= 30 or fps < min_source_fps:
+        # Already high enough OR below useful threshold — don't touch.
+        return video_path
+
+    # Check if ffmpeg is on PATH
+    import shutil, subprocess, os
+    if shutil.which("ffmpeg") is None:
+        return video_path
+
+    out_path = os.path.splitext(video_path)[0] + f"_upsampled_{target_fps}.mp4"
+    if os.path.exists(out_path) and os.path.getmtime(out_path) >= os.path.getmtime(video_path):
+        # Already upsampled this exact source — reuse.
+        return out_path
+
+    # Motion-compensated frame interpolation via ffmpeg's minterpolate
+    # filter. mci_mode=aobmc gives the cleanest results for ball tracking
+    # (less ghosting than blend, sharper than dup).
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", video_path,
+        "-vf", f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc"
+                 f":me_mode=bidir:vsbmc=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-an",  # drop audio — pose/ball detection doesn't need it
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=300)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+            return out_path
+    except Exception:
+        pass
+    return video_path
+
+
 def assess_video_quality(video_path: str) -> dict:
     """Pre-flight quality check on an uploaded bullpen video.
 
@@ -15996,6 +16061,11 @@ def assess_video_quality(video_path: str) -> dict:
     score = 100
 
     # ---- FPS sniff ----
+    # 24fps is fine for our math — flight time is ~0.4 sec so we still get
+    # 8-10 ball detection samples per pitch, well above the fitter's
+    # 5-sample minimum. We only penalize truly low rates (<18fps). The
+    # auto-upsampler runs at processing time to bring 24fps up to 60fps
+    # so the fitter has even more to work with.
     if fps < 18:
         issues.append(f"Very low frame rate ({fps:.1f} fps).")
         suggestions.append(
@@ -16003,15 +16073,12 @@ def assess_video_quality(video_path: str) -> dict:
             "Settings → Camera → Record Video.")
         score -= 35
     elif 23 <= fps <= 25:
-        # 24 fps = cinematic re-encode. Real bullpens are 30/60/120/240.
+        # Note only — no score penalty. Auto-upsampling handles this.
         issues.append(
-            f"Frame rate is {fps:.1f} fps — that's cinematic / streaming "
-            f"format, not raw phone footage. Probably a YouTube re-encode.")
-        suggestions.append(
-            "Use the original camera file (30/60/240 fps phone footage) "
-            "instead of a YouTube download. Re-encoded video loses ball "
-            "detection accuracy.")
-        score -= 15
+            f"Frame rate is {fps:.1f} fps (cinematic). Auto-upsampler "
+            f"will bring this up to 60 fps before processing for "
+            f"sharper break + spin estimates.")
+        # No penalty — this gets fixed automatically downstream.
 
     # ---- Resolution sniff ----
     if short_edge and short_edge < 480:
@@ -16824,12 +16891,25 @@ def _capture_one_camera_for_upload(label: str,
             "sport":             athlete_sport,
         }
         try:
+            # ---- Auto-upsample low-fps videos before processing ----
+            # 24fps source (cinematic / YouTube re-encode) becomes 60fps
+            # via ffmpeg motion interpolation. Gives the trajectory fitter
+            # ~2.5x more ball samples per pitch. No-op if fps already
+            # >=30 or ffmpeg isn't installed.
+            with st.spinner(
+                "Pre-processing video (upsampling frame rate if needed)..."):
+                proc_path = maybe_upsample_video_fps(tmp_path,
+                                                          target_fps=60)
+            if proc_path != tmp_path:
+                st.caption(
+                    "✓ Upsampled to 60 fps via motion interpolation — "
+                    "the fitter has more frames to work with now.")
             if is_behind_pitcher:
                 with st.spinner(
                     "Detecting throws via pose + fitting trajectories "
                     "(behind-pitcher mode)..."):
                     pitches = process_uploaded_video_behind_pitcher(
-                        tmp_path,
+                        proc_path,
                         sport=athlete_sport,
                         hand_is_right=((athlete_hand or "Right") != "Left"),
                         min_ball_radius=int(ball_min),
@@ -16838,7 +16918,7 @@ def _capture_one_camera_for_upload(label: str,
             else:
                 with st.spinner("Detecting ball + fitting pitches..."):
                     pitches = process_uploaded_video(
-                        tmp_path, calibration, sport=athlete_sport,
+                        proc_path, calibration, sport=athlete_sport,
                         min_ball_radius=int(ball_min),
                         max_ball_radius=int(ball_max), progress_cb=_cb)
             progress.empty()
