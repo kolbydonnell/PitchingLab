@@ -17113,18 +17113,30 @@ def process_uploaded_video(video_path: str,
 # Streamlit Cloud), these helpers return (None, None) cleanly and the caller
 # falls back to ball-only metrics.
 def _is_mediapipe_available() -> bool:
-    """True only if mediapipe imports AND exposes the legacy solutions API.
+    """True only if mediapipe imports AND exposes the legacy solutions API
+    AND can actually load its model file.
 
-    On Streamlit Cloud, if Python is the wrong version, pip sometimes
-    installs a stub mediapipe package that imports without errors but is
-    missing the `solutions` submodule. Treat that case as unavailable so
-    the rest of the app gracefully degrades instead of crashing.
+    On Streamlit Cloud, the package sometimes installs but its bundled
+    .tflite model files have wrong permissions (PermissionError on first
+    Pose() instantiation). Or pip installs a stub mediapipe package that
+    imports cleanly but is missing the `solutions` submodule. Both
+    failure modes need to be caught here so the rest of the app
+    gracefully degrades instead of crashing.
     """
     try:
         import mediapipe as _mp  # noqa: F401
         # Real builds expose mediapipe.solutions.pose; stubs don't.
         _ = _mp.solutions.pose            # type: ignore[attr-defined]
         _ = _mp.solutions.drawing_utils   # type: ignore[attr-defined]
+        # Smoke test: actually try to instantiate Pose() with the lowest
+        # model_complexity. This forces the .tflite file load and surfaces
+        # the PermissionError BEFORE any pipeline runs. If it fails, we
+        # treat MediaPipe as unavailable rather than crashing later.
+        try:
+            _test_pose = _mp.solutions.pose.Pose(model_complexity=0)
+            _test_pose.close()
+        except Exception:
+            return False
         return True
     except Exception:
         return False
@@ -17720,6 +17732,13 @@ def detect_throw_events_from_pose(video_path: str,
     except Exception:
         return []
 
+    # Guard against broken Streamlit Cloud mediapipe installs (the
+    # tflite model file sometimes has wrong permissions). The smoke test
+    # inside _is_mediapipe_available() catches this BEFORE we try to use
+    # pose detection in the actual pipeline.
+    if not _is_mediapipe_available():
+        return []
+
     mp_pose = mp.solutions.pose
     L = mp_pose.PoseLandmark
     wrist_idx = (L.RIGHT_WRIST.value if hand_is_right
@@ -17735,10 +17754,14 @@ def detect_throw_events_from_pose(video_path: str,
         return []
 
     # Pass 1: collect wrist Y trace
-    pose = mp_pose.Pose(model_complexity=0,   # fast — we only need wrist
-                          enable_segmentation=False,
-                          min_detection_confidence=0.4,
-                          min_tracking_confidence=0.4)
+    try:
+        pose = mp_pose.Pose(model_complexity=0,   # fast — we only need wrist
+                              enable_segmentation=False,
+                              min_detection_confidence=0.4,
+                              min_tracking_confidence=0.4)
+    except Exception:
+        cap.release()
+        return []
     wrist_trace = []   # list of (frame_idx, wrist_y_normalized)
     try:
         frame_idx = 0
@@ -17946,9 +17969,13 @@ def extract_pose_from_video_segment(video_path: str,
     best_lm     = None
     best_wrist_y = 2.0   # smaller = higher in image = release apex
     L = mp_pose.PoseLandmark
-    pose = mp_pose.Pose(model_complexity=1, enable_segmentation=False,
-                         min_detection_confidence=0.5,
-                         min_tracking_confidence=0.5)
+    try:
+        pose = mp_pose.Pose(model_complexity=1, enable_segmentation=False,
+                             min_detection_confidence=0.5,
+                             min_tracking_confidence=0.5)
+    except Exception:
+        cap.release()
+        return None, None
     try:
         for _ in range(end_frame - start_frame):
             ok, frame = cap.read()
@@ -18581,6 +18608,21 @@ def _capture_one_camera_for_upload(label: str,
                     "✓ Upsampled to 60 fps via motion interpolation — "
                     "the fitter has more frames to work with now.")
             if is_behind_pitcher:
+                # Behind-pitcher pipeline is pose-dependent. If MediaPipe
+                # failed to install correctly on Streamlit Cloud (the
+                # tflite-permissions bug), this pipeline can't run.
+                # Surface a clear message instead of a cryptic crash.
+                if not _is_mediapipe_available():
+                    st.error(
+                        "**Behind-pitcher mode needs MediaPipe but it "
+                        "failed to initialize.** This is a known "
+                        "Streamlit Cloud issue. Fix: open your app at "
+                        "https://share.streamlit.io → click the ⋮ menu "
+                        "next to your app → Reboot app. Wait ~60 seconds "
+                        "then try again. (Side view mode doesn't need "
+                        "MediaPipe for ball tracking — you can use that "
+                        "via the angle override while waiting.)")
+                    return st.session_state.get(pitches_session_key, []), tmp_path
                 with st.spinner(
                     "Detecting throws via pose + fitting trajectories "
                     "(behind-pitcher mode)..."):
