@@ -18,4 +18,4 @@ gatherUsageStats = false
 # headless = true REQUIRED on Streamlit Cloud — skips email onboarding hang.
 headless = true
 runOnSave = true
-maxUploadSize = 200
+maxUploadSize = 500
