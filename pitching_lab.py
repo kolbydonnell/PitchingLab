@@ -16053,9 +16053,23 @@ def maybe_upsample_video_fps(video_path: str,
         return video_path
 
     out_path = os.path.splitext(video_path)[0] + f"_upsampled_{target_fps}.mp4"
+    # Reuse a cached upsample ONLY if it (a) exists, (b) is newer than the
+    # source, AND (c) cv2 can actually open it. Previously a corrupt cache
+    # from a prior failed run would persist and crash every subsequent
+    # processing attempt. Now we verify before reuse.
     if os.path.exists(out_path) and os.path.getmtime(out_path) >= os.path.getmtime(video_path):
-        # Already upsampled this exact source — reuse.
-        return out_path
+        try:
+            _vc = cv2.VideoCapture(out_path)
+            _ok = _vc.isOpened()
+            _nf = int(_vc.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            _vc.release()
+            if _ok and _nf >= 10:
+                return out_path
+        except Exception:
+            pass
+        # Cached file is broken — delete and regenerate.
+        try: os.remove(out_path)
+        except Exception: pass
 
     # Motion-compensated frame interpolation via ffmpeg's minterpolate
     # filter. `blend` mode is fast and produces a guaranteed-valid mp4
