@@ -14695,9 +14695,13 @@ def detect_ball_in_frame(frame_bgr,
     if mask_brightness_min == "auto":
         try:
             peak = int(np.percentile(gray, 99.5))
-            thresh_val = max(110, min(230, int(peak * 0.80)))
+            # Tighter threshold: 92% of peak (was 80%), ceiling raised to
+            # 245. A clean baseball is the BRIGHTEST thing in the frame —
+            # 245-255 — while jerseys and gloves top out around 215-225.
+            # This kicks out most non-ball candidates BEFORE scoring.
+            thresh_val = max(110, min(245, int(peak * 0.92)))
         except Exception:
-            thresh_val = 200
+            thresh_val = 220
     else:
         thresh_val = int(mask_brightness_min)
     _, mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
@@ -14746,7 +14750,9 @@ def detect_ball_in_frame(frame_bgr,
         if perim == 0:
             continue
         circularity = 4.0 * 3.14159 * area / (perim * perim)
-        min_circ = 0.55 if motion_blur_tolerant else 0.78
+        # Tightened: ball is rounder than hand/glove/jersey shapes
+        # (which CAN pass at 0.55 when held in a fist or motion-frozen).
+        min_circ = 0.65 if motion_blur_tolerant else 0.78
         if circularity < min_circ:
             continue
         # Fill ratio — what fraction of the min-enclosing circle is
@@ -14756,12 +14762,31 @@ def detect_ball_in_frame(frame_bgr,
         # poor fill ratios within the min-enclosing circle.
         circle_area = 3.14159 * r * r
         fill_ratio = area / circle_area if circle_area > 0 else 0
-        min_fill = 0.45 if motion_blur_tolerant else 0.7
+        min_fill = 0.50 if motion_blur_tolerant else 0.7
         if fill_ratio < min_fill:
             continue
-        # Score weights circularity heavily, then favors larger radius
-        # for tie-breaking among multiple ball-like candidates.
-        score = circularity * 10.0 + fill_ratio * 5.0 + r * 0.1
+        # ---- Brightness sample inside the contour ----
+        # The critical differentiator between "ball" and "hand/glove/
+        # jersey": baseballs are ULTRA white (245-255). Hands ~200,
+        # gloves ~210, white jerseys top out around 220. Sample mean
+        # brightness INSIDE the contour and weight it heavily — this is
+        # the single biggest accuracy gain on stadium footage.
+        try:
+            cont_mask = np.zeros(gray.shape, np.uint8)
+            cv2.drawContours(cont_mask, [c], 0, 255, -1)
+            mean_brightness = float(cv2.mean(gray, mask=cont_mask)[0])
+        except Exception:
+            mean_brightness = 200.0
+        # 0..1 scale: 200 brightness = 0, 250+ brightness = 1
+        brightness_score = max(0.0, min(1.0, (mean_brightness - 200) / 50.0))
+        # Score weights brightness HEAVILY (15x), then circularity (10x),
+        # then fill (5x), with a small radius tiebreaker. Hands and
+        # gloves can pass shape filters but will score poorly on
+        # brightness — the ball wins.
+        score = (brightness_score * 15.0
+                  + circularity * 10.0
+                  + fill_ratio * 5.0
+                  + r * 0.1)
         if score > best_score:
             best_score = score
             # Sub-pixel centroid via moments — more accurate than
