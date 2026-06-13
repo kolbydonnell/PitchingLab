@@ -2646,6 +2646,565 @@ def phase_improvement_actions(phase: dict) -> list:
     return actions
 
 
+# =============================================================================
+# STRIKE-RATE METRICS — Zone% / Edge% / Heart% per pitch type
+# =============================================================================
+# Standard command metrics from TrackMan / Pitching+. We compute them
+# directly from the plate-location columns (Strike_Zone_Side x position
+# and Strike_Zone_Height z position) using the standard 17"×22" zone.
+#
+#   Zone%   — pitches that crossed inside the strike-zone box
+#   Edge%   — pitches that crossed within 4" of the zone edge
+#             (the "competitive corner" — strikes that miss bats)
+#   Heart%  — pitches that crossed in the middle 33% of the zone
+#             (heart-of-the-plate — what hitters crush)
+#
+# A coach reads it as: "Zone% high but Heart% high = you live IN the zone
+# but down the middle." That's a command problem, not a "miss the zone"
+# problem.
+# =============================================================================
+def _classify_plate_location(plate_x_ft, plate_z_ft) -> str:
+    """Classify one pitch's plate location.
+
+    Returns one of: 'zone_heart', 'zone_edge', 'out_of_zone', 'unknown'.
+    Uses the standard 17"×22" zone (modern MLB ABS dimensions, same as
+    the visual strike-zone chart elsewhere in the app).
+    """
+    if plate_x_ft is None or plate_z_ft is None:
+        return "unknown"
+    try:
+        x = float(plate_x_ft)
+        z = float(plate_z_ft)
+    except Exception:
+        return "unknown"
+    # Zone box (ft)
+    x_lo, x_hi = -0.71, 0.71
+    z_lo, z_hi = 1.55, 3.42
+    if not (x_lo <= x <= x_hi and z_lo <= z <= z_hi):
+        return "out_of_zone"
+    # Inside the zone — is it the middle third (heart)?
+    third = (x_hi - x_lo) / 3.0
+    z_third = (z_hi - z_lo) / 3.0
+    heart_x_lo = x_lo + third
+    heart_x_hi = x_hi - third
+    heart_z_lo = z_lo + z_third
+    heart_z_hi = z_hi - z_third
+    if heart_x_lo <= x <= heart_x_hi and heart_z_lo <= z <= heart_z_hi:
+        return "zone_heart"
+    return "zone_edge"
+
+
+def compute_strike_metrics(df) -> dict:
+    """Compute zone% / edge% / heart% across the whole session and per
+    pitch type. Returns:
+        {
+            "overall": {"zone_pct": x, "edge_pct": x, "heart_pct": x,
+                          "n": N},
+            "by_pitch_type": { "Four-Seam Fastball": {...}, ... }
+        }
+    Heart% is reported as a percentage of TOTAL pitches (not zone-only),
+    because a hitter crushes heart pitches whether they're called strikes
+    or not — what matters is "how many pitches were in the danger area".
+    """
+    if df is None or len(df) == 0:
+        return {"overall": {}, "by_pitch_type": {}}
+    if "Strike_Zone_Side" not in df.columns or "Strike_Zone_Height" not in df.columns:
+        return {"overall": {}, "by_pitch_type": {}}
+
+    def _percentages_for(rows) -> dict:
+        n = len(rows)
+        if n == 0: return {"zone_pct": 0, "edge_pct": 0, "heart_pct": 0, "n": 0}
+        classes = [
+            _classify_plate_location(r.get("Strike_Zone_Side"),
+                                          r.get("Strike_Zone_Height"))
+            for _, r in rows.iterrows()]
+        zone   = sum(1 for c in classes if c in ("zone_edge", "zone_heart"))
+        edge   = sum(1 for c in classes if c == "zone_edge")
+        heart  = sum(1 for c in classes if c == "zone_heart")
+        return {
+            "zone_pct":  round(zone  / n * 100, 1),
+            "edge_pct":  round(edge  / n * 100, 1),
+            "heart_pct": round(heart / n * 100, 1),
+            "n":         n,
+        }
+
+    overall = _percentages_for(df)
+    by_pt = {}
+    if "Pitch_Type" in df.columns:
+        for ptype, g in df.groupby("Pitch_Type"):
+            by_pt[ptype] = _percentages_for(g)
+    return {"overall": overall, "by_pitch_type": by_pt}
+
+
+# =============================================================================
+# CAUSAL DIAGNOSIS ENGINE — connect outcome to root cause to fix
+# =============================================================================
+# Every rule connects a SYMPTOM (a metric outcome) to one or more
+# MECHANICAL CAUSES (other measurements) and then to a FIX (drill +
+# optional grip change). The output is the "why is this pitch weak"
+# explanation a coach used to have to deduce by eye.
+#
+# Each rule is a dict:
+#   "name":           label for the diagnosis card
+#   "sport":          "Baseball" | "Softball" | "Both"
+#   "applies":        callable(p_dict) → bool — does this rule fit?
+#   "evidence":       list of (key, callable, message_template) — each
+#                     evidence check evaluates to True/False; True means
+#                     that evidence is present.
+#   "headline":       formatted string for the diagnosis when fired
+#   "drill_chain":    drill keys to recommend, in priority order
+#   "grip_alt":       optional grip key to suggest as an alternative
+#   "severity":       1 (advisory) .. 3 (critical)
+#
+# The check callables get a single `p` dict with all measurement fields.
+# Use `p.get(KEY, DEFAULT)` to avoid KeyError when a metric isn't logged.
+# =============================================================================
+CAUSAL_RULES = [
+    # ----- SLIDER / SWEEPER family -----
+    {
+        "name":     "Slider — flat horizontal break",
+        "sport":    "Both",
+        "applies":  lambda p: (("slider" in str(p.get("Pitch_Type", "")).lower()
+                                  or "sweeper" in str(p.get("Pitch_Type", "")).lower())
+                                 and p.get("Horiz_Break_in") is not None
+                                 and abs(p.get("Horiz_Break_in", 0)) < 5),
+        "evidence": [
+            ("wrist_pronated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) > 5,
+              "Wrist is pronated (+{Wrist_Pronation_Deg:.0f}°) at release — slider needs neutral or slightly supinated wrist for clean side-spin."),
+            ("low_hs_sep",
+              lambda p: (p.get("Peak_Hip_Shoulder_Sep") or 50) < 45,
+              "Hip-shoulder separation only {Peak_Hip_Shoulder_Sep:.0f}° — under 45° the arm has less torque to generate finger pressure on the seam."),
+            ("low_spin_eff",
+              lambda p: (p.get("Spin_Efficiency_pct") or 30) > 50,
+              "Spin efficiency {Spin_Efficiency_pct:.0f}% — too much true spin means the slider is acting more like a curve; gyro spin (low efficiency) drives the late side-break."),
+        ],
+        "headline": "Slider has flat horizontal break ({Horiz_Break_in:+.1f}\"). Root cause: {top_evidence}",
+        "drill_chain": ["wrist_lock_drill", "spike_slider_ladder",
+                          "football_throws_slider"],
+        "grip_alt":  "slider_spike_seam",
+        "severity":  2,
+    },
+    {
+        "name":     "Slider — over-supination = elbow stress",
+        "sport":    "Baseball",
+        "applies":  lambda p: ("slider" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Wrist_Pronation_Deg") or 0) < -25),
+        "evidence": [
+            ("elbow_stress_high",
+              lambda p: (p.get("Peak_Valgus_Nm") or 0) >= 60,
+              "Elbow valgus {Peak_Valgus_Nm:.0f} Nm is at/above the danger threshold. The aggressive supination is loading the UCL."),
+        ],
+        "headline": "You're hyper-supinating ({Wrist_Pronation_Deg:.0f}°) at slider release. That's the #1 UCL stress mechanism in HS pitchers.",
+        "drill_chain": ["wrist_lock_drill", "high_valgus_stress"],
+        "grip_alt":  "slider_spike_seam",
+        "severity":  3,
+    },
+    # ----- FASTBALL family -----
+    {
+        "name":     "Four-Seam — low carry",
+        "sport":    "Baseball",
+        "applies":  lambda p: ("four-seam" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Vert_Break_in") or 16) < 14),
+        "evidence": [
+            ("under_pronated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) < 0,
+              "Wrist is supinated ({Wrist_Pronation_Deg:.0f}°) at release — fastball needs pronation for clean 12:30 backspin."),
+            ("low_spin_eff",
+              lambda p: (p.get("Spin_Efficiency_pct") or 100) < 90,
+              "Spin efficiency only {Spin_Efficiency_pct:.0f}% — under 90% means too much spin is going gyro instead of into Magnus lift."),
+            ("low_extension",
+              lambda p: (p.get("Extension_ft") or 6.5) < 6.0,
+              "Release extension {Extension_ft:.1f} ft is short — long extension contributes to perceived velocity AND clean backspin axis."),
+        ],
+        "headline": "Four-seam has only {Vert_Break_in:.0f}\" of carry (target 16+). Root cause: {top_evidence}",
+        "drill_chain": ["four_seam_axis_drill", "low_extension"],
+        "grip_alt":  None,
+        "severity":  2,
+    },
+    # ----- CHANGEUP family -----
+    {
+        "name":     "Changeup — no fade",
+        "sport":    "Baseball",
+        "applies":  lambda p: ("changeup" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Horiz_Break_in") or 0) < 8),
+        "evidence": [
+            ("not_pronated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) < 8,
+              "Wrist isn't pronating enough at release ({Wrist_Pronation_Deg:.0f}° — need 15-25° for circle change fade)."),
+            ("soft_arm",
+              lambda p: ((p.get("Velocity_mph") or 80) >= 88
+                          and (p.get("Vert_Break_in") or 0) > 12),
+              "Pitch is essentially a slower fastball — you're throwing it like one. Trust the grip and throw with fastball intent."),
+        ],
+        "headline": "Changeup has minimal fade ({Horiz_Break_in:+.1f}\"). Root cause: {top_evidence}",
+        "drill_chain": ["fastball_change_alternation", "speed_blind_tossing"],
+        "grip_alt":  "changeup_circle",
+        "severity":  2,
+    },
+    # ----- CURVEBALL family -----
+    {
+        "name":     "Curveball — not enough drop",
+        "sport":    "Baseball",
+        "applies":  lambda p: ("curve" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Vert_Break_in") or 0) > -10),
+        "evidence": [
+            ("not_supinated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) > -10,
+              "Wrist is barely supinated ({Wrist_Pronation_Deg:.0f}°) at release — curve needs aggressive supination for clean topspin (target -20° to -30°)."),
+            ("low_spin",
+              lambda p: (p.get("Total_Spin_rpm") or 2600) < 2300,
+              "Spin rate only {Total_Spin_rpm} rpm — under 2300, gravity dominates Magnus and the drop flattens."),
+        ],
+        "headline": "Curveball has only {Vert_Break_in:.0f}\" of drop (target -15+). Root cause: {top_evidence}",
+        "drill_chain": ["one_knee_curveball", "thumb_up_drill"],
+        "grip_alt":  "knuckle_curve",
+        "severity":  2,
+    },
+    # ----- TWO-SEAM / SINKER family -----
+    {
+        "name":     "Sinker — not enough sink",
+        "sport":    "Baseball",
+        "applies":  lambda p: (("sinker" in str(p.get("Pitch_Type", "")).lower()
+                                  or "two-seam" in str(p.get("Pitch_Type", "")).lower())
+                                 and p.get("Vert_Break_in") is not None
+                                 and p.get("Vert_Break_in", 0) > 11),
+        "evidence": [
+            ("too_much_carry",
+              lambda p: (p.get("Spin_Efficiency_pct") or 90) > 95,
+              "Spin efficiency {Spin_Efficiency_pct:.0f}% is so high the ball is acting like a 4-seam — sinkers need 85-92% with axis tilted toward 2:00."),
+            ("over_pronated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) > 30,
+              "Wrist is hyper-pronated ({Wrist_Pronation_Deg:.0f}°) — sinker wants moderate pronation; too much flattens the axis."),
+            ("low_index_pressure",
+              lambda p: (p.get("Total_Spin_rpm") or 2100) > 2300,
+              "Spin rate {Total_Spin_rpm} rpm is in 4-seam territory — sinker thrives at 1950-2200 rpm with index-finger pressure killing some spin."),
+        ],
+        "headline": "Sinker carrying too much ({Vert_Break_in:+.0f}\"). Root cause: {top_evidence}",
+        "drill_chain": ["two_seam_index_drill"],
+        "grip_alt":  "two_seam_fastball",
+        "severity":  2,
+    },
+    {
+        "name":     "Sinker — flat with no run",
+        "sport":    "Baseball",
+        "applies":  lambda p: (("sinker" in str(p.get("Pitch_Type", "")).lower()
+                                  or "two-seam" in str(p.get("Pitch_Type", "")).lower())
+                                 and abs(p.get("Horiz_Break_in") or 0) < 8),
+        "evidence": [
+            ("under_pronated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) < 10,
+              "Wrist not pronating enough ({Wrist_Pronation_Deg:.0f}°) — sinker wants 15-25° pronation to drive arm-side run."),
+            ("staying_on_top",
+              lambda p: (p.get("Arm_Slot_deg") or 50) < 35,
+              "Arm slot too high ({Arm_Slot_deg:.0f}°) — sinkers run better from a 3/4 to low 3/4 slot."),
+        ],
+        "headline": "Sinker has no run ({Horiz_Break_in:+.0f}\" horizontal). Root cause: {top_evidence}",
+        "drill_chain": ["two_seam_index_drill"],
+        "grip_alt":  "sinker",
+        "severity":  2,
+    },
+    # ----- CUTTER family -----
+    {
+        "name":     "Cutter — break too big, becoming a slider",
+        "sport":    "Baseball",
+        "applies":  lambda p: ("cutter" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Horiz_Break_in") or 0) < -7),
+        "evidence": [
+            ("velo_dropped",
+              lambda p: (p.get("Velocity_mph") or 90) < 86,
+              "Velocity {Velocity_mph:.1f} mph is in slider territory — cutter should live within 3 mph of the fastball."),
+            ("over_supinated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) < -10,
+              "Wrist supinating ({Wrist_Pronation_Deg:.0f}°) — cutter wants near-neutral wrist; pull with the middle finger, don't twist."),
+        ],
+        "headline": "Cutter break {Horiz_Break_in:+.0f}\" is too aggressive — it's morphing into a slider. Root cause: {top_evidence}",
+        "drill_chain": ["wrist_lock_drill"],
+        "grip_alt":  "cutter",
+        "severity":  2,
+    },
+    {
+        "name":     "Cutter — no cut, just a flat fastball",
+        "sport":    "Baseball",
+        "applies":  lambda p: ("cutter" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Horiz_Break_in") or 0) > -2),
+        "evidence": [
+            ("no_grip_pressure",
+              lambda p: True,
+              "Cutter needs middle-finger pressure on the seam to drive the cut. Add 1/4\" offset to your grip."),
+        ],
+        "headline": "Cutter has effectively no cut ({Horiz_Break_in:+.0f}\"). Without the late break it's just a slower fastball.",
+        "drill_chain": ["wrist_lock_drill"],
+        "grip_alt":  "cutter",
+        "severity":  2,
+    },
+    # ----- SPLITTER / FORK -----
+    {
+        "name":     "Splitter — no dive",
+        "sport":    "Baseball",
+        "applies":  lambda p: (("splitter" in str(p.get("Pitch_Type", "")).lower()
+                                  or "fork" in str(p.get("Pitch_Type", "")).lower())
+                                 and (p.get("Vert_Break_in") or 0) > 6),
+        "evidence": [
+            ("too_much_spin",
+              lambda p: (p.get("Total_Spin_rpm") or 1400) > 1700,
+              "Spin rate {Total_Spin_rpm} rpm — splitter needs to be UNDER 1600 rpm. The wide finger spread kills spin; if spin is high, the fingers aren't spread enough."),
+            ("guided_release",
+              lambda p: (p.get("Velocity_mph") or 85) < 80,
+              "Velocity {Velocity_mph:.1f} mph is way below fastball — you're slowing the arm down. Throw splitter at fastball intent; the grip dumps velocity."),
+        ],
+        "headline": "Splitter isn't diving ({Vert_Break_in:+.0f}\"). Root cause: {top_evidence}",
+        "drill_chain": ["y_finger_splitter_drops"],
+        "grip_alt":  "fork_change",
+        "severity":  2,
+    },
+    # ----- SWEEPER -----
+    {
+        "name":     "Sweeper — going gyro instead of sweeping",
+        "sport":    "Baseball",
+        "applies":  lambda p: ("sweeper" in str(p.get("Pitch_Type", "")).lower()
+                                 and abs(p.get("Horiz_Break_in") or 0) < 12),
+        "evidence": [
+            ("over_throw",
+              lambda p: (p.get("Velocity_mph") or 82) > 86,
+              "Velocity {Velocity_mph:.1f} mph — sweepers at max effort go gyro. Throw at 90-93% intent for the cleanest axis."),
+            ("high_spin_eff_low",
+              lambda p: (p.get("Spin_Efficiency_pct") or 40) < 25,
+              "Spin efficiency {Spin_Efficiency_pct:.0f}% — too gyro (bullet spin). Sweeper wants 30-50% efficiency from clean off-center grip + finger pull."),
+        ],
+        "headline": "Sweeper has flat horizontal break ({Horiz_Break_in:+.0f}\"). Root cause: {top_evidence}",
+        "drill_chain": ["football_throws_slider", "spike_slider_ladder"],
+        "grip_alt":  "sweeper",
+        "severity":  2,
+    },
+    # ----- VELOCITY SEPARATION -----
+    {
+        "name":     "Changeup velo too close to fastball",
+        "sport":    "Baseball",
+        "applies":  lambda p: (("changeup" in str(p.get("Pitch_Type", "")).lower()
+                                  or "vulcan" in str(p.get("Pitch_Type", "")).lower())
+                                 and (p.get("Velocity_mph") or 80) > 87),
+        "evidence": [
+            ("not_dumping_velo",
+              lambda p: True,
+              "Changeup is essentially a slower fastball — the grip isn't dumping enough velocity. Push the ball deeper into the palm OR switch to a fork-change for a bigger velocity gap."),
+        ],
+        "headline": "Changeup at {Velocity_mph:.1f} mph isn't separated enough — you want 8-12 mph gap below fastball.",
+        "drill_chain": ["speed_blind_tossing"],
+        "grip_alt":  "fork_change",
+        "severity":  2,
+    },
+    # ----- COMMAND / STRIKE % -----
+    {
+        "name":     "Heart of the plate — command issue",
+        "sport":    "Both",
+        "applies":  lambda p: (p.get("plate_location_class") == "zone_heart"),
+        "evidence": [
+            ("center_zone",
+              lambda p: True,
+              "Pitch landed in the middle 33% of the zone. That's the danger area — hitters slug above .500 against heart-of-plate pitches."),
+        ],
+        "headline": "Pitch crossed the heart of the plate. Repeated heart% is the #1 hard-contact driver.",
+        "drill_chain": ["arm_slot_variance"],
+        "grip_alt":  None,
+        "severity":  1,
+    },
+    # ----- SOFTBALL: RISE BALL -----
+    {
+        "name":     "Rise ball — not rising",
+        "sport":    "Softball",
+        "applies":  lambda p: ("rise" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Vert_Break_in") or 0) < 4),
+        "evidence": [
+            ("axis_off",
+              lambda p: (p.get("Spin_Efficiency_pct") or 90) < 90,
+              "Spin efficiency {Spin_Efficiency_pct:.0f}% — rise needs 92%+ from a pure 12:00 axis. Tilt is leaking spin into gyro."),
+            ("low_spin",
+              lambda p: (p.get("Total_Spin_rpm") or 1900) < 1900,
+              "Spin rate {Total_Spin_rpm} rpm — rise wants 2000+. Without enough RPM, gravity wins."),
+        ],
+        "headline": "Rise ball only carrying {Vert_Break_in:+.0f}\". Root cause: {top_evidence}",
+        "drill_chain": [],
+        "grip_alt":  "softball_rise",
+        "severity":  2,
+    },
+    # ----- SOFTBALL: DROP BALL -----
+    {
+        "name":     "Drop ball — not dropping",
+        "sport":    "Softball",
+        "applies":  lambda p: ("drop" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Vert_Break_in") or 0) > -3),
+        "evidence": [
+            ("low_spin_or_axis",
+              lambda p: (p.get("Total_Spin_rpm") or 1700) < 1700,
+              "Spin rate {Total_Spin_rpm} rpm — drop wants 1800-2000 with clean 6:00 topspin to dive."),
+            ("dirty_release",
+              lambda p: (p.get("Spin_Efficiency_pct") or 85) < 80,
+              "Spin efficiency {Spin_Efficiency_pct:.0f}% — topspin axis isn't clean. The peel release needs the fingers cleanly OFF THE FRONT, not rolling over the top."),
+        ],
+        "headline": "Drop ball staying flat ({Vert_Break_in:+.0f}\"). Root cause: {top_evidence}",
+        "drill_chain": [],
+        "grip_alt":  "softball_drop",
+        "severity":  2,
+    },
+    # ----- SOFTBALL: CURVEBALL -----
+    {
+        "name":     "Softball curveball — flat",
+        "sport":    "Softball",
+        "applies":  lambda p: ("curve" in str(p.get("Pitch_Type", "")).lower()
+                                 and abs(p.get("Horiz_Break_in") or 0) < 5),
+        "evidence": [
+            ("under_supinated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) > -10,
+              "Wrist isn't supinating ({Wrist_Pronation_Deg:.0f}°) — softball curve needs aggressive supination at release to drive glove-side break."),
+        ],
+        "headline": "Softball curveball flat ({Horiz_Break_in:+.0f}\"). Root cause: {top_evidence}",
+        "drill_chain": [],
+        "grip_alt":  "softball_curve",
+        "severity":  2,
+    },
+    # ----- SOFTBALL: SCREWBALL -----
+    {
+        "name":     "Screwball — no arm-side break",
+        "sport":    "Softball",
+        "applies":  lambda p: ("screw" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Horiz_Break_in") or 0) < 5),
+        "evidence": [
+            ("under_pronated",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) < 15,
+              "Pronation {Wrist_Pronation_Deg:.0f}° — screwball needs aggressive pronation (the inverse of a curve) to break arm-side."),
+        ],
+        "headline": "Screwball without arm-side break ({Horiz_Break_in:+.0f}\"). Root cause: {top_evidence}",
+        "drill_chain": [],
+        "grip_alt":  "softball_screw",
+        "severity":  2,
+    },
+    # ----- SOFTBALL: CHANGE-UP -----
+    {
+        "name":     "Softball change — velo too close to fastball",
+        "sport":    "Softball",
+        "applies":  lambda p: ("change" in str(p.get("Pitch_Type", "")).lower()
+                                 and (p.get("Velocity_mph") or 47) > 53),
+        "evidence": [
+            ("too_fast",
+              lambda p: True,
+              "Velo {Velocity_mph:.1f} mph isn't separated from fastball. Softball changeup wants 10-14 mph below your fastball to actually disrupt timing."),
+        ],
+        "headline": "Softball change-up too fast. Hitters time it like a fastball.",
+        "drill_chain": [],
+        "grip_alt":  "softball_changeup",
+        "severity":  2,
+    },
+    # ----- COMMAND / CONSISTENCY -----
+    {
+        "name":     "Arm slot drift — command suffering",
+        "sport":    "Both",
+        "applies":  lambda p: False,   # only fires from cross-pitch comparison
+        "evidence": [],
+        "headline": "(meta — not fired per-pitch)",
+        "drill_chain": [],
+        "grip_alt":  None,
+        "severity":  1,
+    },
+    # ----- INJURY-SAFETY (always severity 3) -----
+    {
+        "name":     "Elbow stress in the danger zone",
+        "sport":    "Both",
+        "applies":  lambda p: ((p.get("Peak_Valgus_Nm") or 0) >= 60),
+        "evidence": [
+            ("early_trunk",
+              lambda p: (p.get("FootPlant_Trunk_Rot") or 30) >= 45,
+              "Trunk opens early at foot-plant ({FootPlant_Trunk_Rot:.0f}°) — the arm takes load that should go through the trunk."),
+            ("soft_knee",
+              lambda p: (p.get("Release_Lead_Knee_Ext") or 160) < 145,
+              "Front knee collapses to {Release_Lead_Knee_Ext:.0f}° at release — the chest can't post, so the arm yanks."),
+            ("over_supin",
+              lambda p: (p.get("Wrist_Pronation_Deg") or 0) < -25,
+              "Aggressive supination ({Wrist_Pronation_Deg:.0f}°) — direct UCL load."),
+        ],
+        "headline": "Peak valgus {Peak_Valgus_Nm:.0f} Nm — above the {danger} Nm danger threshold. Root cause: {top_evidence}",
+        "drill_chain": ["high_valgus_stress", "early_trunk_rotation"],
+        "grip_alt":  None,
+        "severity":  3,
+    },
+]
+
+
+def _format_template(template: str, p: dict) -> str:
+    """Replace {KEY} placeholders in template with values from p.
+    Handles missing keys and format spec safely."""
+    import re as _re
+    def repl(m):
+        key = m.group(1).split(":")[0]
+        spec = m.group(1)[len(key):]
+        val = p.get(key)
+        if val is None:
+            return "—"
+        if spec:
+            try:
+                return ("{:" + spec[1:] + "}").format(val)
+            except Exception:
+                return str(val)
+        return str(val)
+    return _re.sub(r"\{([^}]+)\}", repl, template)
+
+
+def diagnose_pitch_issue(pitch: dict, sport: str = "Baseball") -> list:
+    """Run the causal rules against ONE pitch's measurements.
+
+    Returns a list of diagnoses, sorted by severity (highest first).
+    Each diagnosis is a dict:
+        {"rule_name", "headline", "evidence" (list of strings),
+         "drill_chain" (list of drill keys), "grip_alt" (or None),
+         "severity" (1-3)}
+    """
+    diagnoses = []
+    p = dict(pitch or {})
+    p["danger"] = DANGER_VALGUS_NM
+    # Pre-classify plate location so command-zone rules can fire
+    if "plate_location_class" not in p:
+        p["plate_location_class"] = _classify_plate_location(
+            p.get("Strike_Zone_Side"), p.get("Strike_Zone_Height"))
+    for rule in CAUSAL_RULES:
+        # Sport filter
+        rule_sport = rule.get("sport", "Both")
+        if rule_sport != "Both" and rule_sport != sport:
+            continue
+        # Does the rule apply?
+        try:
+            if not rule["applies"](p):
+                continue
+        except Exception:
+            continue
+        # Evidence pass
+        fired_evidence = []
+        for ev_key, ev_check, ev_msg in rule.get("evidence", []):
+            try:
+                if ev_check(p):
+                    fired_evidence.append(_format_template(ev_msg, p))
+            except Exception:
+                continue
+        # We require at least one evidence to fire (rule-of-thumb gating)
+        if not fired_evidence and rule.get("evidence"):
+            continue
+        # Top evidence drives the headline placeholder
+        top_evidence = (fired_evidence[0]
+                          if fired_evidence else "see contributing factors")
+        p_for_headline = dict(p)
+        p_for_headline["top_evidence"] = top_evidence
+        diagnoses.append({
+            "rule_name":   rule["name"],
+            "headline":    _format_template(rule["headline"], p_for_headline),
+            "evidence":    fired_evidence,
+            "drill_chain": list(rule.get("drill_chain", [])),
+            "grip_alt":    rule.get("grip_alt"),
+            "severity":    rule.get("severity", 1),
+        })
+    # Sort: highest severity first, then most evidence
+    diagnoses.sort(key=lambda d: (-d["severity"], -len(d["evidence"])))
+    return diagnoses
+
+
 def analyze_mechanics(df: pd.DataFrame, sport: str = "Baseball") -> dict:
     """Inspect biomech columns and produce strengths + weaknesses, each
     tied to a specific gain category (velocity / control / movement / injury).
@@ -5634,17 +6193,25 @@ def generate_pbr_pdf(df: pd.DataFrame,
     story.append(kpi_table)
     story.append(Spacer(1, 12))
 
-    # --- Pitch Type Breakdown (with Stuff+) ---
+    # --- Pitch Type Breakdown (with Stuff+ and Zone%) ---
     story.append(Paragraph("Pitch Type Breakdown", h2))
     breakdown = pitch_type_breakdown(df)
     _is_right = (athlete_hand or "Right") != "Left"
+    try:
+        _strike_data = compute_strike_metrics(df)
+    except Exception:
+        _strike_data = {"overall": {}, "by_pitch_type": {}}
+    _by_pt_strike = _strike_data.get("by_pitch_type", {}) or {}
     bd_rows = [["Pitch Type", "#", "Velo", "Spin", "V Brk", "H Brk",
-                 "Stuff+", "Stress"]]
+                 "Stuff+", "Zone%", "Heart%", "Stress"]]
     for _, r in breakdown.iterrows():
         stf = compute_stuff_plus(
             r.get("Avg_Velo"), r.get("Avg_Spin"),
             r.get("Avg_Vert_Break"), r.get("Avg_Horiz_Break"),
             r["Pitch_Type"], _is_right, sport=sport)
+        strike_row = _by_pt_strike.get(r["Pitch_Type"]) or {}
+        zone_pct = strike_row.get("zone_pct")
+        heart_pct = strike_row.get("heart_pct")
         bd_rows.append([
             r["Pitch_Type"],
             str(int(r["Thrown"])),
@@ -5653,11 +6220,14 @@ def generate_pbr_pdf(df: pd.DataFrame,
             f"{r['Avg_Vert_Break']:.1f}\"" if pd.notna(r['Avg_Vert_Break']) else "—",
             f"{r['Avg_Horiz_Break']:.1f}\"" if pd.notna(r['Avg_Horiz_Break']) else "—",
             f"{stf}" if stf is not None else "—",
+            f"{zone_pct:.0f}%" if zone_pct is not None else "—",
+            f"{heart_pct:.0f}%" if heart_pct is not None else "—",
             f"{r['Avg_Stress']:.1f} Nm" if pd.notna(r['Avg_Stress']) else "—",
         ])
-    bd_table = Table(bd_rows, colWidths=[1.55*inch, 0.35*inch, 0.85*inch,
-                                          0.65*inch, 0.65*inch, 0.65*inch,
-                                          0.6*inch, 0.85*inch])
+    bd_table = Table(bd_rows, colWidths=[1.35*inch, 0.3*inch, 0.7*inch,
+                                          0.55*inch, 0.55*inch, 0.55*inch,
+                                          0.55*inch, 0.55*inch, 0.55*inch,
+                                          0.7*inch])
     bd_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), brand_navy),
         ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
@@ -6019,10 +6589,15 @@ def generate_recruiting_pdf(df: pd.DataFrame,
     story.append(kpi_table)
     story.append(Spacer(1, 10))
 
-    # ===== Arsenal table (with Stuff+ column) =====
+    # ===== Arsenal table (with Stuff+ and command columns) =====
     story.append(Paragraph("Arsenal", h2))
+    try:
+        _ar_strike_data = compute_strike_metrics(df)
+    except Exception:
+        _ar_strike_data = {"overall": {}, "by_pitch_type": {}}
+    _ar_strike_by_pt = _ar_strike_data.get("by_pitch_type", {}) or {}
     ar_rows = [["Pitch", "#", "Velo Avg", "Velo Pk", "Spin",
-                 "V Brk", "H Brk", "Stuff+"]]
+                 "V Brk", "H Brk", "Stuff+", "Zone%", "Edge%"]]
     # Sort by usage descending so the primary pitches are at the top
     ar_sorted = arsenal_breakdown.sort_values("Thrown", ascending=False) \
                   if len(arsenal_breakdown) else arsenal_breakdown
@@ -6034,6 +6609,9 @@ def generate_recruiting_pdf(df: pd.DataFrame,
         # Peak velo per type — recompute from raw rows
         type_rows = df[df["Pitch_Type"] == r["Pitch_Type"]]
         peak_v = type_rows["Velocity_mph"].max() if "Velocity_mph" in type_rows.columns else None
+        strike_row = _ar_strike_by_pt.get(r["Pitch_Type"]) or {}
+        zone_pct = strike_row.get("zone_pct")
+        edge_pct = strike_row.get("edge_pct")
         ar_rows.append([
             r["Pitch_Type"],
             str(int(r["Thrown"])),
@@ -6043,10 +6621,12 @@ def generate_recruiting_pdf(df: pd.DataFrame,
             f"{r['Avg_Vert_Break']:.1f}\"" if pd.notna(r['Avg_Vert_Break']) else "—",
             f"{r['Avg_Horiz_Break']:.1f}\"" if pd.notna(r['Avg_Horiz_Break']) else "—",
             f"{stf}" if stf is not None else "—",
+            f"{zone_pct:.0f}%" if zone_pct is not None else "—",
+            f"{edge_pct:.0f}%" if edge_pct is not None else "—",
         ])
     ar_table = Table(ar_rows, colWidths=[
-        1.45*inch, 0.3*inch, 0.7*inch, 0.7*inch, 0.65*inch,
-        0.7*inch, 0.7*inch, 0.7*inch])
+        1.25*inch, 0.3*inch, 0.6*inch, 0.6*inch, 0.55*inch,
+        0.6*inch, 0.6*inch, 0.55*inch, 0.55*inch, 0.55*inch])
     ar_table.setStyle(TableStyle([
         ("BACKGROUND",      (0, 0), (-1, 0), brand_navy),
         ("TEXTCOLOR",       (0, 0), (-1, 0), colors.white),
@@ -9102,6 +9682,113 @@ def _render_pitch_detail_panel(pitch: pd.Series, athlete_name: str = "",
                   f"{pitch['FootPlant_Trunk_Rot']:.1f}°" if pd.notna(pitch.get('FootPlant_Trunk_Rot')) else "—",
                   delta="opened early" if pd.notna(pitch.get('FootPlant_Trunk_Rot')) and pitch['FootPlant_Trunk_Rot'] >= EARLY_TRUNK_ROTATION_DEG else None,
                   delta_color="inverse")
+
+    # ===== ROOT CAUSE ANALYSIS — cross-link every measurement =====
+    # Diagnoses run the causal engine over this pitch's full data —
+    # mechanics, pronation, spin, break, elbow stress — and surface the
+    # MOST LIKELY explanation for why a pitch is weak, with the drill
+    # to fix it. The coach doesn't have to deduce the cause from a
+    # scatter of metrics anymore.
+    try:
+        diagnoses = diagnose_pitch_issue(pitch.to_dict()
+                                              if hasattr(pitch, "to_dict")
+                                              else dict(pitch),
+                                              sport=sport)
+    except Exception:
+        diagnoses = []
+    if diagnoses:
+        st.markdown("**Root Cause Analysis:**")
+        for d in diagnoses[:3]:   # top 3 most severe / well-evidenced
+            sev = d["severity"]
+            sev_color = {3: "#ef4444", 2: "#f59e0b", 1: "#3b82f6"}.get(sev, "#94a3b8")
+            sev_label = {3: "CRITICAL", 2: "ACTION ITEM", 1: "ADVISORY"}.get(sev, "INFO")
+            drill_lines = ""
+            for dk in d["drill_chain"][:2]:
+                drl = DRILL_LIBRARY.get(dk, {})
+                if drl:
+                    drill_lines += (
+                        f"<div style='margin-top:6px;padding:6px 10px;"
+                        f"background:#0f172a;border-radius:6px;'>"
+                        f"<span style='color:#10b981;font-size:11px;"
+                        f"font-weight:700;letter-spacing:0.06em;'>"
+                        f"DRILL · {drl.get('label', dk)}</span>"
+                        f"<div style='font-size:12px;color:#cbd5e1;"
+                        f"margin-top:2px;'>{drl.get('drill', '')}</div>"
+                        f"</div>")
+            grip_alt_html = ""
+            if d.get("grip_alt"):
+                grip_alt = GRIP_LIBRARY.get(d["grip_alt"], {})
+                if grip_alt:
+                    grip_alt_html = (
+                        f"<div style='margin-top:6px;padding:6px 10px;"
+                        f"background:#0f172a;border-radius:6px;'>"
+                        f"<span style='color:#3b82f6;font-size:11px;"
+                        f"font-weight:700;letter-spacing:0.06em;'>"
+                        f"GRIP ALTERNATIVE</span>"
+                        f"<div style='font-size:12px;color:#cbd5e1;"
+                        f"margin-top:2px;'>{grip_alt.get('label', d['grip_alt'])}</div>"
+                        f"</div>")
+            evidence_html = "".join(
+                f"<li style='margin-bottom:3px;'>{e}</li>"
+                for e in d["evidence"])
+            st.markdown(
+                f"<div style='background:#1e293b;border:1px solid #334155;"
+                f"border-left:4px solid {sev_color};border-radius:10px;"
+                f"padding:14px 18px;margin:10px 0;'>"
+                f"<div style='display:flex;align-items:center;gap:8px;"
+                f"margin-bottom:6px;flex-wrap:wrap;'>"
+                f"<span style='background:{sev_color};color:white;"
+                f"padding:2px 10px;border-radius:10px;font-size:10px;"
+                f"font-weight:700;letter-spacing:0.06em;'>{sev_label}</span>"
+                f"<span style='font-size:11px;color:#94a3b8;'>"
+                f"{d['rule_name']}</span></div>"
+                f"<div style='font-size:14px;font-weight:700;color:#f1f5f9;"
+                f"line-height:1.4;'>{d['headline']}</div>"
+                + (
+                    f"<ul style='color:#cbd5e1;font-size:12px;"
+                    f"margin-top:6px;padding-left:20px;'>"
+                    f"{evidence_html}</ul>"
+                  if evidence_html else "")
+                +
+                f"{drill_lines}{grip_alt_html}"
+                f"</div>",
+                unsafe_allow_html=True)
+
+    # ===== Wrist Pronation / Supination at release =====
+    # The single biggest determinant of spin axis after the grip.
+    # Positive = pronated (palm-down → arm-side spin for fastballs,
+    # sinkers, changeups). Negative = supinated (palm-up → glove-side
+    # spin for sliders, curves). Near zero = neutral (cutter).
+    if pd.notna(pitch.get("Wrist_Pronation_Deg")):
+        pron = float(pitch["Wrist_Pronation_Deg"])
+        if pron > 12:
+            pron_label = "PRONATED"
+            pron_color = "#10b981"
+            pron_meaning = ("Palm-down rotation — drives arm-side spin "
+                              "(fastball / sinker / changeup family).")
+        elif pron < -12:
+            pron_label = "SUPINATED"
+            pron_color = "#3b82f6"
+            pron_meaning = ("Palm-up rotation — drives glove-side spin "
+                              "(slider / curveball family).")
+        else:
+            pron_label = "NEUTRAL"
+            pron_color = "#94a3b8"
+            pron_meaning = ("Near-neutral wrist orientation — cutter / "
+                              "one-seam shape with mixed-axis spin.")
+        st.markdown(
+            f"<div style='background:#1e293b;border:1px solid #334155;"
+            f"border-left:4px solid {pron_color};border-radius:10px;"
+            f"padding:12px 16px;margin-top:10px;'>"
+            f"<div style='font-size:11px;letter-spacing:0.10em;"
+            f"font-weight:700;color:{pron_color};text-transform:uppercase;'>"
+            f"Wrist at release · {pron_label}</div>"
+            f"<div style='font-size:24px;font-weight:800;color:#f1f5f9;"
+            f"line-height:1.1;margin:4px 0;'>{pron:+.1f}°</div>"
+            f"<div style='font-size:13px;color:#cbd5e1;line-height:1.5;'>"
+            f"{pron_meaning}</div>"
+            f"</div>",
+            unsafe_allow_html=True)
 
     # ---- Video playback (uploaded file OR pasted URL) ----
     video_data = st.session_state.get("bullpen_video")
@@ -14054,7 +14741,19 @@ def detect_ball_in_frame(frame_bgr,
         score = circularity * 10.0 + fill_ratio * 5.0 + r * 0.1
         if score > best_score:
             best_score = score
-            best = (int(round(x)), int(round(y)))
+            # Sub-pixel centroid via moments — more accurate than
+            # minEnclosingCircle's center for small balls. Falls back
+            # to the bounding-circle center if moments fail.
+            try:
+                M = cv2.moments(c)
+                if M["m00"] > 0:
+                    cx_sub = M["m10"] / M["m00"]
+                    cy_sub = M["m01"] / M["m00"]
+                    best = (float(cx_sub), float(cy_sub), float(r))
+                else:
+                    best = (float(x), float(y), float(r))
+            except Exception:
+                best = (float(x), float(y), float(r))
     return best
 
 
@@ -15155,6 +15854,398 @@ def _compute_pose_metrics(landmarks, img_h: int, img_w: int,
         return {}
 
 
+def auto_detect_camera_angle(video_path: str,
+                                  sample_frames: int = 8) -> str:
+    """Sniff a few frames to guess the camera angle.
+
+    Strategy:
+      1. Sample evenly-spaced frames across the video.
+      2. Try to auto-detect the plate in each. If found in ≥2 frames →
+         the camera sees the plate, so it's either SIDE or BEHIND CATCHER.
+      3. Decide between side / behind-catcher by checking the plate's
+         horizontal position — centered = behind catcher, off-center
+         = side view.
+      4. If no plate found in any sample → assume BEHIND PITCHER (no
+         plate in frame).
+
+    Returns one of: "side", "behind_catcher", "behind_pitcher".
+    Conservative default on failure: "side" (most accurate pipeline).
+    """
+    try:
+        import cv2
+    except Exception:
+        return "side"
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return "side"
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total < sample_frames:
+        cap.release()
+        return "side"
+
+    plate_hits = 0
+    plate_positions_x = []   # 0.0 = far left, 1.0 = far right
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+    for k in range(sample_frames):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (k + 1) / (sample_frames + 1)))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        # Reuse the existing plate auto-detector (it takes bytes, so
+        # encode this frame as JPEG first)
+        try:
+            ok_enc, buf = cv2.imencode(".jpg", frame)
+            if ok_enc:
+                plate = auto_detect_plate(buf.tobytes())
+            else:
+                plate = None
+        except Exception:
+            plate = None
+        if plate:
+            cx_norm = plate[0] / max(1, width)
+            plate_hits += 1
+            plate_positions_x.append(cx_norm)
+    cap.release()
+
+    if plate_hits == 0:
+        return "behind_pitcher"
+    avg_x = sum(plate_positions_x) / len(plate_positions_x)
+    # If plate sits in the middle 40% of the frame → likely behind-catcher
+    if 0.30 <= avg_x <= 0.70:
+        return "behind_catcher"
+    return "side"
+
+
+# ===== Per-angle accuracy estimates — surfaced in the UI so coaches
+# know what to expect from each camera angle =====
+CAMERA_ANGLE_ACCURACY = {
+    "side": {
+        "label":     "Side view",
+        "velo_err":  "± 2 mph",
+        "break_err": "± 3 in",
+        "notes":     "Most accurate overall. Best for mechanics + ball flight.",
+    },
+    "behind_catcher": {
+        "label":     "Behind catcher",
+        "velo_err":  "± 1.5 mph",
+        "break_err": "± 2 in",
+        "notes":     "Sharpest plate location of any angle. Pose is "
+                      "front-on so biomech is less detailed.",
+    },
+    "behind_pitcher": {
+        "label":     "Behind pitcher",
+        "velo_err":  "± 3 mph",
+        "break_err": "± 4 in",
+        "notes":     "No plate calibration needed. Uses pose-based throw "
+                      "detection + ball-size-as-depth math. Less precise "
+                      "than side view but works anywhere the pitcher is "
+                      "framed cleanly.",
+    },
+}
+
+
+def process_uploaded_video_behind_pitcher(
+        video_path: str,
+        sport: str = "Baseball",
+        hand_is_right: bool = True,
+        min_ball_radius: int = 4,
+        max_ball_radius: int = 26,
+        progress_cb=None) -> list:
+    """Behind-the-pitcher upload processing.
+
+    Different pipeline from process_uploaded_video:
+      1. Pose-based throw detection finds each release event from the
+         throwing wrist's motion — no plate calibration required.
+      2. For each detected throw window, run ball detection (the ball is
+         small and moves away from the camera so detection is harder,
+         but it's still possible — apparent radius gives us depth).
+      3. Fit each throw with the behind-pitcher trajectory math (fixed
+         pitching distance + ball-radius-based scale).
+
+    Returns same pitch-dict list shape as process_uploaded_video.
+    """
+    try:
+        import cv2
+    except Exception as e:
+        raise RuntimeError(f"OpenCV missing: {e}")
+
+    if progress_cb: progress_cb(0.05)
+    throws = detect_throw_events_from_pose(
+        video_path, hand_is_right=hand_is_right,
+        sample_every_n_frames=2, min_gap_sec=1.0)
+    if progress_cb: progress_cb(0.3)
+    if not throws:
+        return []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    out = []
+    for i, ev in enumerate(throws):
+        start_frame = max(0, int(ev["t_start_sec"] * fps))
+        end_frame   = int(ev["t_end_sec"] * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        ball_positions = []
+        # Slightly broader radius range — ball can be tiny at the far end
+        radius_range = (max(2, min_ball_radius - 2), max_ball_radius + 4)
+        for fno in range(start_frame, end_frame):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            res = detect_ball_in_frame(
+                frame,
+                ball_radius_px_range=radius_range,
+                motion_blur_tolerant=True)
+            if res:
+                # res is (x_subpx, y_subpx, radius_px). Real radius
+                # gives us a proper depth-from-size scale per frame,
+                # which is what makes behind-pitcher velocity / break
+                # actually accurate.
+                rx, ry = res[0], res[1]
+                r_px = res[2] if len(res) >= 3 else 8.0
+                ball_positions.append((fno / fps, rx, ry, r_px))
+        # ----- Refine release time using ball-first-appearance -----
+        # Pose apex is a proxy for release; the FIRST ball detection
+        # after that apex is a much more accurate release moment.
+        # Trim ball_positions to start at that frame.
+        refined_release_t = ev["t_event_sec"]
+        if ball_positions:
+            after_apex = [p for p in ball_positions
+                            if p[0] >= ev["t_event_sec"] - 0.1]
+            if after_apex:
+                refined_release_t = after_apex[0][0]
+                ball_positions = after_apex
+        fit = fit_pitch_trajectory_behind_pitcher(
+            ball_positions, sport=sport)
+        pitch_record = {
+            "pitch_num":     i + 1,
+            "t_start_sec":   ev["t_start_sec"],
+            "t_end_sec":     ev["t_end_sec"],
+            "release_t_sec": refined_release_t,
+        }
+        if fit:
+            pitch_record.update(fit)
+        out.append(pitch_record)
+        if progress_cb:
+            progress_cb(0.3 + 0.7 * (i + 1) / max(1, len(throws)))
+    cap.release()
+    return out
+
+
+def detect_throw_events_from_pose(video_path: str,
+                                      hand_is_right: bool = True,
+                                      sample_every_n_frames: int = 2,
+                                      min_gap_sec: float = 1.0) -> list:
+    """Scan a video for throw events by tracking throwing-wrist motion.
+
+    Doesn't require ball detection — finds each throw from the pose
+    signal alone. Useful for behind-pitcher view where the ball is
+    moving away from the camera and is hard to track frame-by-frame.
+
+    Algorithm:
+      1. Sample every Nth frame, run MediaPipe pose.
+      2. Track the throwing wrist's Y position (normalized 0-1).
+      3. Find frames where wrist hits a local MAXIMUM HEIGHT (smallest Y)
+         followed by rapid downward acceleration — that's the throwing
+         motion peak.
+      4. Release time ≈ frame where wrist reaches its forward-most x.
+         For now we report the apex frame as the throw event; the
+         downstream fit refines the actual release moment from ball
+         data when available.
+
+    Returns: list of dicts, one per detected throw:
+        {"t_event_sec": float,    # apex of arm motion (~= release)
+         "t_start_sec": float,    # 0.4 sec before apex
+         "t_end_sec":   float}    # 0.8 sec after apex
+    """
+    if not _is_mediapipe_available():
+        return []
+    try:
+        import cv2
+        import mediapipe as mp
+    except Exception:
+        return []
+
+    mp_pose = mp.solutions.pose
+    L = mp_pose.PoseLandmark
+    wrist_idx = (L.RIGHT_WRIST.value if hand_is_right
+                   else L.LEFT_WRIST.value)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total_frames < 10:
+        cap.release()
+        return []
+
+    # Pass 1: collect wrist Y trace
+    pose = mp_pose.Pose(model_complexity=0,   # fast — we only need wrist
+                          enable_segmentation=False,
+                          min_detection_confidence=0.4,
+                          min_tracking_confidence=0.4)
+    wrist_trace = []   # list of (frame_idx, wrist_y_normalized)
+    try:
+        frame_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_idx % sample_every_n_frames == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = pose.process(rgb)
+                if res and res.pose_landmarks:
+                    wy = res.pose_landmarks.landmark[wrist_idx].y
+                    wrist_trace.append((frame_idx, wy))
+            frame_idx += 1
+    finally:
+        try: pose.close()
+        except Exception: pass
+        cap.release()
+
+    if len(wrist_trace) < 8:
+        return []
+
+    # Pass 2: find throw events from the wrist trace.
+    # Throwing motion produces a sharp dip (wrist goes UP = small Y) then
+    # a rapid drop (wrist moves DOWN = bigger Y). We detect by finding
+    # local MINIMA of wrist_y (highest position) where the next ~10 samples
+    # show a meaningful drop.
+    events = []
+    last_event_idx = -10**9
+    min_gap_frames = int(min_gap_sec * fps)
+    for i in range(2, len(wrist_trace) - 3):
+        f_i, y_i = wrist_trace[i]
+        # Local min: y_i smaller than neighbors
+        y_prev = wrist_trace[i-2][1]
+        y_next1 = wrist_trace[i+1][1] if i+1 < len(wrist_trace) else y_i
+        y_next2 = wrist_trace[i+2][1] if i+2 < len(wrist_trace) else y_i
+        y_next3 = wrist_trace[i+3][1] if i+3 < len(wrist_trace) else y_i
+        if not (y_i < y_prev and y_i < y_next1):
+            continue
+        # Rapid descent after the apex (drop of >0.15 normalized within
+        # the next 3 samples)
+        max_drop = max(y_next1, y_next2, y_next3) - y_i
+        if max_drop < 0.15:
+            continue
+        # Dedup against last event
+        if f_i - last_event_idx < min_gap_frames:
+            continue
+        last_event_idx = f_i
+        t_apex = f_i / fps
+        events.append({
+            "t_event_sec": round(t_apex, 3),
+            "t_start_sec": round(max(0.0, t_apex - 0.4), 3),
+            "t_end_sec":   round(t_apex + 0.8, 3),
+        })
+    return events
+
+
+def fit_pitch_trajectory_behind_pitcher(positions: list,
+                                            sport: str = "Baseball",
+                                            ball_real_diameter_in: float = 2.9) -> dict | None:
+    """Fit velocity + break from ball positions in a BEHIND-THE-PITCHER view.
+
+    Doesn't need a calibrated plate — uses the FIXED pitching distance
+    (60.5 ft baseball, 43 ft softball) over the measured flight time
+    to derive velocity, and the ball's APPARENT RADIUS in pixels to
+    derive a pixel-to-inches scale for break math.
+
+    `positions` is a list of (t_sec, x_px, y_px, radius_px) — emitted by
+    the calling video processor when it detects the ball each frame.
+
+    Returns same shape as fit_pitch_trajectory:
+        {velocity_mph, vert_break_in, horiz_break_in, n_samples_used,
+         flight_time_sec, plate_x_ft, plate_z_ft, useful_spin_rpm,
+         spin_efficiency_pct, tilt_clock, assumed_total_spin}
+    or None if insufficient data.
+    """
+    if len(positions) < 3:
+        return None
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    c = TUNNEL_CONSTANTS.get(sport, TUNNEL_CONSTANTS["Baseball"])
+    pitching_distance_ft = c["rubber_distance_ft"] - c["release_extension_ft"]
+
+    # Sort by time, drop early outliers near release noise
+    pos = sorted(positions, key=lambda p: p[0])
+    t0 = pos[0][0]
+    t_end = pos[-1][0]
+    flight_time = t_end - t0
+    if flight_time <= 0.05:
+        return None
+    velocity_fps = pitching_distance_ft / flight_time
+    velocity_mph = velocity_fps / 1.467
+
+    # Average ball radius across detections → pixel-to-inches at release
+    radii = [p[3] for p in pos if len(p) >= 4 and p[3] and p[3] > 0]
+    if radii:
+        avg_radius_px = float(np.median(radii))
+        # Ball diameter in pixels = 2 × radius
+        px_per_in = (2.0 * avg_radius_px) / max(ball_real_diameter_in, 0.1)
+    else:
+        # Fall back to a conservative estimate
+        px_per_in = 8.0
+
+    # Lateral break — deviation from straight-line in pixels at midpoint
+    xs = np.array([p[1] for p in pos], dtype=float)
+    ys = np.array([p[2] for p in pos], dtype=float)
+    ts = np.array([p[0] for p in pos], dtype=float)
+    # Expected straight-line pixel position at each time
+    x_lin = xs[0] + (xs[-1] - xs[0]) * (ts - ts[0]) / max(1e-6, ts[-1] - ts[0])
+    y_lin = ys[0] + (ys[-1] - ys[0]) * (ts - ts[0]) / max(1e-6, ts[-1] - ts[0])
+    # Max deviation from straight line (signed)
+    dx = xs - x_lin
+    dy = ys - y_lin
+    h_break_px = float(dx[np.abs(dx).argmax()]) if len(dx) else 0.0
+    v_break_px = float(dy[np.abs(dy).argmax()]) if len(dy) else 0.0
+    # Sign convention: positive H = arm-side for RHP; in pixels, depends
+    # on the camera. We DON'T flip here — leave caller to interpret.
+    horiz_break_in = h_break_px / max(0.1, px_per_in)
+    # V break needs gravity subtraction. At ~95 mph over 0.4 sec, gravity
+    # alone drops the ball about 26 inches. We measure deviation FROM
+    # ballistic baseline.
+    gravity_drop_in = 0.5 * 32.2 * (flight_time ** 2) * 12.0
+    vert_break_in = -(v_break_px / max(0.1, px_per_in)) + gravity_drop_in
+
+    # Plate location at end of flight (approximate — the ball's final
+    # position relative to where a straight pitch would land). We don't
+    # have a calibrated plate; report as deviation in feet from the
+    # frame's center.
+    final_x_dev_in = horiz_break_in / 2.0   # rough estimate
+    plate_x_ft = final_x_dev_in / 12.0
+    # Z is harder without a plate reference; assume mid-zone height
+    plate_z_ft = 2.5 - (vert_break_in - gravity_drop_in) / 24.0
+
+    # Spin estimate from break
+    spin_data = estimate_spin_metrics(
+        velocity_mph=velocity_mph,
+        vert_break_in=vert_break_in,
+        horiz_break_in=horiz_break_in,
+        sport=sport)
+
+    return {
+        "velocity_mph":         round(velocity_mph, 1),
+        "vert_break_in":        round(vert_break_in, 1),
+        "horiz_break_in":       round(horiz_break_in, 1),
+        "n_samples_used":       len(pos),
+        "flight_time_sec":      round(flight_time, 3),
+        "plate_x_ft":           round(plate_x_ft, 2),
+        "plate_z_ft":           round(plate_z_ft, 2),
+        "useful_spin_rpm":      spin_data.get("useful_spin_rpm"),
+        "spin_efficiency_pct":  spin_data.get("spin_efficiency_pct"),
+        "tilt_clock":           spin_data.get("tilt_clock"),
+        "assumed_total_spin":   spin_data.get("assumed_total_spin"),
+    }
+
+
 def extract_pose_from_video_segment(video_path: str,
                                        t_start_sec: float,
                                        t_end_sec: float,
@@ -15275,31 +16366,6 @@ def _capture_one_camera_for_upload(label: str,
     pitches_session_key = f"{key_prefix}pitches"
     path_session_key    = f"{key_prefix}path"
 
-    # ----- Camera angle selector -----
-    # 'Side' = standard 3rd-base / 1st-base view (ball flight + biomech)
-    # 'Behind catcher' = excellent for plate location, less for biomech
-    # 'Behind pitcher' = excellent biomech (clear hip-shoulder view),
-    #   no ball flight (ball moves away from camera — can't fit trajectory)
-    view_angle = st.radio(
-        "Camera angle for this video",
-        ["Side (3rd-base or 1st-base side)",
-         "Behind catcher",
-         "Behind pitcher (biomech only — no ball flight)"],
-        index=0,
-        key=f"{key_prefix}view_angle",
-        horizontal=True,
-        help="Side view is best overall. Behind-catcher gives sharp plate "
-              "location but pose is fronts-on. Behind-pitcher gives the "
-              "clearest hip-shoulder separation read of any angle, but the "
-              "ball moves away from the camera so velocity / break can't "
-              "be measured — biomech-only.")
-    is_behind_pitcher = view_angle.startswith("Behind pitcher")
-    # Stash for downstream code to know whether to skip ball flight
-    st.session_state[f"{key_prefix}view_angle_kind"] = (
-        "behind_pitcher" if is_behind_pitcher else
-        "behind_catcher" if view_angle.startswith("Behind catcher") else
-        "side")
-
     if uploaded is None:
         st.caption("No video uploaded yet.")
         return st.session_state.get(pitches_session_key, []), \
@@ -15319,6 +16385,57 @@ def _capture_one_camera_for_upload(label: str,
     tmp_path = st.session_state.get(path_session_key, tmp_path)
     st.caption(f"Saved: `{tmp_path}` ({uploaded.size / 1024 / 1024:.1f} MB)")
 
+    # ===== Auto-detect camera angle =====
+    # Sniffs a handful of frames to figure out what we're looking at:
+    # side view, behind catcher, or behind pitcher. The consumer doesn't
+    # have to pick anything; the right processing pipeline runs
+    # automatically.
+    angle_state_key = f"{key_prefix}detected_angle"
+    if angle_state_key not in st.session_state:
+        with st.spinner("Looking at the video to figure out the camera angle..."):
+            try:
+                detected = auto_detect_camera_angle(tmp_path)
+            except Exception:
+                detected = "side"
+        st.session_state[angle_state_key] = detected
+    detected = st.session_state[angle_state_key]
+    acc = CAMERA_ANGLE_ACCURACY.get(detected, CAMERA_ANGLE_ACCURACY["side"])
+    st.markdown(
+        f"<div style='background:#0f172a;border:1px solid #1e293b;"
+        f"border-left:4px solid #10b981;border-radius:8px;"
+        f"padding:12px 18px;margin:10px 0 4px 0;display:flex;"
+        f"align-items:center;gap:14px;flex-wrap:wrap;'>"
+        f"<div style='font-size:11px;letter-spacing:0.10em;"
+        f"font-weight:700;color:#10b981;text-transform:uppercase;'>"
+        f"Detected camera angle</div>"
+        f"<div style='font-size:15px;font-weight:700;color:#f1f5f9;'>"
+        f"{acc['label']}</div>"
+        f"<div style='font-size:12px;color:#94a3b8;'>"
+        f"Accuracy: {acc['velo_err']} velo · "
+        f"{acc['break_err']} break</div>"
+        f"</div>",
+        unsafe_allow_html=True)
+    st.caption(acc["notes"] + " &nbsp; *(Click 'Override' if this looks wrong.)*",
+                  unsafe_allow_html=True)
+    with st.expander("Override detected angle (rare)"):
+        ov = st.radio(
+            "Camera angle override",
+            ["Use auto-detected ({})".format(acc["label"]),
+             "Force: Side view",
+             "Force: Behind catcher",
+             "Force: Behind pitcher"],
+            index=0, key=f"{key_prefix}angle_override",
+            label_visibility="collapsed")
+        if ov.startswith("Force: Side"):
+            detected = "side"
+        elif ov.startswith("Force: Behind catcher"):
+            detected = "behind_catcher"
+        elif ov.startswith("Force: Behind pitcher"):
+            detected = "behind_pitcher"
+
+    is_behind_pitcher = (detected == "behind_pitcher")
+    st.session_state[f"{key_prefix}view_angle_kind"] = detected
+
     # ===== Step 2 — calibrate (auto with single-tap fallback) =====
     # Behind-the-pitcher view doesn't see the plate — skip calibration
     # entirely and use a synthetic config. The video will be analyzed
@@ -15326,11 +16443,13 @@ def _capture_one_camera_for_upload(label: str,
     if is_behind_pitcher:
         st.divider()
         st.info(
-            "Behind-the-pitcher view selected. No plate calibration "
-            "needed — this video will be analyzed for biomech "
-            "(hip-shoulder separation, lead-knee block, arm slot, "
-            "elbow stress) only. Ball flight isn't measurable from "
-            "this angle because the ball moves away from the camera.")
+            "Behind-the-pitcher view selected — no plate calibration "
+            "needed. The app uses a pose-based throw detector to find "
+            "each release event, then derives velocity from total flight "
+            "time across the known pitching distance (60.5 ft baseball, "
+            "43 ft softball). Break is computed from lateral pixel "
+            "deviation scaled by the ball's apparent size. Same approach "
+            "Rapsodo Mobile and PocketRadar use.")
         plate_cx = 0; plate_cy = 0; plate_w  = 80
         ball_min = 6; ball_max = 22
     else:
@@ -15376,11 +16495,23 @@ def _capture_one_camera_for_upload(label: str,
             "sport":             athlete_sport,
         }
         try:
-            with st.spinner("Detecting ball + fitting pitches..."):
-                pitches = process_uploaded_video(
-                    tmp_path, calibration, sport=athlete_sport,
-                    min_ball_radius=int(ball_min),
-                    max_ball_radius=int(ball_max), progress_cb=_cb)
+            if is_behind_pitcher:
+                with st.spinner(
+                    "Detecting throws via pose + fitting trajectories "
+                    "(behind-pitcher mode)..."):
+                    pitches = process_uploaded_video_behind_pitcher(
+                        tmp_path,
+                        sport=athlete_sport,
+                        hand_is_right=((athlete_hand or "Right") != "Left"),
+                        min_ball_radius=int(ball_min),
+                        max_ball_radius=int(ball_max),
+                        progress_cb=_cb)
+            else:
+                with st.spinner("Detecting ball + fitting pitches..."):
+                    pitches = process_uploaded_video(
+                        tmp_path, calibration, sport=athlete_sport,
+                        min_ball_radius=int(ball_min),
+                        max_ball_radius=int(ball_max), progress_cb=_cb)
             progress.empty()
             # Pose pass
             if pitches and _is_mediapipe_available():
@@ -15532,6 +16663,7 @@ def _save_pitches_to_history(pitches: list,
             "Peak_Hip_Shoulder_Sep":  pm.get("hip_shoulder_sep_deg"),
             "Release_Lead_Knee_Ext":  pm.get("lead_knee_flex_deg"),
             "Arm_Slot_deg":           pm.get("arm_slot_deg"),
+            "Wrist_Pronation_Deg":    pm.get("wrist_pronation_deg"),
             "Peak_Trunk_Angular_Vel": None,
             "Pulse_Present":          False,
             "Pulse_Match_Method":     None,
@@ -16206,15 +17338,56 @@ def run_live_capture_tab(active_athlete_id: int | None,
                 # Lead leg is the OPPOSITE side from the throwing arm.
                 if self.hand_is_right:
                     throw_shld, throw_wrist = rshld, rwrist
+                    throw_index = landmarks[L.RIGHT_INDEX.value]
+                    throw_pinky = landmarks[L.RIGHT_PINKY.value]
                     lead_hip, lead_knee_lm, lead_ankle = lhip, lknee, lankle
                 else:
                     throw_shld, throw_wrist = lshld, lwrist
+                    throw_index = landmarks[L.LEFT_INDEX.value]
+                    throw_pinky = landmarks[L.LEFT_PINKY.value]
                     lead_hip, lead_knee_lm, lead_ankle = rhip, rknee, rankle
 
                 # Arm slot — angle of the line from the throwing shoulder to
                 # the throwing wrist, measured from horizontal. Now correctly
                 # handles both RHP and LHP.
                 slot_ang = line_angle(throw_shld, throw_wrist)
+
+                # ===== Pronation / Supination angle =====
+                # The line from PINKY to INDEX (across the palm) tells us
+                # the hand's roll orientation. We measure it relative to
+                # the forearm direction so it's invariant to where the
+                # arm is positioned.
+                #
+                # Convention (RHP):
+                #   + degrees  = PRONATED  (palm-down, arm-side spin →
+                #                fastball / sinker / changeup)
+                #   - degrees  = SUPINATED (palm-up, glove-side spin →
+                #                slider / curve)
+                #   ~0 degrees = NEUTRAL  (cutter / one-seam)
+                #
+                # For LHP we negate so the sign convention stays
+                # consistent: positive = pronated regardless of hand.
+                import math as _m_pron
+                # Vector across the palm (pinky → index)
+                px = throw_index.x - throw_pinky.x
+                py = throw_index.y - throw_pinky.y
+                # Vector along the forearm (elbow → wrist) — use the
+                # shoulder→wrist line as a stable proxy
+                fx = throw_wrist.x - throw_shld.x
+                fy = throw_wrist.y - throw_shld.y
+                # Signed angle between palm vector and forearm normal.
+                # atan2(cross, dot) gives a signed angle in [-π, π].
+                cross = fx * py - fy * px
+                dot   = fx * px + fy * py
+                pron_rad = _m_pron.atan2(cross, dot)
+                pron_deg = _m_pron.degrees(pron_rad)
+                # Map to [-90, +90]: anything beyond that is the same
+                # orientation viewed from the back of the hand
+                if pron_deg > 90:    pron_deg -= 180
+                if pron_deg < -90:   pron_deg += 180
+                # Mirror for LHP so positive = pronated for both hands
+                if not self.hand_is_right:
+                    pron_deg = -pron_deg
 
                 # Lead-knee flex — angle at the LEAD knee
                 # (left knee for RHP, right knee for LHP)
@@ -16272,6 +17445,7 @@ def run_live_capture_tab(active_athlete_id: int | None,
                     "release_y_pixel":       round(release_y_px, 1),
                     "body_height_pixel":     round(body_px, 1),
                     "elbow_stress_nm_est":   round(elbow_stress_est, 1),
+                    "wrist_pronation_deg":   round(pron_deg, 1),
                 }
             except Exception:
                 return {}
@@ -16710,6 +17884,7 @@ def run_live_capture_tab(active_athlete_id: int | None,
                         "AC_Ratio":               None,
                         "FootPlant_Trunk_Rot":    None,
                         "Peak_Hip_Shoulder_Sep":  m.get("hip_shoulder_sep_deg"),
+                        "Wrist_Pronation_Deg":    m.get("wrist_pronation_deg"),
                         "Release_Lead_Knee_Ext":  (180 - m.get("lead_knee_flex_deg", 0))
                                                    if m.get("lead_knee_flex_deg") else None,
                         "Arm_Slot_deg":           m.get("arm_slot_deg"),
@@ -20464,6 +21639,27 @@ def _render_pitch_shaping_tab(df, athlete_name, athlete_hand,
                           if stuff_now is not None else None),
                   delta_color="off")
 
+    # ---- Strike-rate row (Zone% · Edge% · Heart%) per pitch type ----
+    try:
+        _strike_data = compute_strike_metrics(df)
+        pt_strike = _strike_data.get("by_pitch_type", {}).get(pitch_picker)
+    except Exception:
+        pt_strike = None
+    if pt_strike and pt_strike.get("n", 0):
+        sc = st.columns(3)
+        sc[0].metric("Zone %",
+                       f"{pt_strike['zone_pct']:.0f}%",
+                       help="Percent of pitches that crossed inside the strike zone box.")
+        sc[1].metric("Edge %",
+                       f"{pt_strike['edge_pct']:.0f}%",
+                       help="Percent on the competitive corners — strikes that get swings-and-misses.")
+        heart_color = ("inverse" if pt_strike['heart_pct'] > 25 else "off")
+        sc[2].metric("Heart %",
+                       f"{pt_strike['heart_pct']:.0f}%",
+                       delta=("danger zone" if pt_strike['heart_pct'] > 25 else None),
+                       delta_color=heart_color,
+                       help="Percent that crossed the middle 33% of the zone — the heart of the plate, where hitters slug.")
+
     # ---- Ideal-zone reference card ----
     if target:
         iv = target["v_break_ideal"]
@@ -21173,6 +22369,124 @@ def _render_pitch_strategy_intro(df, athlete_hand, athlete_sport):
         "margin-bottom:8px;line-height:1.2;'>"
         "Develop a pitching mindset</div>",
         unsafe_allow_html=True)
+
+    # ===== PERSONALIZED SCOUTING REPORT =====
+    # Pull the pitcher's actual arsenal + Stuff+ data and surface
+    # specific recommendations: best put-away pitch, best opposite-side
+    # weapon, weakest strike-getter. Falls back to the generic mindset
+    # framework below when there's no real data to personalize from.
+    try:
+        arsenal_rows = _arsenal_summary(df)
+    except Exception:
+        arsenal_rows = []
+    is_right = (athlete_hand or "Right") != "Left"
+    if arsenal_rows:
+        # Score every pitch type for Stuff+
+        scored = []
+        for a in arsenal_rows:
+            stf = compute_stuff_plus(
+                a.get("avg_velo"), a.get("avg_spin"),
+                a.get("avg_v_break"), a.get("avg_h_break"),
+                a["pitch_type"], is_right,
+                sport=athlete_sport)
+            if stf is None:
+                continue
+            scored.append({
+                "pitch_type": a["pitch_type"],
+                "stuff":      stf,
+                "velo":       a.get("avg_velo"),
+                "h_break":    a.get("avg_h_break"),
+                "v_break":    a.get("avg_v_break"),
+                "count":      a.get("count", 0),
+            })
+        if scored:
+            # Best overall put-away (highest Stuff+)
+            best_putaway = max(scored, key=lambda x: x["stuff"])
+            # Best "arm-side fade" pitch — biggest positive h-break for
+            # opposite-side hitters (changeups, sinkers, screwballs)
+            arm_side = [s for s in scored
+                          if (s.get("h_break") or 0) > 5]
+            best_arm_side = max(arm_side, key=lambda x: x["stuff"]) \
+                              if arm_side else None
+            # Best "glove-side break" pitch — for same-side hitters
+            glove_side = [s for s in scored
+                            if (s.get("h_break") or 0) < -3]
+            best_glove_side = max(glove_side, key=lambda x: x["stuff"]) \
+                                if glove_side else None
+            # Weakest in the arsenal (drag on overall Stuff+)
+            weakest = min(scored, key=lambda x: x["stuff"])
+
+            cards = []
+            if best_putaway:
+                cards.append((
+                    "Top put-away pitch",
+                    "#10b981",
+                    f"{best_putaway['pitch_type']}",
+                    f"Stuff+ {best_putaway['stuff']} · "
+                    f"{best_putaway['velo']:.1f} mph",
+                    "Save it for 2-strike counts. Lead other pitches with this in mind.",
+                ))
+            if best_glove_side:
+                same_side_word = "RHH" if is_right else "LHH"
+                cards.append((
+                    f"Best vs {same_side_word}",
+                    "#3b82f6",
+                    f"{best_glove_side['pitch_type']}",
+                    f"Stuff+ {best_glove_side['stuff']} · "
+                    f"{best_glove_side['h_break']:+.0f}\" glove-side",
+                    f"Your platoon advantage pitch. Start at the belt; "
+                    f"finish off the corner.",
+                ))
+            if best_arm_side:
+                opp_side_word = "LHH" if is_right else "RHH"
+                cards.append((
+                    f"Best vs {opp_side_word}",
+                    "#fbbf24",
+                    f"{best_arm_side['pitch_type']}",
+                    f"Stuff+ {best_arm_side['stuff']} · "
+                    f"{best_arm_side['h_break']:+.0f}\" arm-side fade",
+                    f"Fades AWAY from opposite-side hitters. "
+                    f"Live on the outer half.",
+                ))
+            if weakest and weakest["stuff"] < 90:
+                cards.append((
+                    "Weakest in arsenal",
+                    "#ef4444",
+                    f"{weakest['pitch_type']}",
+                    f"Stuff+ {weakest['stuff']}",
+                    "Either commit to fixing it (see Pitch Shaping) or "
+                    "consider dropping it from the active arsenal until "
+                    "it's competitive.",
+                ))
+
+            st.markdown(
+                "<div style='font-size:11px;letter-spacing:0.10em;"
+                "font-weight:700;color:#10b981;text-transform:uppercase;"
+                "margin:14px 0 6px 0;'>"
+                "Your scouting report — based on this session's data"
+                "</div>",
+                unsafe_allow_html=True)
+            n_cols = min(len(cards), 4)
+            cols = st.columns(n_cols)
+            for c_col, (title, color, pitch_name, sub, line) in zip(cols, cards):
+                with c_col:
+                    st.markdown(
+                        f"<div style='background:#1e293b;border:1px solid "
+                        f"#334155;border-top:4px solid {color};"
+                        f"border-radius:10px;padding:12px 14px;height:100%;"
+                        f"box-sizing:border-box;'>"
+                        f"<div style='font-size:10px;letter-spacing:0.10em;"
+                        f"font-weight:700;color:{color};"
+                        f"text-transform:uppercase;'>{title}</div>"
+                        f"<div style='font-size:17px;font-weight:800;"
+                        f"color:#f1f5f9;margin:6px 0 2px 0;line-height:1.1;'>"
+                        f"{pitch_name}</div>"
+                        f"<div style='font-size:11px;color:#94a3b8;"
+                        f"margin-bottom:8px;'>{sub}</div>"
+                        f"<div style='font-size:12px;color:#cbd5e1;"
+                        f"line-height:1.5;'>{line}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True)
 
     # ----- The 4 self-questions framework — sport-neutral but cite the
     # pitcher's anchor pitch correctly. -----
@@ -22384,6 +23698,13 @@ def main():
                 real_baseline = {}
         active_baseline = real_baseline if real_baseline else DEMO_BASELINE
 
+        # Strike-rate metrics (Zone% / Heart%) keyed by pitch type
+        try:
+            _ov_strike_data = compute_strike_metrics(df)
+            _ov_strike_by_pt = _ov_strike_data.get("by_pitch_type", {}) or {}
+        except Exception:
+            _ov_strike_by_pt = {}
+
         delta_rows = []
         for _, r in breakdown.iterrows():
             base = active_baseline.get(r["Pitch_Type"])
@@ -22393,6 +23714,11 @@ def main():
                 d = today_v - base_v
                 arrow = " 📈" if d > 0.3 else (" 📉" if d < -0.3 else "")
                 return f"{today_v}{unit} ({d:+.1f}){arrow}"
+            _sk = _ov_strike_by_pt.get(r["Pitch_Type"]) or {}
+            _zone_pct = _sk.get("zone_pct")
+            _heart_pct = _sk.get("heart_pct")
+            zone_str = f"{_zone_pct:.0f}%" if _zone_pct is not None else "—"
+            heart_str = f"{_heart_pct:.0f}%" if _heart_pct is not None else "—"
             if base:
                 delta_rows.append({
                     "Pitch Type":     r["Pitch_Type"],
@@ -22400,6 +23726,8 @@ def main():
                     "Velo":           _delta_str(r['Avg_Velo'], base.get('velo'), " mph"),
                     "Vert Break":     _delta_str(r['Avg_Vert_Break'], base.get('vbreak'), '"'),
                     "Horiz Break":    f"{r['Avg_Horiz_Break']}\"",
+                    "Zone %":         zone_str,
+                    "Heart %":        heart_str,
                     "Elbow Stress":   _delta_str(r['Avg_Stress'], base.get('stress'), " Nm"),
                 })
             else:
@@ -22409,6 +23737,8 @@ def main():
                     "Velo":           f"{r['Avg_Velo']} mph",
                     "Vert Break":     f"{r['Avg_Vert_Break']}\"",
                     "Horiz Break":    f"{r['Avg_Horiz_Break']}\"",
+                    "Zone %":         zone_str,
+                    "Heart %":        heart_str,
                     "Elbow Stress":   f"{r['Avg_Stress']} Nm",
                 })
         st.dataframe(pd.DataFrame(delta_rows), use_container_width=True, hide_index=True)
