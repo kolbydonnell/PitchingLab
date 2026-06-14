@@ -17894,6 +17894,25 @@ def process_uploaded_video_multi_angle(video_path: str,
     if progress_cb: progress_cb(0.02)
 
     segments = detect_video_cuts(video_path)
+
+    # ---- Free-tier safety: cap segment count -----
+    # Each segment runs the full pipeline serially. On Render's free
+    # 0.1 CPU tier a 60-sec video with 5+ segments is likely to exceed
+    # the HTTP request timeout. Cap at 5 segments, prioritize the
+    # LONGEST ones (which usually contain the most pitches). For 5+
+    # segments detected, we tag the excluded ones so the UI banner can
+    # tell the user what was skipped.
+    MAX_SEGMENTS = 5
+    if len(segments) > MAX_SEGMENTS:
+        # Sort by duration descending, keep top N, restore time-order
+        scored = sorted(enumerate(segments),
+                         key=lambda x: -x[1]["duration_sec"])
+        keep_idx = sorted(i for i, _ in scored[:MAX_SEGMENTS])
+        for j, seg in enumerate(segments):
+            if j not in keep_idx:
+                seg["skipped"] = True
+                seg["skip_reason"] = "free-tier cap (longest 5 only)"
+        segments = [s for s in segments if not s.get("skipped")]
     if progress_cb: progress_cb(0.08)
 
     # If only one segment detected → run single-pipeline (no overhead)
@@ -19377,9 +19396,19 @@ def _capture_one_camera_for_upload(label: str,
                 _video_segments = detect_video_cuts(proc_path)
             _multi_angle = len(_video_segments) > 1
             if _multi_angle:
-                st.caption(
-                    f"Detected {len(_video_segments)} angle segments — "
-                    f"processing each separately for max accuracy.")
+                # Honest UX about processing time
+                _est_min = (len(_video_segments) * 90) // 60   # rough estimate
+                _seg_count = min(5, len(_video_segments))      # capped
+                _caption_bits = [
+                    f"Detected {len(_video_segments)} angle segment(s)."
+                ]
+                if len(_video_segments) > 5:
+                    _caption_bits.append(
+                        f"Free-tier cap will process only the 5 LONGEST.")
+                _caption_bits.append(
+                    f"Estimated processing time: ~{_est_min}-{_est_min+1} min "
+                    f"(may exceed 5min timeout on free tier).")
+                st.caption(" ".join(_caption_bits))
             if _multi_angle:
                 # Use multi-angle orchestrator regardless of forced angle
                 # (it classifies each segment independently)
