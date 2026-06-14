@@ -17664,6 +17664,327 @@ def maybe_upsample_video_fps(video_path: str,
     return out_path
 
 
+def detect_video_cuts(video_path: str,
+                          similarity_threshold: float = 0.35,
+                          sample_interval_sec: float = 0.5,
+                          min_segment_sec: float = 2.0) -> list:
+    """Detect hard cuts (angle/scene changes) in a video.
+
+    Returns a list of segment dicts: [{"t_start": 0.0, "t_end": 5.3,
+    "duration_sec": 5.3}, ...]. Single-take videos return one segment
+    covering the whole duration.
+
+    Strategy: sample frames at fixed time intervals, compute HSV
+    histogram similarity between consecutive samples. A "cut" is a
+    sudden drop below `similarity_threshold` (correlation < 0.35
+    indicates a hard scene change — different lighting, different
+    composition, different background).
+
+    Segments shorter than min_segment_sec get merged with neighbors
+    (filters jitter / single-frame flashes).
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return [{"t_start": 0.0, "t_end": 0.0, "duration_sec": 0.0}]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return [{"t_start": 0.0, "t_end": 0.0, "duration_sec": 0.0}]
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = n_frames / fps if fps else 0.0
+    if duration < min_segment_sec * 2:
+        # Too short to meaningfully segment — treat as one segment
+        cap.release()
+        return [{"t_start": 0.0, "t_end": duration, "duration_sec": duration}]
+
+    frame_step = max(1, int(sample_interval_sec * fps))
+    prev_hist = None
+    cut_timestamps = []   # times where a cut was detected
+    frame_idx = 0
+    while frame_idx < n_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        small = cv2.resize(frame, (160, 90))
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16],
+                              [0, 180, 0, 256])
+        cv2.normalize(hist, hist)
+        if prev_hist is not None:
+            sim = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+            if sim < similarity_threshold:
+                cut_timestamps.append(frame_idx / fps)
+        prev_hist = hist
+        frame_idx += frame_step
+    cap.release()
+
+    # Build segments from cut timestamps
+    boundaries = [0.0] + cut_timestamps + [duration]
+    segments = []
+    for i in range(len(boundaries) - 1):
+        seg_start = boundaries[i]
+        seg_end = boundaries[i + 1]
+        if seg_end - seg_start >= min_segment_sec:
+            segments.append({"t_start": seg_start, "t_end": seg_end,
+                              "duration_sec": seg_end - seg_start})
+        elif segments:
+            # Merge with previous segment
+            segments[-1]["t_end"] = seg_end
+            segments[-1]["duration_sec"] = (segments[-1]["t_end"]
+                                              - segments[-1]["t_start"])
+    if not segments:
+        segments = [{"t_start": 0.0, "t_end": duration,
+                      "duration_sec": duration}]
+    return segments
+
+
+def classify_segment_angle(video_path: str,
+                                 t_start: float,
+                                 t_end: float,
+                                 n_samples: int = 4) -> str:
+    """Classify the camera angle of a video segment by sampling frames
+    and running plate + pose detection. Returns one of:
+    "side", "behind_catcher", "behind_pitcher".
+
+    Re-uses auto_detect_camera_angle's logic but on a specific time
+    window rather than the whole video.
+    """
+    try:
+        import cv2
+    except Exception:
+        return "side"
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return "side"
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    seg_start_frame = int(t_start * fps)
+    seg_end_frame   = min(n_frames, int(t_end * fps))
+    if seg_end_frame - seg_start_frame < 30:
+        cap.release()
+        return "side"
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+
+    # Plate detection across sample frames inside the window
+    plate_hits = 0
+    plate_xs   = []
+    for k in range(n_samples):
+        f_idx = seg_start_frame + int(
+            (seg_end_frame - seg_start_frame) * (k + 1) / (n_samples + 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        try:
+            ok_enc, buf = cv2.imencode(".jpg", frame)
+            if ok_enc:
+                plate = auto_detect_plate(buf.tobytes())
+                if plate:
+                    plate_hits += 1
+                    plate_xs.append(plate[0] / max(1, width))
+        except Exception:
+            pass
+
+    # Pose-based classification (mirrors auto_detect_camera_angle)
+    # Skip pose if MediaPipe isn't available — fall back to plate logic
+    pose_pitcher_seen = 0
+    pose_catcher_seen = 0
+    if _is_mediapipe_available():
+        try:
+            import mediapipe as _mp
+            mp_pose = _mp.solutions.pose
+            L = mp_pose.PoseLandmark
+            pose = mp_pose.Pose(model_complexity=0,
+                                  enable_segmentation=False,
+                                  min_detection_confidence=0.4)
+            try:
+                for k in range(n_samples):
+                    f_idx = seg_start_frame + int(
+                        (seg_end_frame - seg_start_frame) * (k + 1)
+                          / (n_samples + 1))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+                    ok, frame = cap.read()
+                    if not ok:
+                        continue
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    res = pose.process(rgb)
+                    if not res.pose_landmarks:
+                        continue
+                    lm = res.pose_landmarks.landmark
+                    # Quick squat heuristic — same as in _detect_pitcher_catcher_anchors
+                    lhip = lm[L.LEFT_HIP.value]
+                    rhip = lm[L.RIGHT_HIP.value]
+                    lknee = lm[L.LEFT_KNEE.value]
+                    rknee = lm[L.RIGHT_KNEE.value]
+                    knee_y = (lknee.y + rknee.y) / 2
+                    hip_y  = (lhip.y + rhip.y) / 2
+                    squat_diff = knee_y - hip_y
+                    if squat_diff < 0.18:
+                        pose_catcher_seen += 1
+                    elif squat_diff > 0.35:
+                        pose_pitcher_seen += 1
+            finally:
+                pose.close()
+        except Exception:
+            pass
+    cap.release()
+
+    # Decision
+    if pose_pitcher_seen >= 2 and pose_catcher_seen >= 2:
+        return "side"
+    if pose_catcher_seen >= 2 and pose_pitcher_seen < 1:
+        return "behind_catcher"
+    if pose_pitcher_seen >= 2 and pose_catcher_seen < 1:
+        return "behind_pitcher"
+    # Fall back to plate position
+    if plate_hits == 0:
+        return "behind_catcher"
+    avg_x = sum(plate_xs) / len(plate_xs)
+    if 0.30 <= avg_x <= 0.70:
+        return "behind_catcher"
+    return "side"
+
+
+def _extract_video_segment(video_path: str,
+                                 t_start: float,
+                                 duration: float,
+                                 output_path: str) -> bool:
+    """Extract a contiguous video segment using ffmpeg without re-encoding
+    (fast, lossless). Returns True on success, False on any failure."""
+    import subprocess, shutil, os
+    if shutil.which("ffmpeg") is None:
+        return False
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{t_start:.3f}",
+            "-i", video_path,
+            "-t", f"{duration:.3f}",
+            "-c", "copy",
+            output_path]
+    try:
+        subprocess.run(cmd, check=True, timeout=60)
+        return (os.path.exists(output_path)
+                  and os.path.getsize(output_path) > 1024)
+    except Exception:
+        return False
+
+
+def process_uploaded_video_multi_angle(video_path: str,
+                                              calibration: dict,
+                                              sport: str = "Baseball",
+                                              hand_is_right: bool = True,
+                                              min_ball_radius: int = 6,
+                                              max_ball_radius: int = 22,
+                                              progress_cb=None) -> tuple:
+    """Multi-angle orchestrator. Detects cuts, classifies each segment's
+    camera angle independently, processes each segment with the right
+    pipeline, merges results.
+
+    Returns:
+        (pitches, segments_info)
+        pitches: list of pitch dicts (same shape as single-pipeline result),
+            with `segment_idx` and `segment_angle` tags on each
+        segments_info: list of {"t_start", "t_end", "angle", "n_pitches"}
+            for the UI banner
+    """
+    import os, tempfile
+    if progress_cb: progress_cb(0.02)
+
+    segments = detect_video_cuts(video_path)
+    if progress_cb: progress_cb(0.08)
+
+    # If only one segment detected → run single-pipeline (no overhead)
+    if len(segments) == 1:
+        angle = classify_segment_angle(video_path,
+                                            segments[0]["t_start"],
+                                            segments[0]["t_end"])
+        segments[0]["angle"] = angle
+        if angle == "behind_pitcher":
+            pitches = process_uploaded_video_behind_pitcher(
+                video_path, sport=sport, hand_is_right=hand_is_right,
+                min_ball_radius=min_ball_radius,
+                max_ball_radius=max_ball_radius, progress_cb=progress_cb)
+        else:
+            pitches = process_uploaded_video(
+                video_path, calibration, sport=sport,
+                min_ball_radius=min_ball_radius,
+                max_ball_radius=max_ball_radius, progress_cb=progress_cb)
+        for p in pitches:
+            p["segment_idx"]   = 0
+            p["segment_angle"] = angle
+        segments[0]["n_pitches"] = len(pitches)
+        return pitches, segments
+
+    # Multi-segment pipeline
+    all_pitches = []
+    segment_progress_share = 0.85 / max(1, len(segments))
+    base_progress = 0.10
+    for s_idx, seg in enumerate(segments):
+        # Classify each segment's angle
+        angle = classify_segment_angle(video_path, seg["t_start"],
+                                            seg["t_end"])
+        seg["angle"] = angle
+
+        # Extract segment to temp file (ffmpeg copy mode — instant)
+        seg_path = os.path.join(
+            tempfile.gettempdir(),
+            f"seg_{s_idx}_{os.path.basename(video_path)}")
+        ok = _extract_video_segment(video_path, seg["t_start"],
+                                          seg["duration_sec"], seg_path)
+        if not ok:
+            seg["n_pitches"] = 0
+            seg["error"] = "ffmpeg extract failed"
+            base_progress += segment_progress_share
+            if progress_cb: progress_cb(base_progress)
+            continue
+
+        # Route to appropriate pipeline based on classified angle
+        def _seg_cb(frac):
+            if progress_cb:
+                progress_cb(base_progress + frac * segment_progress_share)
+
+        try:
+            if angle == "behind_pitcher":
+                seg_pitches = process_uploaded_video_behind_pitcher(
+                    seg_path, sport=sport, hand_is_right=hand_is_right,
+                    min_ball_radius=min_ball_radius,
+                    max_ball_radius=max_ball_radius, progress_cb=_seg_cb)
+            else:
+                seg_pitches = process_uploaded_video(
+                    seg_path, calibration, sport=sport,
+                    min_ball_radius=min_ball_radius,
+                    max_ball_radius=max_ball_radius, progress_cb=_seg_cb)
+        except Exception as e:
+            seg_pitches = []
+            seg["error"] = str(e)
+
+        # Tag each pitch with segment info + offset timestamps to global
+        for p in seg_pitches:
+            p["segment_idx"]   = s_idx
+            p["segment_angle"] = angle
+            p["t_start_sec"]   = p.get("t_start_sec", 0.0) + seg["t_start"]
+            p["t_end_sec"]     = p.get("t_end_sec", 0.0) + seg["t_start"]
+        all_pitches.extend(seg_pitches)
+        seg["n_pitches"] = len(seg_pitches)
+
+        # Clean up temp segment file
+        try: os.remove(seg_path)
+        except Exception: pass
+
+        base_progress += segment_progress_share
+        if progress_cb: progress_cb(base_progress)
+
+    # Renumber pitches contiguously across all segments
+    for i, p in enumerate(all_pitches, 1):
+        p["pitch_num"] = i
+
+    if progress_cb: progress_cb(1.0)
+    return all_pitches, segments
+
+
 def assess_video_quality(video_path: str) -> dict:
     """Pre-flight quality check on an uploaded bullpen video.
 
@@ -19047,7 +19368,34 @@ def _capture_one_camera_for_upload(label: str,
                 st.caption(
                     "✓ Upsampled to 60 fps via motion interpolation — "
                     "the fitter has more frames to work with now.")
-            if is_behind_pitcher:
+
+            # ---- Multi-angle detection ----
+            # Bullpen videos on social media commonly cut between
+            # behind-pitcher, behind-catcher, and side angles. Detect
+            # cuts and route each segment to the right pipeline.
+            with st.spinner("Detecting angle changes in the video..."):
+                _video_segments = detect_video_cuts(proc_path)
+            _multi_angle = len(_video_segments) > 1
+            if _multi_angle:
+                st.caption(
+                    f"Detected {len(_video_segments)} angle segments — "
+                    f"processing each separately for max accuracy.")
+            if _multi_angle:
+                # Use multi-angle orchestrator regardless of forced angle
+                # (it classifies each segment independently)
+                with st.spinner(
+                    f"Processing {len(_video_segments)} segments — this "
+                    f"may take a couple minutes..."):
+                    pitches, _segments_info = process_uploaded_video_multi_angle(
+                        proc_path, calibration, sport=athlete_sport,
+                        hand_is_right=((athlete_hand or "Right") != "Left"),
+                        min_ball_radius=int(ball_min),
+                        max_ball_radius=int(ball_max),
+                        progress_cb=_cb)
+                # Stash segment info for the diagnostic banner
+                st.session_state[
+                    f"{key_prefix}segments_info"] = _segments_info
+            elif is_behind_pitcher:
                 # Behind-pitcher now has a pose-free fallback. We just
                 # surface a note when MediaPipe isn't available so the
                 # user knows release-frame precision is reduced.
@@ -19130,6 +19478,36 @@ def _capture_one_camera_for_upload(label: str,
             elif pitches:
                 st.success(
                     f"Found {len(pitches)} pitch(es) in this video.")
+            # Multi-angle segment breakdown — show per-segment counts when
+            # the video was cut between angles
+            _seg_info = st.session_state.get(f"{key_prefix}segments_info")
+            if _seg_info and len(_seg_info) > 1:
+                _bd_html = []
+                _angle_emoji = {"side": "↔", "behind_pitcher": "▲",
+                                  "behind_catcher": "▼"}
+                _angle_label = {"side": "Side view",
+                                  "behind_pitcher": "Behind pitcher",
+                                  "behind_catcher": "Behind catcher"}
+                for s_idx, seg in enumerate(_seg_info):
+                    ang = seg.get("angle", "?")
+                    npitch = seg.get("n_pitches", 0)
+                    _bd_html.append(
+                        f"<span style='background:#1e293b;"
+                        f"border:1px solid #334155;border-radius:6px;"
+                        f"padding:6px 12px;margin:4px;display:inline-block;"
+                        f"font-size:12px;color:#cbd5e1;'>"
+                        f"<b>{_angle_emoji.get(ang, '?')} "
+                        f"{_angle_label.get(ang, ang)}</b><br>"
+                        f"{seg['t_start']:.0f}–{seg['t_end']:.0f}s · "
+                        f"<b style='color:#22d3ee;'>{npitch} pitch"
+                        f"{'es' if npitch != 1 else ''}</b></span>")
+                st.markdown(
+                    f"<div style='margin-top:10px;'>"
+                    f"<div style='font-size:11px;letter-spacing:0.10em;"
+                    f"font-weight:700;color:#64748b;margin-bottom:6px;'>"
+                    f"PER-SEGMENT BREAKDOWN</div>"
+                    f"<div>{''.join(_bd_html)}</div></div>",
+                    unsafe_allow_html=True)
             elif n_detected:
                 # We DID detect motion but everything got filtered.
                 cal_source = diag.get("calibration_source", "unknown")
