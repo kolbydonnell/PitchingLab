@@ -24,9 +24,8 @@ streamlit-image-coordinates>=0.1.6   # click-to-calibrate plate
 
 # Pose extraction via MediaPipe — drives skeleton overlay + biomech in
 # Live Capture and Upload Video. Wheels available for Python 3.9-3.12.
-# IMPORTANT: Streamlit Cloud app Settings → Python version MUST be 3.12.
-# 0.10.18 and 0.10.20 ship with broken file permissions on bundled
-# .tflite models on Streamlit Cloud (PermissionError). 0.10.14 had the
-# same issue for some deploys. 0.10.9 is the most reliable on Cloud
-# according to community reports.
-mediapipe==0.10.9
+# 0.10.21 is the most recent stable version in the 0.10.x series before
+# the API restructure in 0.10.30+. We chmod the bundled .tflite files
+# explicitly in the Dockerfile so the permission issue we hit on
+# Streamlit Cloud doesn't apply here.
+mediapipe==0.10.21
