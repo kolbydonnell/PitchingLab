@@ -1,0 +1,56 @@
+# =============================================================================
+# Render Blueprint — auto-configures the service when you connect this repo
+# =============================================================================
+# When you create a new service on Render and point it at this GitHub repo,
+# Render reads this file and pre-fills the service configuration. You won't
+# have to click through 15 settings — Render just asks you to confirm.
+#
+# Docs: https://render.com/docs/blueprint-spec
+# =============================================================================
+services:
+  - type: web
+    name: diamond-sports-lab
+    runtime: docker
+    plan: free                       # 750 hrs/month, spins down after 15min idle
+    region: oregon                   # change if you want — also: ohio, frankfurt, singapore
+    branch: main                     # auto-deploy on every push to main
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /_stcore/health  # Streamlit's built-in health endpoint
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: TZ
+        value: UTC
+      # ----------------------------------------------------------------------
+      # Add these in the Render dashboard (Service → Environment → Add Env Var)
+      # rather than committing them here:
+      #
+      #   STRIPE_PUBLISHABLE_KEY   pk_live_... or pk_test_...
+      #   STRIPE_SECRET_KEY        sk_live_... or sk_test_...
+      #   STRIPE_WEBHOOK_SECRET    whsec_...
+      #   RESEND_API_KEY           re_...
+      #   ADMIN_EMAIL              kolbydonnell@gmail.com
+      #
+      # For your existing .streamlit/secrets.toml content, use Render's
+      # "Secret Files" feature instead (Service → Environment → Secret Files):
+      #   Filename: secrets.toml
+      #   Contents: paste your local .streamlit/secrets.toml content
+      # ----------------------------------------------------------------------
+
+# ============================================================================
+# OPTIONAL: persistent disk for the SQLite database
+# ============================================================================
+# Render's free tier has EPHEMERAL filesystem — every restart wipes data.
+# For a passion project this is initially fine (test data resets are OK),
+# but when you want to keep real user accounts and session history, either:
+#   (a) Add a persistent disk (cheap: $0.25/GB/month, minimum $1/month)
+#   (b) Migrate to free Postgres (Supabase, Neon, or Render's own Postgres
+#       free tier — 90 days then $7/mo, but we'd switch DB engine).
+#
+# Leaving the disk config commented out for now. Uncomment to enable.
+# ----------------------------------------------------------------------------
+# disk:
+#   name: diamond-sports-lab-data
+#   mountPath: /app/data
+#   sizeGB: 1

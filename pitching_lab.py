@@ -17072,32 +17072,55 @@ def process_uploaded_video(video_path: str,
     try:
         # FIRST: check if the calibration dict has manual landmarks.
         # These are user-provided ground truth and override everything.
+        # We try multiple combinations in priority order — the corridor
+        # represents the ball flight path, so ANY two clicks that
+        # bracket the throwing line will work (pitcher+catcher,
+        # rubber+plate, pitcher+plate, rubber+catcher, etc.).
         _ml = calibration.get("manual_landmarks") if isinstance(calibration, dict) else None
         _ml = _ml or {}
-        _manual_pxy = _ml.get("pitcher_xy")
-        _manual_cxy = _ml.get("catcher_xy")
+        _manual_pxy        = _ml.get("pitcher_xy")
+        _manual_cxy        = _ml.get("catcher_xy")
+        _manual_rubber     = _ml.get("rubber_xy")
+        _manual_plate      = _ml.get("plate_xy")
         _pxy = None
         _cxy = None
         _anchor_source = "none"
 
-        if _manual_pxy and _manual_cxy:
+        # Priority order — use whichever pair of FIXED landmarks the
+        # user gave us. Rubber↔plate is best (both are anchored to the
+        # field). Pitcher↔catcher works but pitcher click can be at
+        # release point which varies pitch-to-pitch.
+        if _manual_rubber and _manual_plate:
+            _pxy = tuple(int(v) for v in _manual_rubber)
+            _cxy = tuple(int(v) for v in _manual_plate)
+            _anchor_source = "manual-clicks (rubber→plate)"
+        elif _manual_pxy and _manual_cxy:
             _pxy = tuple(int(v) for v in _manual_pxy)
             _cxy = tuple(int(v) for v in _manual_cxy)
-            _anchor_source = "manual-clicks"
+            _anchor_source = "manual-clicks (pitcher→catcher)"
+        elif _manual_pxy and _manual_plate:
+            # Pitcher click + plate click — defines throw direction
+            _pxy = tuple(int(v) for v in _manual_pxy)
+            _cxy = tuple(int(v) for v in _manual_plate)
+            _anchor_source = "manual-clicks (pitcher→plate)"
+        elif _manual_rubber and _manual_cxy:
+            _pxy = tuple(int(v) for v in _manual_rubber)
+            _cxy = tuple(int(v) for v in _manual_cxy)
+            _anchor_source = "manual-clicks (rubber→catcher)"
         else:
-            # Fall back to pose detection
+            # Fall back to pose detection (MediaPipe required)
             _anchors = _detect_pitcher_catcher_anchors(video_path, n_samples=10)
             _pose_pxy = (_anchors.get("pitcher_wrist_extent_xy")
                           or _anchors.get("pitcher_wrist_xy")
                           or _anchors.get("pitcher_xy"))
             _pose_cxy = (_anchors.get("catcher_glove_xy")
                           or _anchors.get("catcher_xy"))
-            # Use manual values where provided, pose for the other
-            _pxy = (tuple(int(v) for v in _manual_pxy)
-                     if _manual_pxy else _pose_pxy)
-            _cxy = (tuple(int(v) for v in _manual_cxy)
-                     if _manual_cxy else _pose_cxy)
-            if _manual_pxy or _manual_cxy:
+            # Mix-and-match: use any manual values present, fill rest from pose
+            _pxy = (tuple(int(v) for v in (_manual_pxy or _manual_rubber))
+                     if (_manual_pxy or _manual_rubber) else _pose_pxy)
+            _cxy = (tuple(int(v) for v in (_manual_cxy or _manual_plate))
+                     if (_manual_cxy or _manual_plate) else _pose_cxy)
+            if _manual_pxy or _manual_cxy or _manual_rubber or _manual_plate:
                 _anchor_source = "mixed (manual+pose)"
             elif (_anchors.get("pitcher_wrist_xy")
                     and _anchors.get("catcher_glove_xy")):
@@ -17110,7 +17133,7 @@ def process_uploaded_video(video_path: str,
             roi_corridor_mask = _np.zeros((fh_video, fw_video),
                                               dtype=_np.uint8)
             # Width depends on anchor source confidence
-            if _anchor_source == "manual-clicks":
+            if _anchor_source.startswith("manual-clicks"):
                 corridor_w = int(min(fw_video, fh_video) * 0.22)
             elif _anchor_source.startswith("pose wrist"):
                 corridor_w = int(min(fw_video, fh_video) * 0.18)
@@ -17912,6 +17935,86 @@ CAMERA_ANGLE_ACCURACY = {
 }
 
 
+def _detect_throws_from_ball_motion(video_path: str,
+                                          min_ball_radius: int = 4,
+                                          max_ball_radius: int = 26,
+                                          min_gap_sec: float = 1.0
+                                          ) -> list:
+    """Pose-free throw detection — runs ball detection across the whole
+    video and segments contiguous detection bursts into "throws."
+    Each throw becomes a {t_start_sec, t_event_sec, t_end_sec} dict
+    matching detect_throw_events_from_pose's output shape.
+
+    This is the no-MediaPipe fallback for behind-pitcher mode. Less
+    precise than pose-based detection (we don't have an exact release
+    frame) but works on any video where the ball is visible.
+    """
+    try:
+        import cv2
+    except Exception:
+        return []
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total < 10:
+        cap.release()
+        return []
+
+    # MOG2 background subtraction so we ignore static bright objects
+    bg = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=20,
+                                               detectShadows=False)
+    detections = []  # list of frame indices where the ball was seen
+    frame_idx = 0
+    warmup = min(30, total // 4 or 30)
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        fg = bg.apply(frame)
+        if frame_idx < warmup:
+            frame_idx += 1
+            continue
+        pos = detect_ball_in_frame(
+            frame,
+            ball_radius_px_range=(min_ball_radius, max_ball_radius),
+            motion_blur_tolerant=True,
+            foreground_mask=fg)
+        if pos:
+            detections.append(frame_idx)
+        frame_idx += 1
+    cap.release()
+
+    if not detections:
+        return []
+    # Segment into "throws": contiguous frames with detections separated
+    # by gaps of at least min_gap_sec
+    min_gap_frames = int(min_gap_sec * fps)
+    throws = []
+    current = [detections[0]]
+    for f in detections[1:]:
+        if f - current[-1] > min_gap_frames:
+            if len(current) >= 3:
+                t_start = current[0] / fps
+                t_end   = current[-1] / fps
+                t_mid   = (t_start + t_end) / 2
+                throws.append({"t_start_sec": t_start,
+                                "t_event_sec": t_mid,
+                                "t_end_sec":   t_end})
+            current = [f]
+        else:
+            current.append(f)
+    if len(current) >= 3:
+        t_start = current[0] / fps
+        t_end   = current[-1] / fps
+        t_mid   = (t_start + t_end) / 2
+        throws.append({"t_start_sec": t_start,
+                        "t_event_sec": t_mid,
+                        "t_end_sec":   t_end})
+    return throws
+
+
 def process_uploaded_video_behind_pitcher(
         video_path: str,
         sport: str = "Baseball",
@@ -17922,8 +18025,9 @@ def process_uploaded_video_behind_pitcher(
     """Behind-the-pitcher upload processing.
 
     Different pipeline from process_uploaded_video:
-      1. Pose-based throw detection finds each release event from the
-         throwing wrist's motion — no plate calibration required.
+      1. Throw detection — pose-based if MediaPipe available (precise
+         release frame from throwing wrist), else ball-motion fallback
+         (less precise but works without MediaPipe).
       2. For each detected throw window, run ball detection (the ball is
          small and moves away from the camera so detection is harder,
          but it's still possible — apparent radius gives us depth).
@@ -17938,9 +18042,28 @@ def process_uploaded_video_behind_pitcher(
         raise RuntimeError(f"OpenCV missing: {e}")
 
     if progress_cb: progress_cb(0.05)
-    throws = detect_throw_events_from_pose(
-        video_path, hand_is_right=hand_is_right,
-        sample_every_n_frames=2, min_gap_sec=1.0)
+    # Try pose-based throw detection first (more precise). Fall back to
+    # ball-motion detection if MediaPipe is unavailable on this deploy.
+    throws = []
+    if _is_mediapipe_available():
+        try:
+            throws = detect_throw_events_from_pose(
+                video_path, hand_is_right=hand_is_right,
+                sample_every_n_frames=2, min_gap_sec=1.0)
+        except Exception:
+            throws = []
+    if not throws:
+        # Fallback: ball-motion-based throw detection (no pose needed)
+        throws = _detect_throws_from_ball_motion(
+            video_path,
+            min_ball_radius=min_ball_radius,
+            max_ball_radius=max_ball_radius,
+            min_gap_sec=1.0)
+        try:
+            print(f"[upload-behind-pitcher] using ball-motion throw "
+                  f"detection (pose unavailable) — found {len(throws)} throws")
+        except Exception:
+            pass
     if progress_cb: progress_cb(0.3)
     if not throws:
         return []
@@ -18925,21 +19048,18 @@ def _capture_one_camera_for_upload(label: str,
                     "✓ Upsampled to 60 fps via motion interpolation — "
                     "the fitter has more frames to work with now.")
             if is_behind_pitcher:
-                # Behind-pitcher pipeline is pose-dependent. If MediaPipe
-                # failed to install correctly on Streamlit Cloud (the
-                # tflite-permissions bug), this pipeline can't run.
-                # Surface a clear message instead of a cryptic crash.
+                # Behind-pitcher now has a pose-free fallback. We just
+                # surface a note when MediaPipe isn't available so the
+                # user knows release-frame precision is reduced.
                 if not _is_mediapipe_available():
-                    st.error(
-                        "**Behind-pitcher mode needs MediaPipe but it "
-                        "failed to initialize.** This is a known "
-                        "Streamlit Cloud issue. Fix: open your app at "
-                        "https://share.streamlit.io → click the ⋮ menu "
-                        "next to your app → Reboot app. Wait ~60 seconds "
-                        "then try again. (Side view mode doesn't need "
-                        "MediaPipe for ball tracking — you can use that "
-                        "via the angle override while waiting.)")
-                    return st.session_state.get(pitches_session_key, []), tmp_path
+                    st.info(
+                        "MediaPipe unavailable — behind-pitcher mode "
+                        "will use the ball-motion fallback for throw "
+                        "detection (slightly less precise on release "
+                        "frame timing but still produces velocity / "
+                        "break / pitch type). For maximum accuracy, "
+                        "Reboot the app from Streamlit Cloud to "
+                        "restore MediaPipe.")
                 with st.spinner(
                     "Detecting throws via pose + fitting trajectories "
                     "(behind-pitcher mode)..."):

@@ -1,0 +1,66 @@
+# =============================================================================
+# Files that should NOT be copied into the Docker image
+# =============================================================================
+# Keeping the image small improves build speed + deploy speed.
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+*.egg-info
+.Python
+.venv
+venv/
+
+# Local databases (will be created fresh in container)
+*.db
+*.sqlite
+*.sqlite3
+diamond_sports_lab.db
+
+# Secrets — these come from Render's Secret Files feature
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+.env
+.env.local
+.env.*.local
+
+# Test videos — way too large for the image (multi-hundred MB each)
+test_videos/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+build/
+dist/
+node_modules/
+
+# Streamlit Cloud-specific files we don't need in Docker
+runtime.txt
+
+# Docker stuff itself
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+
+# Documentation that doesn't need to ship
+README.md
+HOW_TO_DEPLOY.md
+*.md
