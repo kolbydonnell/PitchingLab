@@ -15847,28 +15847,48 @@ def render_manual_landmarks_panel(video_path: str,
 
     st.markdown(
         "**Manual landmarks** — click any of these directly on the still "
-        "below. Any click overrides the matching auto-detection.")
+        "below. Any click overrides the matching auto-detection. The "
+        "more landmarks you provide, the more accurate calibration "
+        "becomes. Plate corners + rubber enable full perspective "
+        "correction (homography) for maximum accuracy.")
     target = st.radio(
         "What does the next click identify?",
-        ["pitcher", "catcher", "plate (center)", "ball"],
+        ["pitcher", "catcher", "plate (center)",
+         "plate left corner", "plate right corner",
+         "rubber", "ball"],
         horizontal=True,
         key=target_key,
         label_visibility="visible")
+    st.caption(
+        "**Minimum useful:** pitcher + catcher (or rubber + plate). "
+        "**Best accuracy:** plate tip + both plate corners + rubber "
+        "(4-point homography). **Click only what's visible** — corners "
+        "may be hidden by catcher in behind-catcher view, rubber may "
+        "be hidden by pitcher's leg in behind-pitcher view. The system "
+        "uses whatever you provide.")
 
     # Show current stored landmarks as a HIGHLY VISIBLE status card.
     # Previously this was a small st.caption that users could miss
     # entirely after clicking.
     landmark_keys = {
-        "pitcher": f"{state_prefix}pitcher_xy",
-        "catcher": f"{state_prefix}catcher_xy",
-        "plate":   f"{state_prefix}plate_xy",
-        "ball":    f"{state_prefix}ball_xy",
+        "pitcher":     f"{state_prefix}pitcher_xy",
+        "catcher":     f"{state_prefix}catcher_xy",
+        "plate":       f"{state_prefix}plate_xy",
+        "plate_left":  f"{state_prefix}plate_left_xy",
+        "plate_right": f"{state_prefix}plate_right_xy",
+        "rubber":      f"{state_prefix}rubber_xy",
+        "ball":        f"{state_prefix}ball_xy",
     }
     cur = {k: st.session_state.get(v) for k, v in landmark_keys.items()}
     n_stored = sum(1 for v in cur.values() if v)
     status_html_bits = []
-    color_chips = {"pitcher": "#22d3ee", "catcher": "#22c55e",
-                     "plate":   "#ef4444", "ball":    "#fde047"}
+    color_chips = {"pitcher":     "#22d3ee",
+                     "catcher":     "#22c55e",
+                     "plate":       "#ef4444",
+                     "plate_left":  "#fb923c",
+                     "plate_right": "#fb923c",
+                     "rubber":      "#a78bfa",
+                     "ball":        "#fde047"}
     for k, xy in cur.items():
         c = color_chips[k]
         if xy:
@@ -15908,10 +15928,13 @@ def render_manual_landmarks_panel(video_path: str,
         img_bgr = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
         if img_bgr is None:
             raise ValueError("imdecode returned None")
-        colors_bgr = {"pitcher": (255, 200, 50),    # cyan in BGR
-                        "catcher": (90, 220, 50),     # green in BGR
-                        "plate":   (255, 100, 60),    # red-ish in BGR
-                        "ball":    (50, 220, 255)}    # yellow in BGR
+        colors_bgr = {"pitcher":     (255, 200, 50),    # cyan in BGR
+                        "catcher":     (90, 220, 50),     # green in BGR
+                        "plate":       (255, 100, 60),    # red-ish in BGR
+                        "plate_left":  (40, 150, 250),    # orange in BGR
+                        "plate_right": (40, 150, 250),    # orange in BGR
+                        "rubber":      (250, 140, 170),   # purple in BGR
+                        "ball":        (50, 220, 255)}    # yellow in BGR
         # Scale marker size with image — smaller markers on smaller stills.
         _img_h_marker, _img_w_marker = img_bgr.shape[:2]
         _marker_arm = max(6, min(14, _img_w_marker // 160))   # arm length
@@ -15988,18 +16011,33 @@ def render_manual_landmarks_panel(video_path: str,
             scale_y = orig_h / max(1, disp_h)
             clicked_xy = (int(click["x"] * scale_x),
                            int(click["y"] * scale_y))
-            target_clean = target.split()[0]
-            store_key = landmark_keys[target_clean]
-            st.session_state[store_key] = clicked_xy
-            st.session_state[last_click_key] = new_click_sig
+            # Map radio label → internal key. Multi-word labels need
+            # special handling: "plate left corner" → plate_left,
+            # "plate right corner" → plate_right, "plate (center)" → plate.
+            _target_map = {
+                "pitcher": "pitcher",
+                "catcher": "catcher",
+                "plate (center)": "plate",
+                "plate left corner": "plate_left",
+                "plate right corner": "plate_right",
+                "rubber": "rubber",
+                "ball": "ball",
+            }
+            target_clean = _target_map.get(target, target.split()[0])
+            if target_clean in landmark_keys:
+                store_key = landmark_keys[target_clean]
+                st.session_state[store_key] = clicked_xy
+                st.session_state[last_click_key] = new_click_sig
             # No st.rerun() — Streamlit already reran when the user
             # clicked the image. Re-running here would just kick off
             # another wasted render cycle.
 
-    btn_cols = st.columns(4)
-    for i, label in enumerate(["pitcher", "catcher", "plate", "ball"]):
+    _all_labels = ["pitcher", "catcher", "plate", "plate_left",
+                    "plate_right", "rubber", "ball"]
+    btn_cols = st.columns(len(_all_labels))
+    for i, label in enumerate(_all_labels):
         with btn_cols[i]:
-            if st.button(f"Clear {label}",
+            if st.button(f"× {label}",
                             key=f"{state_prefix}clear_{label}",
                             use_container_width=True):
                 st.session_state.pop(landmark_keys[label], None)
@@ -16406,6 +16444,128 @@ def _calibrate_from_catcher_pose(video_path: str,
     }
 
 
+def kalman_smooth_pitch(positions: list, fps: float = 60.0
+                              ) -> tuple:
+    """Constant-acceleration Kalman filter over a single pitch's detections.
+    Rejects detections that don't fit physical baseball flight (gravity +
+    smooth curve), returns smoothed positions and a quality score.
+
+    A real baseball follows a smooth parabolic-ish curve. False-positive
+    detections from jersey edges / lights / hands jump randomly between
+    frames. The Kalman filter's outlier rejection naturally separates
+    real flight (small innovation from prediction) from noise (large
+    innovation).
+
+    State per axis: [position, velocity, acceleration] (3-dim).
+    Transition F applies kinematics: x(t+1) = x(t) + v·dt + ½a·dt².
+
+    positions: list of (t_sec, x_px, y_px, radius_px) tuples
+    Returns:
+        (smoothed_positions, quality_score)
+        smoothed_positions: same length as input; outliers replaced
+            with predictions, inliers smoothed via Kalman update
+        quality_score: fraction of detections that fit physics (0..1).
+            <0.5 = mostly noise, caller should reject the whole pitch.
+    """
+    if len(positions) < 4:
+        # Too few samples — pass through, low quality (caller decides)
+        return positions, 0.4
+    try:
+        import numpy as _np
+    except Exception:
+        return positions, 0.5
+
+    times = _np.array([p[0] for p in positions], dtype=float)
+    xs    = _np.array([p[1] for p in positions], dtype=float)
+    ys    = _np.array([p[2] for p in positions], dtype=float)
+    if len(positions) > 0 and len(positions[0]) >= 4:
+        rs = [p[3] if len(p) >= 4 else 8.0 for p in positions]
+    else:
+        rs = [8.0] * len(positions)
+
+    dt_init = float(times[2] - times[0])
+    if dt_init <= 0:
+        return positions, 0.4
+
+    # Initial state estimates from first 3 detections
+    def _init_state(vals):
+        v = (vals[2] - vals[0]) / (times[2] - times[0])
+        dt12 = times[1] - times[0]
+        if dt12 <= 0:
+            a = 0.0
+        else:
+            a = (vals[2] - 2 * vals[1] + vals[0]) / (dt12 * dt12)
+        return _np.array([vals[0], v, a], dtype=float)
+
+    x_state = _init_state(xs)
+    y_state = _init_state(ys)
+
+    Q = _np.eye(3) * 0.5            # process noise — physics can flex a bit
+    R = 25.0                          # measurement noise — ~5px detection error
+    P_x = _np.eye(3) * 100.0
+    P_y = _np.eye(3) * 100.0
+    H = _np.array([[1.0, 0.0, 0.0]])  # measurement matrix: observe position only
+
+    OUTLIER_PX = 80.0   # if measurement is >80px from prediction, reject
+
+    smoothed_xs = [float(xs[0])]
+    smoothed_ys = [float(ys[0])]
+    kept_count = 1
+    total_count = 1
+
+    for i in range(1, len(positions)):
+        dt = float(times[i] - times[i - 1])
+        if dt <= 0:
+            smoothed_xs.append(float(xs[i]))
+            smoothed_ys.append(float(ys[i]))
+            total_count += 1
+            continue
+        F = _np.array([[1.0, dt, 0.5 * dt * dt],
+                        [0.0, 1.0, dt],
+                        [0.0, 0.0, 1.0]])
+        # Predict
+        x_pred = F @ x_state
+        y_pred = F @ y_state
+        P_x_pred = F @ P_x @ F.T + Q
+        P_y_pred = F @ P_y @ F.T + Q
+
+        z_x = float(xs[i])
+        z_y = float(ys[i])
+        innov_x = z_x - x_pred[0]
+        innov_y = z_y - y_pred[0]
+        dist = (innov_x * innov_x + innov_y * innov_y) ** 0.5
+
+        total_count += 1
+        if dist > OUTLIER_PX:
+            # Outlier — use prediction, don't apply update
+            x_state = x_pred
+            y_state = y_pred
+            P_x = P_x_pred
+            P_y = P_y_pred
+            smoothed_xs.append(float(x_pred[0]))
+            smoothed_ys.append(float(y_pred[0]))
+            continue
+
+        # Standard Kalman update
+        S_x = P_x_pred[0, 0] + R
+        S_y = P_y_pred[0, 0] + R
+        K_x = P_x_pred[:, 0:1] / S_x
+        K_y = P_y_pred[:, 0:1] / S_y
+        x_state = x_pred + K_x.flatten() * innov_x
+        y_state = y_pred + K_y.flatten() * innov_y
+        P_x = P_x_pred - K_x @ (H @ P_x_pred)
+        P_y = P_y_pred - K_y @ (H @ P_y_pred)
+        smoothed_xs.append(float(x_state[0]))
+        smoothed_ys.append(float(y_state[0]))
+        kept_count += 1
+
+    quality = kept_count / max(1, total_count)
+    smoothed_positions = [(float(times[i]), float(smoothed_xs[i]),
+                            float(smoothed_ys[i]), float(rs[i]))
+                          for i in range(len(positions))]
+    return smoothed_positions, quality
+
+
 def auto_calibrate_from_trajectories(pitches_positions: list,
                                           frame_width: int = 1920,
                                           frame_height: int = 1080) -> dict:
@@ -16531,18 +16691,96 @@ def auto_calibrate_full(video_path: str,
     # scale exactly like the auto version. If only plate was clicked, we
     # use that directly. Mix-and-match supported.
     m = manual_landmarks or {}
-    pitcher_xy = m.get("pitcher_xy")
-    catcher_xy = m.get("catcher_xy")
-    plate_xy   = m.get("plate_xy")
-    ball_xy    = m.get("ball_xy")
+    pitcher_xy     = m.get("pitcher_xy")
+    catcher_xy     = m.get("catcher_xy")
+    plate_xy       = m.get("plate_xy")
+    plate_left_xy  = m.get("plate_left_xy")
+    plate_right_xy = m.get("plate_right_xy")
+    rubber_xy      = m.get("rubber_xy")
+    ball_xy        = m.get("ball_xy")
+    real_dist_ft = TUNNEL_CONSTANTS.get(sport,
+                                            TUNNEL_CONSTANTS["Baseball"]
+                                            )["rubber_distance_ft"]
+
+    # ---- METHOD -1A: full homography (4+ correspondence points) ----
+    # When the user provides plate tip + both corners + rubber, we have
+    # enough points to compute a perspective transformation matrix that
+    # accurately maps any pixel to real-world field coordinates. This is
+    # the most accurate calibration possible from a single camera.
+    homography_points = []
+    homography_world = []
+    if plate_xy:
+        homography_points.append(plate_xy)
+        homography_world.append((0.0, 0.0))           # plate tip
+    if plate_left_xy:
+        homography_points.append(plate_left_xy)
+        homography_world.append((-0.708, 1.41))       # left corner
+    if plate_right_xy:
+        homography_points.append(plate_right_xy)
+        homography_world.append((0.708, 1.41))        # right corner
+    if rubber_xy:
+        homography_points.append(rubber_xy)
+        homography_world.append((0.0, real_dist_ft))  # rubber center
+    if len(homography_points) >= 4:
+        try:
+            import cv2 as _cv2_hg
+            import numpy as _np_hg
+            src = _np_hg.array(homography_points, dtype=_np_hg.float32)
+            dst = _np_hg.array(homography_world, dtype=_np_hg.float32)
+            H, _ = _cv2_hg.findHomography(src, dst)
+            if H is not None:
+                # Derive plate width and center from homography by
+                # transforming the known real-world plate corners back to
+                # pixel space. This gives the trajectory fitter a single
+                # plate_w_px / plate_cx_px / plate_cy_px scalar that's
+                # *consistent* with the homography.
+                inv_H = _np_hg.linalg.inv(H)
+                def _world_to_px(wx, wy):
+                    v = _np_hg.array([wx, wy, 1.0])
+                    p = inv_H @ v
+                    return (p[0] / p[2], p[1] / p[2])
+                tip_px   = _world_to_px(0.0, 0.0)
+                left_px  = _world_to_px(-0.708, 1.41)
+                right_px = _world_to_px(0.708, 1.41)
+                plate_w_px = ((right_px[0] - left_px[0]) ** 2
+                                + (right_px[1] - left_px[1]) ** 2) ** 0.5
+                candidates.append(("manual_homography_4pt", 1.0, {
+                    "plate_center_x_px": int(tip_px[0]),
+                    "plate_center_y_px": int(tip_px[1]),
+                    "plate_width_px":    max(20, int(plate_w_px)),
+                    "homography_matrix": H.tolist(),
+                    "source":            f"manual 4-point homography "
+                                          f"({len(homography_points)} "
+                                          f"correspondence points)",
+                }))
+        except Exception as _e:
+            pass
+
+    # ---- METHOD -1B: rubber + plate geometry (2 fixed landmarks) ----
+    # When user provided rubber AND plate clicks (not just pitcher),
+    # use those as the fixed reference — way more accurate than
+    # pitcher pose which varies pitch-to-pitch.
+    if rubber_xy and plate_xy:
+        rdx = rubber_xy[0] - plate_xy[0]
+        rdy = rubber_xy[1] - plate_xy[1]
+        rubber_pixel_dist = (rdx * rdx + rdy * rdy) ** 0.5
+        if rubber_pixel_dist > 30:
+            pixels_per_foot = rubber_pixel_dist / real_dist_ft
+            plate_w_px = int(pixels_per_foot * (17.0 / 12.0))
+            candidates.append(("manual_rubber_plate_geometry", 1.0, {
+                "plate_center_x_px": int(plate_xy[0]),
+                "plate_center_y_px": int(plate_xy[1]),
+                "plate_width_px":    max(20, plate_w_px),
+                "source":            f"manual rubber→plate geometry "
+                                      f"(d={rubber_pixel_dist:.0f}px = "
+                                      f"{real_dist_ft}ft)",
+            }))
+
     if pitcher_xy and catcher_xy:
         dx = pitcher_xy[0] - catcher_xy[0]
         dy = pitcher_xy[1] - catcher_xy[1]
         pixel_dist = (dx * dx + dy * dy) ** 0.5
         if pixel_dist > 30:
-            real_dist_ft = TUNNEL_CONSTANTS.get(sport,
-                                                    TUNNEL_CONSTANTS["Baseball"]
-                                                    )["rubber_distance_ft"]
             pixels_per_foot = pixel_dist / real_dist_ft
             plate_w_px = int(pixels_per_foot * (17.0 / 12.0))
             # If user clicked plate, use that location; otherwise put it
@@ -16989,6 +17227,33 @@ def process_uploaded_video(video_path: str,
         ) >= min_pitch_motion_px
     ]
 
+    # ----- Pass 2.4: Kalman filter physics-based rejection -----
+    # For each segmented pitch, run a Kalman filter over the detections.
+    # Pitches whose detection sequence doesn't match smooth physical
+    # baseball motion (gravity + smooth curve) get rejected here, BEFORE
+    # they reach the trajectory fitter. This catches:
+    #   - Random false-positive sequences (jersey edges, lights)
+    #   - Partial pitches where some frames detected wrong things
+    #   - Camera shake that looks like motion
+    # Pitches with quality < 0.55 get dropped. Surviving pitches have
+    # their detections smoothed for cleaner trajectory fitting.
+    kalman_kept = []
+    kalman_rejected = 0
+    for pitch_positions in pitches:
+        smoothed, quality = kalman_smooth_pitch(pitch_positions, fps=fps)
+        if quality >= 0.55:
+            kalman_kept.append(smoothed)
+        else:
+            kalman_rejected += 1
+    if kalman_rejected:
+        try:
+            print(f"[upload-side] Kalman filter rejected "
+                  f"{kalman_rejected}/{len(pitches)} pitches as physics-"
+                  f"inconsistent (likely noise)")
+        except Exception:
+            pass
+    pitches = kalman_kept
+
     # ----- Pass 2.5: auto-calibration -----
     # If the caller passed calibration={"auto": True} OR the supplied
     # calibration's plate_width_px is implausible (too small or absent),
@@ -17074,6 +17339,7 @@ def process_uploaded_video(video_path: str,
         "throw_backs":     n_throwback,
         "sanity_dropped":  len(dropped),
         "sanity_reasons":  reasons[:5],
+        "kalman_rejected": kalman_rejected,
         "kept":            len(kept),
         # Surface the calibration source string so the user (and us)
         # can see WHICH fusion method actually anchored the math —
@@ -18580,8 +18846,12 @@ def _capture_one_camera_for_upload(label: str,
                                 text=f"Scanning frames... {int(frac*100)}%")
         # Pick up manual landmarks the user set in the fallback panel
         # (they live in session_state, keyed by f"{key_prefix}ml_*_xy").
+        # Includes the new homography landmarks: plate_left, plate_right,
+        # rubber. When enough are present (>=4 points with known field
+        # coordinates) the calibrator computes a perspective transform.
         _manual_landmarks = {}
-        for _name in ("pitcher", "catcher", "plate", "ball"):
+        for _name in ("pitcher", "catcher", "plate", "plate_left",
+                       "plate_right", "rubber", "ball"):
             _xy = st.session_state.get(f"{key_prefix}ml_{_name}_xy")
             if _xy:
                 _manual_landmarks[f"{_name}_xy"] = _xy
@@ -18716,11 +18986,16 @@ def _capture_one_camera_for_upload(label: str,
             n_detected   = diag.get("detected_total", len(pitches))
             n_throwback  = diag.get("throw_backs", 0)
             n_sanity_bad = diag.get("sanity_dropped", 0)
+            n_kalman_bad = diag.get("kalman_rejected", 0)
             sanity_reasons = diag.get("sanity_reasons") or []
 
-            if pitches and (n_throwback or n_sanity_bad):
+            if pitches and (n_throwback or n_sanity_bad or n_kalman_bad):
                 # SOME pitches survived but the pipeline trimmed garbage.
                 breakdown = []
+                if n_kalman_bad:
+                    breakdown.append(
+                        f"{n_kalman_bad} physics-inconsistent (Kalman "
+                        f"flagged as noise)")
                 if n_throwback:
                     breakdown.append(
                         f"{n_throwback} catcher throw-back(s)")
