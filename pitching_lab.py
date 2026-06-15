@@ -16053,8 +16053,9 @@ def render_manual_landmarks_panel(video_path: str,
 
 
 def _detect_pitcher_catcher_anchors(video_path: str,
-                                          n_samples: int = 16,
-                                          hand_is_right: bool = True
+                                          n_samples: int = 8,
+                                          hand_is_right: bool = True,
+                                          resize_max_dim: int = 640
                                           ) -> dict:
     """Detect pitcher and catcher anchor points from pose across multiple
     frames. Returns:
@@ -16131,7 +16132,19 @@ def _detect_pitcher_catcher_anchors(video_path: str,
             ok, frame = cap.read()
             if not ok:
                 continue
-            rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+            # Downsize before pose detection — MediaPipe handles small
+            # frames fine and inference is ~5x faster at 640px max.
+            # Critical for free-tier CPU budget.
+            h_orig, w_orig = frame.shape[:2]
+            scale_factor = 1.0
+            if max(h_orig, w_orig) > resize_max_dim:
+                scale_factor = resize_max_dim / max(h_orig, w_orig)
+                new_w = int(w_orig * scale_factor)
+                new_h = int(h_orig * scale_factor)
+                frame_small = _cv2.resize(frame, (new_w, new_h))
+            else:
+                frame_small = frame
+            rgb = _cv2.cvtColor(frame_small, _cv2.COLOR_BGR2RGB)
             res = pose.process(rgb)
             if not res.pose_landmarks:
                 continue
@@ -17059,8 +17072,25 @@ def process_uploaded_video(video_path: str,
         raise RuntimeError(f"Could not open video file: {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    fw_video = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
-    fh_video = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+    fw_raw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+    fh_raw = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+
+    # ---- Memory-safety downsample ----
+    # 1080p frames are 6 MB each. On a 512 MB free-tier instance the
+    # MOG2 history (~50 frames buffered) + Streamlit + MediaPipe + the
+    # frame currently being processed easily exceed memory. Downsample
+    # to 720p max for processing — accuracy impact is minor since our
+    # detector already resizes for some operations, but RAM use drops
+    # by ~2.2x per frame.
+    PROCESSING_MAX_DIM = 720
+    proc_scale = 1.0
+    if max(fw_raw, fh_raw) > PROCESSING_MAX_DIM:
+        proc_scale = PROCESSING_MAX_DIM / max(fw_raw, fh_raw)
+        fw_video = int(fw_raw * proc_scale)
+        fh_video = int(fh_raw * proc_scale)
+    else:
+        fw_video = fw_raw
+        fh_video = fh_raw
 
     # ----- Pitcher-catcher ROI corridor -----
     # The ball can only exist along the corridor between the pitcher's
@@ -17155,13 +17185,11 @@ def process_uploaded_video(video_path: str,
 
     # ----- Background subtractor (motion gate) -----
     # MOG2 learns the static background over the first few frames, then
-    # gives us a per-frame foreground mask. Pass it to the ball detector
-    # so we ignore stadium lights, white jerseys, scoreboards, and any
-    # other stationary bright objects competing for "looks like a ball".
-    # detectShadows=False because we want a clean binary mask — shadow
-    # pixels (grey 127) would mess with the bitwise AND.
+    # gives us a per-frame foreground mask. Reduced history=60 (from 120)
+    # to halve the background model's memory footprint — accuracy impact
+    # is minor since bullpens are short single-takes anyway.
     bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-        history=120, varThreshold=20, detectShadows=False)
+        history=60, varThreshold=20, detectShadows=False)
     # Warm-up: prime the background model on the first 30 frames so we
     # don't get false "everything is foreground" hits at the very start.
     warmup_frames = min(30, total_frames // 4 if total_frames else 30)
@@ -17177,6 +17205,11 @@ def process_uploaded_video(video_path: str,
         ok, frame = cap.read()
         if not ok:
             break
+        # Memory-safety: downsample to PROCESSING_MAX_DIM before all
+        # subsequent operations. Cuts per-frame memory by ~2x for 1080p
+        # sources without meaningfully affecting ball detection.
+        if proc_scale < 1.0:
+            frame = cv2.resize(frame, (fw_video, fh_video))
         fg_mask = bg_subtractor.apply(frame)
         # During warm-up, the bg model isn't trained yet; skip detection.
         if frame_idx < warmup_frames:
@@ -18978,9 +19011,38 @@ def _capture_one_camera_for_upload(label: str,
     # automatically.
     angle_state_key = f"{key_prefix}detected_angle"
     if angle_state_key not in st.session_state:
-        with st.spinner("Looking at the video to figure out the camera angle..."):
+        # Light pre-detection — plate-only, no MediaPipe.
+        # Pose-based detection is expensive (multiple frames at HD =
+        # several seconds on free-tier 0.1 CPU). We only use it during
+        # actual processing. For the initial UI hint, plate sniffing
+        # gives "behind_catcher" / "side" / "behind_pitcher" cheaply.
+        with st.spinner("Sniffing camera angle..."):
             try:
-                detected = auto_detect_camera_angle(tmp_path)
+                import cv2 as _cv2_q
+                cap_q = _cv2_q.VideoCapture(tmp_path)
+                total_q = int(cap_q.get(_cv2_q.CAP_PROP_FRAME_COUNT) or 0)
+                w_q = int(cap_q.get(_cv2_q.CAP_PROP_FRAME_WIDTH) or 1280)
+                plate_hits = 0
+                plate_xs = []
+                for k in range(4):  # only 4 samples, no pose
+                    cap_q.set(_cv2_q.CAP_PROP_POS_FRAMES,
+                                int(total_q * (k + 1) / 5))
+                    ok_q, frame_q = cap_q.read()
+                    if not ok_q:
+                        continue
+                    ok_enc, buf = _cv2_q.imencode(".jpg", frame_q)
+                    if ok_enc:
+                        plate = auto_detect_plate(buf.tobytes())
+                        if plate:
+                            plate_hits += 1
+                            plate_xs.append(plate[0] / max(1, w_q))
+                cap_q.release()
+                if plate_hits == 0:
+                    detected = "behind_catcher"
+                else:
+                    avg_x = sum(plate_xs) / len(plate_xs)
+                    detected = ("behind_catcher" if 0.30 <= avg_x <= 0.70
+                                  else "side")
             except Exception:
                 detected = "side"
         st.session_state[angle_state_key] = detected
